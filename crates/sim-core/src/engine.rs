@@ -84,62 +84,107 @@ impl Engine {
 struct ConnectionHandle {
     task: JoinHandle<()>,
     outgoing_tx: mpsc::Sender<Vec<u8>>,
+    generation: u64,
 }
 
 async fn run(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
     let mut connections: HashMap<ConnectionId, ConnectionHandle> = HashMap::new();
+    let (finished_tx, mut finished_rx) =
+        mpsc::channel::<(ConnectionId, u64)>(EVENT_CHANNEL_CAPACITY);
+    let mut next_generation: u64 = 0;
 
-    while let Some(command) = commands.recv().await {
-        match command {
-            Command::Connect { id, config } => {
-                if connections.contains_key(&id) {
-                    report_error(
-                        &events,
-                        Some(id.clone()),
-                        EngineError::DuplicateConnection(id),
-                    )
-                    .await;
-                    continue;
-                }
-                let handle = start_connection(id.clone(), config, events.clone());
-                connections.insert(id, handle);
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else { break };
+                handle_command(
+                    command,
+                    &mut connections,
+                    &events,
+                    &finished_tx,
+                    &mut next_generation,
+                )
+                .await;
             }
-            Command::Disconnect { id } => match connections.remove(&id) {
-                Some(handle) => {
-                    handle.task.abort();
-                    let _ = events
-                        .send(Event::ConnectionStatus {
-                            id,
-                            status: ConnectionStatus::Disconnected,
-                        })
-                        .await;
-                }
-                None => {
-                    report_error(
-                        &events,
-                        Some(id.clone()),
-                        EngineError::UnknownConnection(id),
-                    )
-                    .await;
-                }
-            },
-            Command::SendRaw { id, bytes } => {
-                let Some(handle) = connections.get(&id) else {
-                    report_error(
-                        &events,
-                        Some(id.clone()),
-                        EngineError::UnknownConnection(id),
-                    )
-                    .await;
-                    continue;
-                };
-                // A closed channel means the connection task already exited on its
-                // own (transport error, peer hang-up). Drop the dead entry rather
-                // than leaving it around to fail every later send.
-                if handle.outgoing_tx.send(bytes).await.is_err() {
+            // A task that ended on its own frees its name straight away, so the
+            // same connection can be recreated without a manual disconnect first.
+            // The generation guards against a stale notice evicting the newer
+            // connection that has since taken the name.
+            Some((id, generation)) = finished_rx.recv() => {
+                if connections.get(&id).is_some_and(|handle| handle.generation == generation) {
                     connections.remove(&id);
-                    report_error(&events, Some(id.clone()), EngineError::ConnectionDown(id)).await;
                 }
+            }
+        }
+    }
+}
+
+async fn handle_command(
+    command: Command,
+    connections: &mut HashMap<ConnectionId, ConnectionHandle>,
+    events: &mpsc::Sender<Event>,
+    finished_tx: &mpsc::Sender<(ConnectionId, u64)>,
+    next_generation: &mut u64,
+) {
+    match command {
+        Command::Connect { id, config } => {
+            // An entry whose task already exited is just garbage awaiting its
+            // notification on `finished_rx`. Checking the task directly keeps
+            // reconnecting deterministic: a caller acting the instant it sees
+            // `Disconnected` would otherwise race that notification and be told
+            // the name is taken.
+            let stale = connections
+                .get(&id)
+                .is_some_and(|handle| handle.task.is_finished());
+            if stale {
+                connections.remove(&id);
+            }
+
+            if connections.contains_key(&id) {
+                report_error(
+                    events,
+                    Some(id.clone()),
+                    EngineError::DuplicateConnection(id),
+                )
+                .await;
+                return;
+            }
+            let generation = *next_generation;
+            *next_generation += 1;
+            let handle = start_connection(
+                id.clone(),
+                config,
+                events.clone(),
+                finished_tx.clone(),
+                generation,
+            );
+            connections.insert(id, handle);
+        }
+        Command::Disconnect { id } => match connections.remove(&id) {
+            Some(handle) => {
+                handle.task.abort();
+                let _ = events
+                    .send(Event::ConnectionStatus {
+                        id,
+                        status: ConnectionStatus::Disconnected,
+                    })
+                    .await;
+            }
+            None => {
+                report_error(events, Some(id.clone()), EngineError::UnknownConnection(id)).await;
+            }
+        },
+        Command::SendRaw { id, bytes } => {
+            let Some(handle) = connections.get(&id) else {
+                report_error(events, Some(id.clone()), EngineError::UnknownConnection(id)).await;
+                return;
+            };
+            // A closed channel means the connection task already exited on its
+            // own (transport error, peer hang-up). Drop the dead entry rather
+            // than leaving it around to fail every later send.
+            if handle.outgoing_tx.send(bytes).await.is_err() {
+                connections.remove(&id);
+                report_error(events, Some(id.clone()), EngineError::ConnectionDown(id)).await;
             }
         }
     }
@@ -153,6 +198,8 @@ fn start_connection(
     id: ConnectionId,
     config: TransportConfig,
     events: mpsc::Sender<Event>,
+    finished_tx: mpsc::Sender<(ConnectionId, u64)>,
+    generation: u64,
 ) -> ConnectionHandle {
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Vec<u8>>(OUTGOING_CHANNEL_CAPACITY);
 
@@ -164,8 +211,16 @@ fn start_connection(
             })
             .await;
 
-        let mut transport = match open_transport(config).await {
-            Ok(transport) => transport,
+        match open_transport(config).await {
+            Ok(mut transport) => {
+                let _ = events
+                    .send(Event::ConnectionStatus {
+                        id: id.clone(),
+                        status: ConnectionStatus::Connected,
+                    })
+                    .await;
+                run_connection(id.clone(), &mut transport, outgoing_rx, &events).await;
+            }
             Err(source) => {
                 report_error(
                     &events,
@@ -176,34 +231,23 @@ fn start_connection(
                     },
                 )
                 .await;
-                let _ = events
-                    .send(Event::ConnectionStatus {
-                        id,
-                        status: ConnectionStatus::Disconnected,
-                    })
-                    .await;
-                return;
             }
-        };
+        }
 
         let _ = events
             .send(Event::ConnectionStatus {
                 id: id.clone(),
-                status: ConnectionStatus::Connected,
-            })
-            .await;
-
-        run_connection(id.clone(), &mut transport, outgoing_rx, &events).await;
-
-        let _ = events
-            .send(Event::ConnectionStatus {
-                id,
                 status: ConnectionStatus::Disconnected,
             })
             .await;
+        let _ = finished_tx.send((id, generation)).await;
     });
 
-    ConnectionHandle { task, outgoing_tx }
+    ConnectionHandle {
+        task,
+        outgoing_tx,
+        generation,
+    }
 }
 
 async fn open_transport(config: TransportConfig) -> Result<TransportKind, TransportError> {

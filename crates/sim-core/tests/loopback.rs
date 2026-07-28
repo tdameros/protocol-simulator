@@ -177,3 +177,64 @@ async fn udp_multicast_round_trip() {
     assert_eq!(bytes, vec![0xCA, 0xFE]);
     assert!(source.is_some(), "multicast receive must report a source");
 }
+
+/// A connection whose task died must not keep its slot: reusing the name has to
+/// work without first disconnecting a connection that is already gone.
+#[tokio::test]
+async fn dead_connection_frees_its_name() {
+    let (tx, mut rx) = Engine::spawn();
+
+    // Connecting to a closed port fails, so the task exits right away.
+    let dead = "127.0.0.1:19987".parse().unwrap();
+    tx.send(Command::Connect {
+        id: ConnectionId::from("probe"),
+        config: TransportConfig::Tcp {
+            mode: TcpMode::Client { addr: dead },
+        },
+    })
+    .await
+    .unwrap();
+
+    wait_for(&mut rx, |event| {
+        matches!(
+            event,
+            Event::ConnectionStatus {
+                id,
+                status: ConnectionStatus::Disconnected
+            } if id.0 == "probe"
+        )
+    })
+    .await;
+
+    // Reusing the name must succeed rather than report DuplicateConnection.
+    let addr = "127.0.0.1:19988".parse().unwrap();
+    tx.send(Command::Connect {
+        id: ConnectionId::from("probe"),
+        config: TransportConfig::Tcp {
+            mode: TcpMode::Server { listen: addr },
+        },
+    })
+    .await
+    .unwrap();
+
+    let event = timeout(TEST_TIMEOUT, async {
+        loop {
+            let event = rx.recv().await.expect("channel closed");
+            match &event {
+                Event::Error { .. } => return event,
+                Event::ConnectionStatus {
+                    id,
+                    status: ConnectionStatus::Connecting,
+                } if id.0 == "probe" => return event,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out");
+
+    assert!(
+        matches!(event, Event::ConnectionStatus { .. }),
+        "reusing a dead connection's name should be accepted, got an error instead"
+    );
+}
