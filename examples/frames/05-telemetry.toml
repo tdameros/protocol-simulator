@@ -1,0 +1,67 @@
+# A realistic downlink frame, combining everything the format offers.
+#
+# This is the shape most projects end up with: a sync word, a header, a typed
+# payload, and a CRC over the lot.
+
+name = "Telemetry"
+description = "Realistic downlink telemetry, 40 bytes"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+description = "Frame start marker, constant"
+
+[[field]]
+name = "device_id"
+type = "u8"
+default = 1
+
+[[field]]
+name = "label"
+type = "text"
+len = 8
+description = "Fixed width, NUL padded on send and trimmed on receive"
+
+[[field]]
+name = "timestamp"
+type = "u32"
+description = "Milliseconds since power-on"
+
+[[field]]
+name = "mode"
+type = "enum"
+repr = "u8"
+variants = { IDLE = 0, RUNNING = 1, DEGRADED = 2, FAULT = 3 }
+
+[[field]]
+name = "flags"
+type = "bits"
+repr = "u8"
+bits = [
+  { name = "armed",     width = 1 },
+  { name = "heater_on", width = 1 },
+  { name = "link_up",   width = 1 },
+  { name = "spare",     width = 5 },
+]
+
+[[field]]
+name = "temperature"
+type = "i16"
+description = "Tenths of a degree Celsius"
+
+[[field]]
+name = "bus_voltage"
+type = "f32"
+
+[[field]]
+name = "payload"
+type = "bytes"
+len = 15
+
+[[field]]
+name = "crc"
+type = "crc16"
+algo = "crc16-ccitt"
+covers = { from = "sync", to = "payload" }

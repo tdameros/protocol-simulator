@@ -1,0 +1,35 @@
+# Named values and packed flags: the two things that make a raw hex dump
+# unreadable, and that the editor turns into a dropdown and checkboxes.
+
+name = "Status"
+description = "A mode enum and a packed flag byte, 4 bytes"
+endian = "big"
+
+[[field]]
+name = "mode"
+type = "enum"
+repr = "u8"
+# The editor shows the names and sends the numbers. Order in the file does not
+# matter: variants are listed by value, so the lowest one comes first.
+variants = { IDLE = 0, RUNNING = 1, DEGRADED = 2, FAULT = 3 }
+
+[[field]]
+name = "flags"
+type = "bits"
+repr = "u8"
+# Packed most significant bit first: `armed` is bit 7, `spare` occupies bits 3..0.
+# The widths must add up to exactly the size of `repr`, otherwise the file is
+# rejected at load time rather than producing a quietly wrong frame.
+bits = [
+  { name = "armed",      width = 1 },
+  { name = "heater_on",  width = 1 },
+  { name = "link_up",    width = 1 },
+  { name = "power_level", width = 2 },
+  { name = "spare",      width = 3 },
+]
+
+[[field]]
+name = "error_code"
+type = "enum"
+repr = "u16"
+variants = { NONE = 0, OVERTEMP = 16, UNDERVOLT = 17, TIMEOUT = 32 }

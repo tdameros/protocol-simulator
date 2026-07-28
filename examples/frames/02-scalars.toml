@@ -1,0 +1,40 @@
+# Every scalar type, and how byte order is decided.
+#
+# Available: u8 i8 u16 i16 u32 i32 u64 i64 f32 f64
+#
+# Byte order comes from the frame's `endian`, unless a field sets its own. Most
+# protocols are homogeneous, so declaring it once at the top keeps the file
+# readable; the override exists for the odd field that disagrees.
+
+name = "Scalars"
+description = "One field per scalar type, 23 bytes"
+endian = "big"
+
+[[field]]
+name = "counter"
+type = "u8"
+
+[[field]]
+name = "temperature"
+type = "i16"
+description = "Tenths of a degree Celsius, so -40.0 C is sent as -400"
+
+[[field]]
+name = "uptime"
+type = "u32"
+description = "Seconds since power-on"
+
+[[field]]
+name = "host_word"
+type = "u32"
+# This one field disagrees with the frame default.
+endian = "little"
+description = "Little-endian even though the rest of the frame is big-endian"
+
+[[field]]
+name = "bus_voltage"
+type = "f32"
+
+[[field]]
+name = "position"
+type = "f64"
