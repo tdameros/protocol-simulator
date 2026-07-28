@@ -45,7 +45,7 @@ impl SimApp {
                     bytes,
                     timestamp,
                 } => {
-                    self.state.log.push(LogEntry {
+                    self.state.push_log(LogEntry {
                         id,
                         direction: Direction::Sent,
                         bytes,
@@ -59,7 +59,7 @@ impl SimApp {
                     source,
                     timestamp,
                 } => {
-                    self.state.log.push(LogEntry {
+                    self.state.push_log(LogEntry {
                         id,
                         direction: Direction::Received,
                         bytes,

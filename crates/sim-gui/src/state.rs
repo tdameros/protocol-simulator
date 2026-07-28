@@ -1,13 +1,20 @@
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::SystemTime;
 
 use sim_core::{ConnectionId, ConnectionStatus, EngineError, TcpMode, TransportConfig};
 use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
 
+/// Cap on retained traffic entries.
+///
+/// A periodic frame at 100 Hz produces 360k entries an hour, so the log has to
+/// forget or it grows without bound for as long as the app is left running.
+pub const MAX_LOG_ENTRIES: usize = 10_000;
+
 #[derive(Default)]
 pub struct AppState {
     pub connections: Vec<(ConnectionId, ConnectionEntry)>,
-    pub log: Vec<LogEntry>,
+    pub log: VecDeque<LogEntry>,
     pub new_connection: NewConnectionForm,
     pub hex_input: String,
     pub hex_target: Option<ConnectionId>,
@@ -34,6 +41,13 @@ impl AppState {
             Some(id) => format!("[{id}] {error}"),
             None => error.to_string(),
         });
+    }
+
+    pub fn push_log(&mut self, entry: LogEntry) {
+        if self.log.len() == MAX_LOG_ENTRIES {
+            self.log.pop_front();
+        }
+        self.log.push_back(entry);
     }
 
     pub fn status_of(&self, id: &ConnectionId) -> Option<ConnectionStatus> {
@@ -278,5 +292,22 @@ mod tests {
         form.name = "v6".to_owned();
         assert!(form.build(&[]).is_none());
         assert!(form.error.is_some_and(|e| e.contains("IPv6")));
+    }
+
+    #[test]
+    fn log_forgets_oldest_entries_past_the_cap() {
+        let mut state = AppState::default();
+        for n in 0..MAX_LOG_ENTRIES + 50 {
+            state.push_log(LogEntry {
+                id: ConnectionId::from("c"),
+                direction: Direction::Sent,
+                bytes: vec![u8::try_from(n % 256).unwrap()],
+                source: None,
+                timestamp: SystemTime::now(),
+            });
+        }
+        assert_eq!(state.log.len(), MAX_LOG_ENTRIES);
+        // The 50 oldest were dropped, so the buffer now starts at entry 50.
+        assert_eq!(state.log.front().unwrap().bytes, vec![50]);
     }
 }
