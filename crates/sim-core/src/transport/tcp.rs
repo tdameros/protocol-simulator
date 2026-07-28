@@ -14,7 +14,7 @@ const LISTEN_BACKLOG: i32 = 128;
 ///
 /// `tokio::net::TcpListener::bind` goes through mio, which unlike
 /// `std::net::TcpListener::bind` does not set that option. Without it, sockets
-/// left in `TIME_WAIT` by previous peers keep the port busy, so stopping a
+/// left in `TIME_WAIT` by the previous peers keep the port busy, so stopping a
 /// server and restarting it on the same port fails for about a minute.
 fn bind_listener(addr: SocketAddr) -> Result<TcpListener, TransportError> {
     let domain = Domain::for_address(addr);
@@ -29,6 +29,10 @@ fn bind_listener(addr: SocketAddr) -> Result<TcpListener, TransportError> {
 pub struct TcpTransport {
     stream: TcpStream,
     peer: Option<SocketAddr>,
+    /// Kept by servers so a peer hanging up sends them back to accepting rather
+    /// than ending the connection. `None` for clients, which have nothing to
+    /// accept on.
+    listener: Option<TcpListener>,
     buf: Vec<u8>,
 }
 
@@ -38,7 +42,7 @@ impl TcpTransport {
     /// Returns an error if the connection to `addr` cannot be established.
     pub async fn connect(addr: SocketAddr) -> Result<Self, TransportError> {
         let stream = TcpStream::connect(addr).await?;
-        Ok(Self::from_stream(stream))
+        Ok(Self::new(stream, None))
     }
 
     /// # Errors
@@ -47,13 +51,14 @@ impl TcpTransport {
     pub async fn listen(listen: SocketAddr) -> Result<Self, TransportError> {
         let listener = bind_listener(listen)?;
         let (stream, _peer) = listener.accept().await?;
-        Ok(Self::from_stream(stream))
+        Ok(Self::new(stream, Some(listener)))
     }
 
-    fn from_stream(stream: TcpStream) -> Self {
+    fn new(stream: TcpStream, listener: Option<TcpListener>) -> Self {
         Self {
             peer: stream.peer_addr().ok(),
             stream,
+            listener,
             buf: vec![0u8; RECV_BUFFER_SIZE],
         }
     }
@@ -74,5 +79,15 @@ impl Transport for TcpTransport {
             bytes: self.buf[..n].to_vec(),
             source: self.peer,
         })
+    }
+
+    async fn relisten(&mut self) -> Result<bool, TransportError> {
+        let Some(listener) = self.listener.as_ref() else {
+            return Ok(false);
+        };
+        let (stream, _) = listener.accept().await?;
+        self.peer = stream.peer_addr().ok();
+        self.stream = stream;
+        Ok(true)
     }
 }

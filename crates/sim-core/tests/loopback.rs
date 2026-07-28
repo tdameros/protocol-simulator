@@ -238,3 +238,50 @@ async fn dead_connection_frees_its_name() {
         "reusing a dead connection's name should be accepted, got an error instead"
     );
 }
+
+/// A TCP server outlives the peer that hangs up and serves the next one.
+#[tokio::test]
+async fn tcp_server_accepts_a_second_peer() {
+    use tokio::io::AsyncWriteExt;
+
+    let (tx, mut rx) = Engine::spawn();
+    let addr: std::net::SocketAddr = "127.0.0.1:19971".parse().unwrap();
+
+    tx.send(Command::Connect {
+        id: ConnectionId::from("srv"),
+        config: TransportConfig::Tcp {
+            mode: TcpMode::Server { listen: addr },
+        },
+    })
+    .await
+    .unwrap();
+
+    for expected in [vec![0xAAu8], vec![0xBBu8]] {
+        let mut client = timeout(TEST_TIMEOUT, async {
+            loop {
+                if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                    return stream;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("server never accepted a connection");
+
+        wait_all_connected(&mut rx, &["srv"]).await;
+
+        client.write_all(&expected).await.unwrap();
+        let event = wait_for(
+            &mut rx,
+            |event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "srv"),
+        )
+        .await;
+        let Event::FrameReceived { bytes, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(bytes, expected);
+
+        // Hang up so the next iteration exercises the re-accept path.
+        drop(client);
+    }
+}

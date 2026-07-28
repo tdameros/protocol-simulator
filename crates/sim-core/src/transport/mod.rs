@@ -25,4 +25,12 @@ pub trait Transport: Send {
     fn send_error_is_fatal(&self) -> bool {
         true
     }
+
+    /// Re-establishes the link after the peer went away, when the transport can.
+    ///
+    /// A listening TCP server goes back to accepting; everything else reports
+    /// `false` and lets the connection end.
+    fn relisten(&mut self) -> impl Future<Output = Result<bool, TransportError>> + Send {
+        async { Ok(false) }
+    }
 }

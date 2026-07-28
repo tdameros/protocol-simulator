@@ -315,6 +315,14 @@ impl Transport for TransportKind {
             TransportKind::Serial(t) => t.send_error_is_fatal(),
         }
     }
+
+    async fn relisten(&mut self) -> Result<bool, TransportError> {
+        match self {
+            TransportKind::Udp(t) => t.relisten().await,
+            TransportKind::Tcp(t) => t.relisten().await,
+            TransportKind::Serial(t) => t.relisten().await,
+        }
+    }
 }
 
 async fn run_connection<T: Transport>(
@@ -350,7 +358,20 @@ async fn run_connection<T: Transport>(
                     }
                     Err(source) => {
                         report_error(events, Some(id.clone()), EngineError::Transport { id: id.clone(), source }).await;
-                        break;
+                        // A listening server waits for the next peer instead of
+                        // dying with the one that just hung up.
+                        match transport.relisten().await {
+                            Ok(true) => {
+                                let _ = events
+                                    .send(Event::ConnectionStatus { id: id.clone(), status: ConnectionStatus::Connected })
+                                    .await;
+                            }
+                            Ok(false) => break,
+                            Err(source) => {
+                                report_error(events, Some(id.clone()), EngineError::Transport { id: id.clone(), source }).await;
+                                break;
+                            }
+                        }
                     }
                 }
             }
