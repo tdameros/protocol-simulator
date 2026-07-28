@@ -121,6 +121,16 @@ impl CrcSpec {
         })
     }
 
+    /// The preset this spec came from, so a loaded frame can be written back
+    /// with the name the author used rather than raw polynomial parameters.
+    #[must_use]
+    pub fn preset_name(self) -> Option<&'static str> {
+        Self::preset_names()
+            .iter()
+            .copied()
+            .find(|name| Self::preset(name) == Some(self))
+    }
+
     #[must_use]
     pub fn preset_names() -> &'static [&'static str] {
         &[
