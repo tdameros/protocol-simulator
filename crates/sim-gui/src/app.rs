@@ -16,17 +16,22 @@ pub struct SimApp {
 }
 
 impl SimApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, frames_dir: Option<std::path::PathBuf>) -> Self {
         theme::apply(&cc.egui_ctx);
+
+        let mut state = AppState::default();
+        if let Some(directory) = frames_dir {
+            state.frames.load_from(directory);
+        }
 
         let mut dock_state = DockState::new(vec![Tab::LiveMonitor]);
         let surface = dock_state.main_surface_mut();
         let [live, _connections] =
             surface.split_left(NodeIndex::root(), 0.22, vec![Tab::Connections]);
-        surface.split_below(live, 0.75, vec![Tab::HexInject]);
+        surface.split_below(live, 0.6, vec![Tab::FrameEditor, Tab::HexInject]);
 
         Self {
-            state: AppState::default(),
+            state,
             engine: EngineHandle::new(),
             dock_state,
         }

@@ -1,4 +1,5 @@
 pub mod connections;
+pub mod frame_editor;
 pub mod hex_inject;
 pub mod live_monitor;
 
@@ -13,6 +14,7 @@ pub enum Tab {
     Connections,
     LiveMonitor,
     HexInject,
+    FrameEditor,
 }
 
 impl Tab {
@@ -21,6 +23,7 @@ impl Tab {
             Self::Connections => "Connections",
             Self::LiveMonitor => "Live Monitor",
             Self::HexInject => "Hex Inject",
+            Self::FrameEditor => "Frames",
         }
     }
 }
@@ -42,6 +45,7 @@ impl TabViewer for AppTabViewer<'_> {
             Tab::Connections => connections::show(ui, self.state, self.engine),
             Tab::LiveMonitor => live_monitor::show(ui, self.state),
             Tab::HexInject => hex_inject::show(ui, self.state, self.engine),
+            Tab::FrameEditor => frame_editor::show(ui, self.state, self.engine),
         }
     }
 }

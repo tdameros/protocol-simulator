@@ -18,6 +18,8 @@ pub struct AppState {
     pub new_connection: NewConnectionForm,
     pub hex_input: String,
     pub hex_target: Option<ConnectionId>,
+    pub frames: crate::frames::FrameLibrary,
+    pub frame_target: Option<ConnectionId>,
     pub last_error: Option<String>,
 }
 
