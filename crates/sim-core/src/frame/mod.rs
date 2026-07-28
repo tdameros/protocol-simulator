@@ -1,4 +1,5 @@
 pub mod checksum;
+pub mod codec;
 pub mod value;
 
 use checksum::ChecksumSpec;
