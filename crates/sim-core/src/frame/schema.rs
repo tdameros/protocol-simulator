@@ -271,20 +271,22 @@ fn build_kind(field: &RawField, index: usize, names: &[String]) -> Result<FieldK
                         kind: field.kind.clone(),
                         missing: "variants",
                     })?;
-            Ok(FieldKind::Enum {
-                repr,
-                variants: variants
-                    .iter()
-                    .map(|(name, value)| EnumVariant {
-                        name: name.clone(),
-                        #[expect(
-                            clippy::cast_sign_loss,
-                            reason = "toml integers are signed; a negative discriminant is caught by the range check at encode time"
-                        )]
-                        value: *value as u64,
-                    })
-                    .collect(),
-            })
+            let mut variants: Vec<EnumVariant> = variants
+                .iter()
+                .map(|(name, value)| EnumVariant {
+                    name: name.clone(),
+                    #[expect(
+                        clippy::cast_sign_loss,
+                        reason = "toml integers are signed; a negative discriminant is caught by the range check at encode time"
+                    )]
+                    value: *value as u64,
+                })
+                .collect();
+            // A TOML inline table arrives alphabetically sorted by name, which is
+            // not how a protocol specification reads. Order by value instead, so
+            // listings match the spec and the lowest value comes first.
+            variants.sort_by_key(|variant| variant.value);
+            Ok(FieldKind::Enum { repr, variants })
         }
         "bits" => {
             let repr = unsigned_repr(field)?;
@@ -587,6 +589,20 @@ covers = { from = "sync", to = "payload" }
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn enum_variants_are_ordered_by_value_not_by_name() {
+        let frame = from_toml(TELEMETRY).unwrap();
+        let FieldKind::Enum { variants, .. } = &frame.field("mode").unwrap().kind else {
+            panic!("mode should be an enum");
+        };
+        // Declared as an inline table, which arrives sorted as FAULT, IDLE, RUN.
+        // Ordering by value keeps the lowest first, so a frame does not default
+        // to whatever variant happens to sort first alphabetically.
+        let names: Vec<&str> = variants.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["IDLE", "RUN", "FAULT"]);
+        assert_eq!(variants[0].value, 0);
     }
 
     #[test]
