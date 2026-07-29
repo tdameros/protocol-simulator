@@ -7,6 +7,6 @@ pub mod error;
 pub mod frame;
 pub mod transport;
 
-pub use connection::{ConnectionId, ConnectionStatus, TcpMode, TransportConfig};
+pub use connection::{ConnectionId, ConnectionStatus, RetryPolicy, TcpMode, TransportConfig};
 pub use engine::{Command, Engine, Event};
 pub use error::{EngineError, TransportError};

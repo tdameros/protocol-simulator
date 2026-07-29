@@ -1,7 +1,9 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
-use sim_core::{Command, ConnectionId, ConnectionStatus, Engine, Event, TcpMode, TransportConfig};
+use sim_core::{
+    Command, ConnectionId, ConnectionStatus, Engine, Event, RetryPolicy, TcpMode, TransportConfig,
+};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -61,6 +63,7 @@ async fn udp_round_trip() {
             bind: addr_a,
             remote: addr_b,
         },
+        retry: None,
     })
     .await
     .unwrap();
@@ -70,6 +73,7 @@ async fn udp_round_trip() {
             bind: addr_b,
             remote: addr_a,
         },
+        retry: None,
     })
     .await
     .unwrap();
@@ -105,6 +109,7 @@ async fn tcp_round_trip() {
         config: TransportConfig::Tcp {
             mode: TcpMode::Server { listen: addr },
         },
+        retry: None,
     })
     .await
     .unwrap();
@@ -113,6 +118,7 @@ async fn tcp_round_trip() {
         config: TransportConfig::Tcp {
             mode: TcpMode::Client { addr },
         },
+        retry: None,
     })
     .await
     .unwrap();
@@ -152,6 +158,7 @@ async fn udp_multicast_round_trip() {
         tx.send(Command::Connect {
             id: ConnectionId::from(name),
             config: TransportConfig::UdpMulticast { group, interface },
+            retry: None,
         })
         .await
         .unwrap();
@@ -191,6 +198,7 @@ async fn dead_connection_frees_its_name() {
         config: TransportConfig::Tcp {
             mode: TcpMode::Client { addr: dead },
         },
+        retry: None,
     })
     .await
     .unwrap();
@@ -213,6 +221,7 @@ async fn dead_connection_frees_its_name() {
         config: TransportConfig::Tcp {
             mode: TcpMode::Server { listen: addr },
         },
+        retry: None,
     })
     .await
     .unwrap();
@@ -239,6 +248,86 @@ async fn dead_connection_frees_its_name() {
     );
 }
 
+/// A retrying connection keeps knocking and comes up on its own once the peer
+/// finally shows up, with no command from the caller in between.
+#[tokio::test]
+async fn a_retrying_connection_comes_up_when_the_peer_appears() {
+    let (tx, mut rx) = Engine::spawn();
+    let addr: std::net::SocketAddr = "127.0.0.1:19961".parse().unwrap();
+
+    tx.send(Command::Connect {
+        id: ConnectionId::from("client"),
+        config: TransportConfig::Tcp {
+            mode: TcpMode::Client { addr },
+        },
+        retry: Some(RetryPolicy {
+            max_attempts: None,
+            initial_delay: Duration::from_millis(20),
+            max_delay: Duration::from_millis(50),
+        }),
+    })
+    .await
+    .unwrap();
+
+    // Nothing is listening yet, so the first attempt has to fail.
+    wait_for(
+        &mut rx,
+        |event| matches!(event, Event::Error { id: Some(id), .. } if id.0 == "client"),
+    )
+    .await;
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    tokio::spawn(async move {
+        // Held rather than dropped, so the link stays up once accepted.
+        let _accepted = listener.accept().await;
+        tokio::time::sleep(TEST_TIMEOUT).await;
+    });
+
+    wait_all_connected(&mut rx, &["client"]).await;
+}
+
+/// A capped policy stops on its own rather than retrying forever.
+#[tokio::test]
+async fn a_capped_retry_gives_up_after_its_budget() {
+    let (tx, mut rx) = Engine::spawn();
+    let dead: std::net::SocketAddr = "127.0.0.1:19962".parse().unwrap();
+
+    tx.send(Command::Connect {
+        id: ConnectionId::from("probe"),
+        config: TransportConfig::Tcp {
+            mode: TcpMode::Client { addr: dead },
+        },
+        retry: Some(RetryPolicy {
+            max_attempts: Some(2),
+            initial_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(10),
+        }),
+    })
+    .await
+    .unwrap();
+
+    let mut attempts = 0;
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            match rx.recv().await.expect("channel closed") {
+                Event::ConnectionStatus {
+                    id,
+                    status: ConnectionStatus::Connecting,
+                } if id.0 == "probe" => attempts += 1,
+                Event::ConnectionStatus {
+                    id,
+                    status: ConnectionStatus::Disconnected,
+                } if id.0 == "probe" => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("a capped retry should stop by itself");
+
+    assert_eq!(attempts, 3, "the first attempt plus two retries");
+}
+
 /// A TCP server outlives the peer that hangs up and serves the next one.
 #[tokio::test]
 async fn tcp_server_accepts_a_second_peer() {
@@ -252,6 +341,7 @@ async fn tcp_server_accepts_a_second_peer() {
         config: TransportConfig::Tcp {
             mode: TcpMode::Server { listen: addr },
         },
+        retry: None,
     })
     .await
     .unwrap();

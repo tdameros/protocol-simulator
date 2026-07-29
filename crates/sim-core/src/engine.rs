@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::connection::{ConnectionId, ConnectionStatus, TcpMode, TransportConfig};
+use crate::connection::{ConnectionId, ConnectionStatus, RetryPolicy, TcpMode, TransportConfig};
 use crate::error::{EngineError, TransportError};
 use crate::transport::serial::SerialTransport;
 use crate::transport::tcp::TcpTransport;
@@ -20,6 +22,8 @@ pub enum Command {
     Connect {
         id: ConnectionId,
         config: TransportConfig,
+        /// `None` gives up the moment the link fails, which is the default.
+        retry: Option<RetryPolicy>,
     },
     Disconnect {
         id: ConnectionId,
@@ -84,6 +88,10 @@ impl Engine {
 struct ConnectionHandle {
     task: JoinHandle<()>,
     outgoing_tx: mpsc::Sender<Vec<u8>>,
+    /// Set by the task while a transport is actually open. A retrying
+    /// connection keeps its channel alive between attempts, so this is the only
+    /// thing that can tell a send whether it has anywhere to go.
+    connected: Arc<AtomicBool>,
     generation: u64,
 }
 
@@ -127,7 +135,7 @@ async fn handle_command(
     next_generation: &mut u64,
 ) {
     match command {
-        Command::Connect { id, config } => {
+        Command::Connect { id, config, retry } => {
             // An entry whose task already exited is just garbage awaiting its
             // notification on `finished_rx`. Checking the task directly keeps
             // reconnecting deterministic: a caller acting the instant it sees
@@ -154,6 +162,7 @@ async fn handle_command(
             let handle = start_connection(
                 id.clone(),
                 config,
+                retry,
                 events.clone(),
                 finished_tx.clone(),
                 generation,
@@ -179,6 +188,13 @@ async fn handle_command(
                 report_error(events, Some(id.clone()), EngineError::UnknownConnection(id)).await;
                 return;
             };
+            // Between attempts the task is alive and its channel open, so a
+            // send would sit in the queue and go out much later against a peer
+            // that has since changed. Refusing it reports the truth instead.
+            if !handle.connected.load(Ordering::Relaxed) {
+                report_error(events, Some(id.clone()), EngineError::ConnectionDown(id)).await;
+                return;
+            }
             // A closed channel means the connection task already exited on its
             // own (transport error, peer hang-up). Drop the dead entry rather
             // than leaving it around to fail every later send.
@@ -194,44 +210,79 @@ async fn report_error(events: &mpsc::Sender<Event>, id: Option<ConnectionId>, er
     let _ = events.send(Event::Error { id, error }).await;
 }
 
+/// Why a connection attempt stopped running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// The transport failed, or the peer went away. Worth another attempt.
+    Link,
+    /// The engine dropped the handle; there is nothing left to reconnect for.
+    Locally,
+}
+
 fn start_connection(
     id: ConnectionId,
     config: TransportConfig,
+    retry: Option<RetryPolicy>,
     events: mpsc::Sender<Event>,
     finished_tx: mpsc::Sender<(ConnectionId, u64)>,
     generation: u64,
 ) -> ConnectionHandle {
-    let (outgoing_tx, outgoing_rx) = mpsc::channel::<Vec<u8>>(OUTGOING_CHANNEL_CAPACITY);
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(OUTGOING_CHANNEL_CAPACITY);
+    let connected = Arc::new(AtomicBool::new(false));
+    let task_connected = Arc::clone(&connected);
 
     let task = tokio::spawn(async move {
-        let _ = events
-            .send(Event::ConnectionStatus {
-                id: id.clone(),
-                status: ConnectionStatus::Connecting,
-            })
-            .await;
+        // Counts consecutive failures, so it drives the backoff and the attempt
+        // budget alike. A link that comes up clears it.
+        let mut failures: u32 = 0;
 
-        match open_transport(config).await {
-            Ok(mut transport) => {
-                let _ = events
-                    .send(Event::ConnectionStatus {
-                        id: id.clone(),
-                        status: ConnectionStatus::Connected,
-                    })
-                    .await;
-                run_connection(id.clone(), &mut transport, outgoing_rx, &events).await;
-            }
-            Err(source) => {
-                report_error(
-                    &events,
-                    Some(id.clone()),
-                    EngineError::Transport {
-                        id: id.clone(),
-                        source,
-                    },
-                )
+        loop {
+            // Emitted before every attempt, including a retry: from the outside
+            // a connection that is backing off is a connection being opened.
+            let _ = events
+                .send(Event::ConnectionStatus {
+                    id: id.clone(),
+                    status: ConnectionStatus::Connecting,
+                })
                 .await;
+
+            let outcome = match open_transport(config.clone()).await {
+                Ok(mut transport) => {
+                    failures = 0;
+                    task_connected.store(true, Ordering::Relaxed);
+                    let _ = events
+                        .send(Event::ConnectionStatus {
+                            id: id.clone(),
+                            status: ConnectionStatus::Connected,
+                        })
+                        .await;
+                    let ended =
+                        run_connection(id.clone(), &mut transport, &mut outgoing_rx, &events).await;
+                    task_connected.store(false, Ordering::Relaxed);
+                    ended
+                }
+                Err(source) => {
+                    report_error(
+                        &events,
+                        Some(id.clone()),
+                        EngineError::Transport {
+                            id: id.clone(),
+                            source,
+                        },
+                    )
+                    .await;
+                    Ended::Link
+                }
+            };
+
+            let Some(policy) = retry else { break };
+            if outcome == Ended::Locally || !policy.allows(failures) {
+                break;
             }
+            // Aborting the task cancels this sleep, so a manual disconnect is
+            // never held up by a long backoff.
+            tokio::time::sleep(policy.delay_after(failures)).await;
+            failures = failures.saturating_add(1);
         }
 
         let _ = events
@@ -246,6 +297,7 @@ fn start_connection(
     ConnectionHandle {
         task,
         outgoing_tx,
+        connected,
         generation,
     }
 }
@@ -325,16 +377,20 @@ impl Transport for TransportKind {
     }
 }
 
+/// Pumps one open transport until it fails or the engine lets go of it.
+///
+/// The receiver is borrowed rather than owned because a retrying connection
+/// reuses it across attempts.
 async fn run_connection<T: Transport>(
     id: ConnectionId,
     transport: &mut T,
-    mut outgoing_rx: mpsc::Receiver<Vec<u8>>,
+    outgoing_rx: &mut mpsc::Receiver<Vec<u8>>,
     events: &mpsc::Sender<Event>,
-) {
+) -> Ended {
     loop {
         tokio::select! {
             outgoing = outgoing_rx.recv() => {
-                let Some(bytes) = outgoing else { break };
+                let Some(bytes) = outgoing else { return Ended::Locally };
                 match transport.send(&bytes).await {
                     Ok(()) => {
                         let _ = events
@@ -344,7 +400,7 @@ async fn run_connection<T: Transport>(
                     Err(source) => {
                         report_error(events, Some(id.clone()), EngineError::Transport { id: id.clone(), source }).await;
                         if transport.send_error_is_fatal() {
-                            break;
+                            return Ended::Link;
                         }
                     }
                 }
@@ -366,10 +422,10 @@ async fn run_connection<T: Transport>(
                                     .send(Event::ConnectionStatus { id: id.clone(), status: ConnectionStatus::Connected })
                                     .await;
                             }
-                            Ok(false) => break,
+                            Ok(false) => return Ended::Link,
                             Err(source) => {
                                 report_error(events, Some(id.clone()), EngineError::Transport { id: id.clone(), source }).await;
-                                break;
+                                return Ended::Link;
                             }
                         }
                     }
