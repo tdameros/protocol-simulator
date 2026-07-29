@@ -48,7 +48,8 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
     let mut to_remove = Vec::new();
     for (id, entry) in &state.connections {
         ui.horizontal(|ui| {
-            ui.label(status_dot(entry.status));
+            ui.label(status_dot(entry.status))
+                .on_hover_text(status_label(entry.status));
             ui.label(RichText::new(&id.0).strong());
             ui.label(kind_summary(entry));
             if entry.retry.is_some() {
@@ -68,7 +69,9 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
                         to_remove.push(id.clone());
                     }
                 }
-                ConnectionStatus::Connecting | ConnectionStatus::Connected => {
+                ConnectionStatus::Connecting
+                | ConnectionStatus::Listening
+                | ConnectionStatus::Connected => {
                     if ui
                         .button(icons::PLUGS)
                         .on_hover_text("Disconnect")
@@ -285,12 +288,24 @@ fn labeled_combo<T: PartialEq + Copy>(
 }
 
 fn status_dot(status: ConnectionStatus) -> RichText {
+    // Phosphor only ships three circles, so colour carries the difference
+    // between reaching out and waiting to be reached; the tooltip spells it out.
     let (glyph, color) = match status {
         ConnectionStatus::Connecting => (icons::CIRCLE_DASHED, Color32::from_rgb(200, 160, 40)),
+        ConnectionStatus::Listening => (icons::CIRCLE_DASHED, Color32::from_rgb(45, 110, 200)),
         ConnectionStatus::Connected => (icons::CIRCLE_HALF, Color32::from_rgb(40, 160, 80)),
         ConnectionStatus::Disconnected => (icons::CIRCLE, Color32::from_rgb(150, 150, 150)),
     };
     RichText::new(glyph).color(color)
+}
+
+fn status_label(status: ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Connecting => "Connecting",
+        ConnectionStatus::Listening => "Port open, waiting for a peer",
+        ConnectionStatus::Connected => "Connected",
+        ConnectionStatus::Disconnected => "Disconnected",
+    }
 }
 
 fn kind_summary(entry: &ConnectionEntry) -> String {

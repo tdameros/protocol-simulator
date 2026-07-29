@@ -40,6 +40,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
                     let label = match status {
                         ConnectionStatus::Connected => id.0.clone(),
                         ConnectionStatus::Connecting => format!("{} (connecting)", id.0),
+                        ConnectionStatus::Listening => format!("{} (no peer yet)", id.0),
                         ConnectionStatus::Disconnected => format!("{} (disconnected)", id.0),
                     };
                     if ui.selectable_label(is_selected, label).clicked() {
