@@ -56,6 +56,12 @@ pub enum TcpMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connecting,
+    /// Bound and waiting for a peer, which only a server can be.
+    ///
+    /// Distinct from `Connected` because there is nowhere to send yet, and from
+    /// `Connecting` because the port is already open: a listening server that
+    /// reported `Connecting` would look broken when it is working perfectly.
+    Listening,
     Connected,
     Disconnected,
 }

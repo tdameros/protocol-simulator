@@ -26,6 +26,15 @@ pub trait Transport: Send {
         true
     }
 
+    /// Whether the transport can carry data right now.
+    ///
+    /// False for a server that holds its port but has no peer: it is open, yet
+    /// [`Transport::send`] and [`Transport::recv`] have nowhere to go until
+    /// [`Transport::relisten`] finds one.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
     /// Re-establishes the link after the peer went away, when the transport can.
     ///
     /// A listening TCP server goes back to accepting; everything else reports

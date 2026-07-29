@@ -248,6 +248,57 @@ async fn dead_connection_frees_its_name() {
     );
 }
 
+/// A server holding its port is up, even with nobody on the other end.
+///
+/// It used to sit on `Connecting` until a client turned up, which made a
+/// perfectly working server look stuck.
+#[tokio::test]
+async fn a_bound_server_reports_listening_before_any_peer() {
+    let (tx, mut rx) = Engine::spawn();
+    let addr: std::net::SocketAddr = "127.0.0.1:19941".parse().unwrap();
+
+    tx.send(Command::Connect {
+        id: ConnectionId::from("srv"),
+        config: TransportConfig::Tcp {
+            mode: TcpMode::Server { listen: addr },
+        },
+        retry: None,
+    })
+    .await
+    .unwrap();
+
+    wait_for(&mut rx, |event| {
+        matches!(
+            event,
+            Event::ConnectionStatus {
+                id,
+                status: ConnectionStatus::Listening
+            } if id.0 == "srv"
+        )
+    })
+    .await;
+
+    // The port really is open: connecting to it has to succeed.
+    let peer = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("a listening server must accept a connection");
+    wait_all_connected(&mut rx, &["srv"]).await;
+
+    // And losing the peer sends it back to listening rather than leaving it
+    // looking connected with nothing on the line.
+    drop(peer);
+    wait_for(&mut rx, |event| {
+        matches!(
+            event,
+            Event::ConnectionStatus {
+                id,
+                status: ConnectionStatus::Listening
+            } if id.0 == "srv"
+        )
+    })
+    .await;
+}
+
 /// A retrying connection keeps knocking and comes up on its own once the peer
 /// finally shows up, with no command from the caller in between.
 #[tokio::test]

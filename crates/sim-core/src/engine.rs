@@ -249,15 +249,25 @@ fn start_connection(
             let outcome = match open_transport(config.clone()).await {
                 Ok(mut transport) => {
                     failures = 0;
-                    task_connected.store(true, Ordering::Relaxed);
-                    let _ = events
-                        .send(Event::ConnectionStatus {
-                            id: id.clone(),
-                            status: ConnectionStatus::Connected,
-                        })
-                        .await;
-                    let ended =
-                        run_connection(id.clone(), &mut transport, &mut outgoing_rx, &events).await;
+                    // A server that is merely bound is not connected yet;
+                    // `run_connection` announces it as listening instead.
+                    if transport.is_ready() {
+                        task_connected.store(true, Ordering::Relaxed);
+                        let _ = events
+                            .send(Event::ConnectionStatus {
+                                id: id.clone(),
+                                status: ConnectionStatus::Connected,
+                            })
+                            .await;
+                    }
+                    let ended = run_connection(
+                        id.clone(),
+                        &mut transport,
+                        &mut outgoing_rx,
+                        &events,
+                        &task_connected,
+                    )
+                    .await;
                     task_connected.store(false, Ordering::Relaxed);
                     ended
                 }
@@ -368,6 +378,14 @@ impl Transport for TransportKind {
         }
     }
 
+    fn is_ready(&self) -> bool {
+        match self {
+            TransportKind::Udp(t) => t.is_ready(),
+            TransportKind::Tcp(t) => t.is_ready(),
+            TransportKind::Serial(t) => t.is_ready(),
+        }
+    }
+
     async fn relisten(&mut self) -> Result<bool, TransportError> {
         match self {
             TransportKind::Udp(t) => t.relisten().await,
@@ -386,8 +404,47 @@ async fn run_connection<T: Transport>(
     transport: &mut T,
     outgoing_rx: &mut mpsc::Receiver<Vec<u8>>,
     events: &mpsc::Sender<Event>,
+    connected: &AtomicBool,
 ) -> Ended {
     loop {
+        // A server holds its port before anyone calls, and again after a peer
+        // hangs up. Both are reported as `Listening` rather than left looking
+        // half connected, and no send is accepted meanwhile.
+        if !transport.is_ready() {
+            connected.store(false, Ordering::Relaxed);
+            let _ = events
+                .send(Event::ConnectionStatus {
+                    id: id.clone(),
+                    status: ConnectionStatus::Listening,
+                })
+                .await;
+            match transport.relisten().await {
+                Ok(true) => {
+                    connected.store(true, Ordering::Relaxed);
+                    let _ = events
+                        .send(Event::ConnectionStatus {
+                            id: id.clone(),
+                            status: ConnectionStatus::Connected,
+                        })
+                        .await;
+                }
+                // Nothing to accept on, so the link is done for good.
+                Ok(false) => return Ended::Link,
+                Err(source) => {
+                    report_error(
+                        events,
+                        Some(id.clone()),
+                        EngineError::Transport {
+                            id: id.clone(),
+                            source,
+                        },
+                    )
+                    .await;
+                    return Ended::Link;
+                }
+            }
+        }
+
         tokio::select! {
             outgoing = outgoing_rx.recv() => {
                 let Some(bytes) = outgoing else { return Ended::Locally };
@@ -414,19 +471,12 @@ async fn run_connection<T: Transport>(
                     }
                     Err(source) => {
                         report_error(events, Some(id.clone()), EngineError::Transport { id: id.clone(), source }).await;
-                        // A listening server waits for the next peer instead of
-                        // dying with the one that just hung up.
-                        match transport.relisten().await {
-                            Ok(true) => {
-                                let _ = events
-                                    .send(Event::ConnectionStatus { id: id.clone(), status: ConnectionStatus::Connected })
-                                    .await;
-                            }
-                            Ok(false) => return Ended::Link,
-                            Err(source) => {
-                                report_error(events, Some(id.clone()), EngineError::Transport { id: id.clone(), source }).await;
-                                return Ended::Link;
-                            }
+                        // A transport that lost its peer reports itself as not
+                        // ready, and the top of the loop waits for the next one.
+                        // One that cannot recover stays ready and errors again,
+                        // so end it here rather than spinning on a dead socket.
+                        if transport.is_ready() {
+                            return Ended::Link;
                         }
                     }
                 }

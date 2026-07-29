@@ -27,7 +27,9 @@ fn bind_listener(addr: SocketAddr) -> Result<TcpListener, TransportError> {
 }
 
 pub struct TcpTransport {
-    stream: TcpStream,
+    /// `None` between peers: a bound server exists before anyone connects to it
+    /// and outlives the client that hangs up.
+    stream: Option<TcpStream>,
     peer: Option<SocketAddr>,
     /// Kept by servers so a peer hanging up sends them back to accepting rather
     /// than ending the connection. `None` for clients, which have nothing to
@@ -42,43 +44,73 @@ impl TcpTransport {
     /// Returns an error if the connection to `addr` cannot be established.
     pub async fn connect(addr: SocketAddr) -> Result<Self, TransportError> {
         let stream = TcpStream::connect(addr).await?;
-        Ok(Self::new(stream, None))
+        Ok(Self {
+            peer: stream.peer_addr().ok(),
+            stream: Some(stream),
+            listener: None,
+            buf: vec![0u8; RECV_BUFFER_SIZE],
+        })
     }
 
+    /// Binds the listening socket, without waiting for a peer.
+    ///
+    /// Accepting is left to [`Transport::relisten`] so that binding the port and
+    /// getting a client are two observable steps: a server is up the moment it
+    /// holds the port, whether or not anyone has called yet.
+    ///
     /// # Errors
     ///
-    /// Returns an error if `listen` cannot be bound or no peer connects.
+    /// Returns an error if `listen` cannot be bound.
+    #[expect(
+        clippy::unused_async,
+        reason = "async is what forces callers into a runtime, which from_std requires"
+    )]
     pub async fn listen(listen: SocketAddr) -> Result<Self, TransportError> {
-        let listener = bind_listener(listen)?;
-        let (stream, _peer) = listener.accept().await?;
-        Ok(Self::new(stream, Some(listener)))
+        Ok(Self {
+            stream: None,
+            peer: None,
+            listener: Some(bind_listener(listen)?),
+            buf: vec![0u8; RECV_BUFFER_SIZE],
+        })
     }
 
-    fn new(stream: TcpStream, listener: Option<TcpListener>) -> Self {
-        Self {
-            peer: stream.peer_addr().ok(),
-            stream,
-            listener,
-            buf: vec![0u8; RECV_BUFFER_SIZE],
-        }
+    fn stream_mut(&mut self) -> Result<&mut TcpStream, TransportError> {
+        self.stream.as_mut().ok_or(TransportError::Closed)
     }
 }
 
 impl Transport for TcpTransport {
     async fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        self.stream.write_all(bytes).await?;
+        self.stream_mut()?.write_all(bytes).await?;
         Ok(())
     }
 
     async fn recv(&mut self) -> Result<Received, TransportError> {
-        let n = self.stream.read(&mut self.buf).await?;
-        if n == 0 {
-            return Err(TransportError::Closed);
-        }
+        let Self { stream, buf, .. } = self;
+        let stream = stream.as_mut().ok_or(TransportError::Closed)?;
+        let n = match stream.read(buf).await {
+            Ok(0) => {
+                // The peer hung up. Dropping the stream is what puts a server
+                // back to waiting instead of reading a dead socket forever.
+                self.stream = None;
+                self.peer = None;
+                return Err(TransportError::Closed);
+            }
+            Ok(n) => n,
+            Err(source) => {
+                self.stream = None;
+                self.peer = None;
+                return Err(source.into());
+            }
+        };
         Ok(Received {
             bytes: self.buf[..n].to_vec(),
             source: self.peer,
         })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.stream.is_some()
     }
 
     async fn relisten(&mut self) -> Result<bool, TransportError> {
@@ -87,7 +119,7 @@ impl Transport for TcpTransport {
         };
         let (stream, _) = listener.accept().await?;
         self.peer = stream.peer_addr().ok();
-        self.stream = stream;
+        self.stream = Some(stream);
         Ok(true)
     }
 }
