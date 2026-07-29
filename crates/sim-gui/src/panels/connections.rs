@@ -39,6 +39,7 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
     }
 
     let mut to_disconnect = Vec::new();
+    let mut to_reconnect = Vec::new();
     let mut to_remove = Vec::new();
     for (id, entry) in &state.connections {
         ui.horizontal(|ui| {
@@ -47,6 +48,13 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
             ui.label(kind_summary(entry));
             match entry.status {
                 ConnectionStatus::Disconnected => {
+                    if ui
+                        .button(icons::PLUG)
+                        .on_hover_text("Reconnect with the same settings")
+                        .clicked()
+                    {
+                        to_reconnect.push(id.clone());
+                    }
                     if ui.button(icons::TRASH).on_hover_text("Remove").clicked() {
                         to_remove.push(id.clone());
                     }
@@ -66,6 +74,11 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
 
     for id in to_disconnect {
         engine.disconnect(id);
+    }
+    for id in to_reconnect {
+        if let Some(config) = state.begin_reconnect(&id) {
+            engine.connect(id, config);
+        }
     }
     for id in to_remove {
         state.remove_connection(&id);

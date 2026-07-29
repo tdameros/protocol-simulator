@@ -31,6 +31,21 @@ impl AppState {
             .map(|(_, entry)| entry)
     }
 
+    /// Puts a dropped connection back into `Connecting` and hands back the
+    /// config it was created with, so reopening it costs one click instead of
+    /// deleting the entry and typing everything again.
+    ///
+    /// Returns `None` for a connection that is not down, which is what makes
+    /// the button safe to press twice.
+    pub fn begin_reconnect(&mut self, id: &ConnectionId) -> Option<TransportConfig> {
+        let entry = self.connection_mut(id)?;
+        if entry.status != ConnectionStatus::Disconnected {
+            return None;
+        }
+        entry.status = ConnectionStatus::Connecting;
+        Some(entry.config.clone())
+    }
+
     pub fn remove_connection(&mut self, id: &ConnectionId) {
         self.connections.retain(|(cid, _)| cid != id);
         if self.hex_target.as_ref() == Some(id) {
@@ -242,6 +257,41 @@ mod tests {
             udp_remote: remote.to_owned(),
             ..NewConnectionForm::default()
         }
+    }
+
+    #[test]
+    fn a_dropped_connection_reconnects_with_the_settings_it_had() {
+        let id = ConnectionId("link".to_owned());
+        let mut state = AppState {
+            connections: vec![(
+                id.clone(),
+                ConnectionEntry {
+                    config: TransportConfig::Udp {
+                        bind: "127.0.0.1:9000".parse().unwrap(),
+                        remote: "127.0.0.1:9001".parse().unwrap(),
+                    },
+                    status: ConnectionStatus::Connected,
+                },
+            )],
+            ..AppState::default()
+        };
+
+        // Nothing to reconnect while it is up, so the button cannot restart a
+        // live connection behind your back.
+        assert!(state.begin_reconnect(&id).is_none());
+
+        state.connection_mut(&id).unwrap().status = ConnectionStatus::Disconnected;
+        assert!(matches!(
+            state.begin_reconnect(&id),
+            Some(TransportConfig::Udp { .. })
+        ));
+        assert_eq!(state.status_of(&id), Some(ConnectionStatus::Connecting));
+
+        // And now that it is connecting again, pressing twice is a no-op.
+        assert!(state.begin_reconnect(&id).is_none());
+        assert!(state
+            .begin_reconnect(&ConnectionId("gone".to_owned()))
+            .is_none());
     }
 
     #[test]
