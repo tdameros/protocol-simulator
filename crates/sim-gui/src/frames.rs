@@ -5,6 +5,9 @@ use sim_core::frame::schema;
 use sim_core::frame::value::{FieldValues, Value};
 use sim_core::frame::{FieldKind, FrameDef, ScalarType};
 
+/// Subdirectory holding the type definitions every frame in the folder can use.
+const TYPES_DIR: &str = "types";
+
 /// Frame definitions loaded from a directory, plus the values being edited.
 ///
 /// The TOML files stay the source of truth: the library only reads them, so the
@@ -15,6 +18,8 @@ pub struct FrameLibrary {
     pub frames: Vec<FrameDef>,
     /// Files that failed to load, as (file name, reason).
     pub failures: Vec<(String, String)>,
+    /// Names of the shared types available to every frame in the folder.
+    pub shared_types: Vec<String>,
     pub selected: Option<usize>,
     /// Edited values, keyed by frame name so switching frames keeps your input.
     values: BTreeMap<String, FieldValues>,
@@ -24,9 +29,12 @@ impl FrameLibrary {
     pub fn load_from(&mut self, directory: PathBuf) {
         self.frames.clear();
         self.failures.clear();
+        self.shared_types.clear();
 
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
+        let types = self.load_shared_types(&directory);
+
+        let paths = match schema::toml_files(&directory) {
+            Ok(paths) => paths,
             Err(error) => {
                 self.failures
                     .push((directory.display().to_string(), error.to_string()));
@@ -35,15 +43,8 @@ impl FrameLibrary {
             }
         };
 
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-            .collect();
-        paths.sort();
-
         for path in paths {
-            match schema::load(&path) {
+            match schema::load_with(&path, &types) {
                 Ok(frame) => self.frames.push(frame),
                 Err(error) => self.failures.push((file_label(&path), error.to_string())),
             }
@@ -52,6 +53,34 @@ impl FrameLibrary {
         self.frames.sort_by(|a, b| a.name.cmp(&b.name));
         self.selected = (!self.frames.is_empty()).then_some(0);
         self.directory = Some(directory);
+    }
+
+    /// Reads `types/`, one file at a time so a broken one costs only itself.
+    fn load_shared_types(&mut self, directory: &Path) -> schema::TypeLibrary {
+        let mut types = schema::TypeLibrary::default();
+        let types_dir = directory.join(TYPES_DIR);
+        if !types_dir.is_dir() {
+            return types;
+        }
+
+        match schema::toml_files(&types_dir) {
+            Ok(paths) => {
+                for path in paths {
+                    if let Err(error) = types.merge_file(&path) {
+                        self.failures.push((
+                            format!("{TYPES_DIR}/{}", file_label(&path)),
+                            error.to_string(),
+                        ));
+                    }
+                }
+            }
+            Err(error) => self
+                .failures
+                .push((TYPES_DIR.to_owned(), error.to_string())),
+        }
+
+        self.shared_types = types.names().into_iter().map(ToOwned::to_owned).collect();
+        types
     }
 
     pub fn reload(&mut self) {
@@ -210,6 +239,49 @@ bits = [{ name = "only", width = 3 }]
             library.values_mut(&frame).get("sync"),
             Some(&Value::Uint(0xAA55))
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shared_types_are_read_from_the_types_subfolder() {
+        let dir = scratch("types");
+        std::fs::create_dir_all(dir.join(TYPES_DIR)).unwrap();
+        std::fs::write(
+            dir.join(TYPES_DIR).join("led.toml"),
+            r#"
+[[type]]
+name = "LedConfig"
+[[type.field]]
+name = "mode"
+type = "u8"
+[[type.field]]
+name = "period_ms"
+type = "u16"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("bank.toml"),
+            r#"
+name = "Bank"
+[[field]]
+name = "led"
+type = "LedConfig"
+repeat = 3
+"#,
+        )
+        .unwrap();
+
+        let mut library = FrameLibrary::default();
+        library.load_from(dir.clone());
+
+        assert!(library.failures.is_empty(), "{:?}", library.failures);
+        assert_eq!(library.shared_types, ["LedConfig"]);
+        // The subfolder itself must not be mistaken for a frame file.
+        assert_eq!(library.frames.len(), 1);
+        assert_eq!(library.frames[0].fields.len(), 6);
+        assert_eq!(library.frames[0].size(), 9);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -30,20 +30,23 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         return;
     };
 
+    let groups = group_fields(&frame);
     ScrollArea::vertical()
         .id_salt("frame_fields")
         .max_height(ui.available_height() * 0.55)
         .show(ui, |ui| {
             let values = state.frames.values_mut(&frame);
-            egui::Grid::new("frame_field_grid")
-                .num_columns(3)
-                .striped(true)
-                .show(ui, |ui| {
-                    for field in &frame.fields {
-                        field_row(ui, field, values);
-                        ui.end_row();
-                    }
-                });
+            for (index, group) in groups.iter().enumerate() {
+                let Some(path) = group.path else {
+                    field_grid(ui, index, &group.fields, values);
+                    continue;
+                };
+                let size: usize = group.fields.iter().map(|field| field.kind.size()).sum();
+                egui::CollapsingHeader::new(RichText::new(format!("{path}  ·  {size} B")).strong())
+                    .id_salt(("frame_group", index))
+                    .default_open(true)
+                    .show(ui, |ui| field_grid(ui, index, &group.fields, values));
+            }
         });
 
     ui.separator();
@@ -76,6 +79,9 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         ui.label(RichText::new(directory.display().to_string()).weak());
     } else {
         ui.label("Pick the folder holding your frame .toml files.");
+    }
+    if !state.frames.shared_types.is_empty() {
+        ui.label(RichText::new(format!("types/: {}", state.frames.shared_types.join(", "))).weak());
     }
 }
 
@@ -135,10 +141,62 @@ fn show_failures(ui: &mut Ui, state: &AppState) {
     }
 }
 
+/// Fields that came from one instantiated type, so a block of eight LEDs reads
+/// as eight groups rather than as twenty-four loose rows.
+struct FieldGroup<'a> {
+    /// The shared instance path, or `None` for fields declared directly.
+    path: Option<&'a str>,
+    fields: Vec<&'a FieldDef>,
+}
+
+fn group_fields(frame: &FrameDef) -> Vec<FieldGroup<'_>> {
+    let mut groups: Vec<FieldGroup<'_>> = Vec::new();
+    for field in &frame.fields {
+        let path = instance_path(&field.name);
+        match groups.last_mut() {
+            Some(group) if group.path == path => group.fields.push(field),
+            _ => groups.push(FieldGroup {
+                path,
+                fields: vec![field],
+            }),
+        }
+    }
+    groups
+}
+
+/// Everything before the last separator: `led[2].mode` belongs to `led[2]`.
+fn instance_path(name: &str) -> Option<&str> {
+    name.rfind('.').map(|at| &name[..at])
+}
+
+fn leaf_name(name: &str) -> &str {
+    name.rfind('.').map_or(name, |at| &name[at + 1..])
+}
+
+fn field_grid(
+    ui: &mut Ui,
+    id: usize,
+    fields: &[&FieldDef],
+    values: &mut sim_core::frame::value::FieldValues,
+) {
+    egui::Grid::new(("frame_field_grid", id))
+        .num_columns(3)
+        .striped(true)
+        .show(ui, |ui| {
+            for field in fields {
+                field_row(ui, field, values);
+                ui.end_row();
+            }
+        });
+}
+
 fn field_row(ui: &mut Ui, field: &FieldDef, values: &mut sim_core::frame::value::FieldValues) {
-    let mut label = ui.label(RichText::new(&field.name).strong());
+    let mut label = ui.label(RichText::new(leaf_name(&field.name)).strong());
     if let Some(description) = &field.description {
         label = label.on_hover_text(description);
+    }
+    if instance_path(&field.name).is_some() {
+        label = label.on_hover_text(&field.name);
     }
     let _ = label;
 
