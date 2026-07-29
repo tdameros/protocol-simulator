@@ -1,4 +1,4 @@
-use sim_core::{Command, ConnectionId, Engine, Event, TransportConfig};
+use sim_core::{Command, ConnectionId, Engine, Event, RetryPolicy, TransportConfig};
 
 use tokio::sync::mpsc;
 
@@ -16,8 +16,8 @@ impl EngineHandle {
         }
     }
 
-    pub fn connect(&self, id: ConnectionId, config: TransportConfig) {
-        self.send(Command::Connect { id, config });
+    pub fn connect(&self, id: ConnectionId, config: TransportConfig, retry: Option<RetryPolicy>) {
+        self.send(Command::Connect { id, config, retry });
     }
 
     pub fn disconnect(&self, id: ConnectionId) {

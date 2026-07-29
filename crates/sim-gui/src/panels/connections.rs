@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use sim_core::ConnectionStatus;
+use sim_core::{ConnectionStatus, RetryPolicy};
 
 use egui::{Color32, ComboBox, RichText, Ui};
 use egui_phosphor::regular as icons;
@@ -17,12 +17,17 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
         .clicked()
     {
         if let Some((id, config)) = state.new_connection.build(&state.connections) {
-            engine.connect(id.clone(), config.clone());
+            let retry = state
+                .new_connection
+                .auto_reconnect
+                .then(RetryPolicy::standard);
+            engine.connect(id.clone(), config.clone(), retry);
             state.connections.push((
                 id,
                 ConnectionEntry {
                     config,
                     status: ConnectionStatus::Connecting,
+                    retry,
                 },
             ));
             state.new_connection.name.clear();
@@ -46,6 +51,10 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
             ui.label(status_dot(entry.status));
             ui.label(RichText::new(&id.0).strong());
             ui.label(kind_summary(entry));
+            if entry.retry.is_some() {
+                ui.label(RichText::new(icons::ARROWS_CLOCKWISE).weak())
+                    .on_hover_text("Reopens itself when the link drops");
+            }
             match entry.status {
                 ConnectionStatus::Disconnected => {
                     if ui
@@ -76,8 +85,8 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
         engine.disconnect(id);
     }
     for id in to_reconnect {
-        if let Some(config) = state.begin_reconnect(&id) {
-            engine.connect(id, config);
+        if let Some((config, retry)) = state.begin_reconnect(&id) {
+            engine.connect(id, config, retry);
         }
     }
     for id in to_remove {
@@ -116,6 +125,9 @@ fn new_connection_form(ui: &mut Ui, form: &mut NewConnectionForm) {
         }
         TransportKindChoice::Serial => serial_fields(ui, form),
     }
+
+    ui.checkbox(&mut form.auto_reconnect, "Auto-reconnect")
+        .on_hover_text("Keep retrying when the link drops, backing off from 0.5 s up to 10 s");
 }
 
 fn udp_fields(ui: &mut Ui, form: &mut NewConnectionForm) {

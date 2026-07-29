@@ -2,7 +2,9 @@ use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::SystemTime;
 
-use sim_core::{ConnectionId, ConnectionStatus, EngineError, TcpMode, TransportConfig};
+use sim_core::{
+    ConnectionId, ConnectionStatus, EngineError, RetryPolicy, TcpMode, TransportConfig,
+};
 use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
 
 /// Cap on retained traffic entries.
@@ -37,13 +39,16 @@ impl AppState {
     ///
     /// Returns `None` for a connection that is not down, which is what makes
     /// the button safe to press twice.
-    pub fn begin_reconnect(&mut self, id: &ConnectionId) -> Option<TransportConfig> {
+    pub fn begin_reconnect(
+        &mut self,
+        id: &ConnectionId,
+    ) -> Option<(TransportConfig, Option<RetryPolicy>)> {
         let entry = self.connection_mut(id)?;
         if entry.status != ConnectionStatus::Disconnected {
             return None;
         }
         entry.status = ConnectionStatus::Connecting;
-        Some(entry.config.clone())
+        Some((entry.config.clone(), entry.retry))
     }
 
     pub fn remove_connection(&mut self, id: &ConnectionId) {
@@ -78,6 +83,9 @@ impl AppState {
 pub struct ConnectionEntry {
     pub config: TransportConfig,
     pub status: ConnectionStatus,
+    /// Kept so a manual reconnect reuses the policy the connection was made
+    /// with, rather than silently dropping it.
+    pub retry: Option<RetryPolicy>,
 }
 
 pub struct LogEntry {
@@ -128,6 +136,7 @@ pub struct NewConnectionForm {
     pub serial_parity: Parity,
     pub serial_stop_bits: StopBits,
     pub serial_flow_control: FlowControl,
+    pub auto_reconnect: bool,
     pub error: Option<String>,
 }
 
@@ -146,6 +155,7 @@ impl Default for NewConnectionForm {
             serial_parity: Parity::None,
             serial_stop_bits: StopBits::One,
             serial_flow_control: FlowControl::None,
+            auto_reconnect: false,
             error: None,
         }
     }
@@ -271,6 +281,7 @@ mod tests {
                         remote: "127.0.0.1:9001".parse().unwrap(),
                     },
                     status: ConnectionStatus::Connected,
+                    retry: Some(RetryPolicy::standard()),
                 },
             )],
             ..AppState::default()
@@ -281,9 +292,10 @@ mod tests {
         assert!(state.begin_reconnect(&id).is_none());
 
         state.connection_mut(&id).unwrap().status = ConnectionStatus::Disconnected;
+        // The policy it was created with comes back with the config.
         assert!(matches!(
             state.begin_reconnect(&id),
-            Some(TransportConfig::Udp { .. })
+            Some((TransportConfig::Udp { .. }, Some(policy))) if policy == RetryPolicy::standard()
         ));
         assert_eq!(state.status_of(&id), Some(ConnectionStatus::Connecting));
 
