@@ -10,6 +10,7 @@ use crate::engine_handle::EngineHandle;
 use crate::state::AppState;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
+const WARNING: Color32 = Color32::from_rgb(200, 120, 40);
 
 pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     library_bar(ui, state);
@@ -418,16 +419,13 @@ fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, fr
 
     ui.heading("Preview");
     match &encoded {
-        Ok(bytes) => {
-            ui.label(
-                RichText::new(to_hex_spaced(bytes))
-                    .text_style(TextStyle::Monospace)
-                    .strong(),
-            );
-        }
+        Ok(bytes) => hex_preview(ui, state, frame, bytes),
         Err(error) => {
             ui.colored_label(ERROR, error.to_string());
         }
+    }
+    if let Some(note) = &state.frame_hex_note {
+        ui.colored_label(WARNING, note);
     }
 
     let connected: Vec<_> = state
@@ -465,7 +463,7 @@ fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, fr
         == Some(ConnectionStatus::Connected);
     if let (Some(id), false) = (state.frame_target.as_ref(), target_ready) {
         ui.colored_label(
-            Color32::from_rgb(200, 120, 40),
+            WARNING,
             format!("\"{}\" is not connected — reconnect it to send.", id.0),
         );
     }
@@ -482,6 +480,81 @@ fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, fr
             engine.send_raw(id, bytes);
         }
     }
+}
+
+/// The encoded frame, editable: typing bytes drives the fields above.
+///
+/// The box only mirrors the encoder while it is not focused. Once it is, the
+/// text is whatever was typed, and the fields follow it instead.
+fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: &[u8]) {
+    let id = egui::Id::new(("frame_hex", &frame.name));
+    if !ui.memory(|memory| memory.has_focus(id)) {
+        state.frame_hex = to_hex_spaced(bytes);
+        state.frame_hex_note = None;
+    }
+
+    let response = ui.add(
+        egui::TextEdit::multiline(&mut state.frame_hex)
+            .id(id)
+            .font(TextStyle::Monospace)
+            .desired_rows(2),
+    );
+
+    if response.changed() {
+        let typed = state.frame_hex.clone();
+        state.frame_hex_note = apply_hex(state, frame, &typed);
+    }
+}
+
+/// Decodes typed hex back into the field values.
+///
+/// Returns what the operator should know about: why nothing was applied, or
+/// what the frame will not keep.
+fn apply_hex(state: &mut AppState, frame: &FrameDef, typed: &str) -> Option<String> {
+    let cleaned: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+    if !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some("Not hexadecimal.".to_owned());
+    }
+    // Half a byte typed is someone mid-keystroke, not a mistake to point at.
+    let bytes = parse_hex(&cleaned)?;
+    if bytes.len() != frame.size() {
+        return Some(format!(
+            "{} bytes typed, the frame is {}.",
+            bytes.len(),
+            frame.size()
+        ));
+    }
+
+    let decoded = match codec::decode(frame, &bytes) {
+        Ok(decoded) => decoded,
+        Err(error) => return Some(error.to_string()),
+    };
+
+    let values = state.frames.values_mut(frame);
+    for field in &frame.fields {
+        // Checksums are recomputed on encode, so writing one back would be
+        // overwritten anyway; the mismatch below is the honest report.
+        if matches!(field.kind, FieldKind::Checksum { .. }) {
+            continue;
+        }
+        if let Some(value) = decoded.values.get(&field.name) {
+            values.insert(field.name.clone(), value.clone());
+        }
+    }
+
+    // Worth saying out loud: paste a capture with a bad checksum and the
+    // preview will quietly show the corrected one a moment later.
+    (!decoded.checksum_mismatches.is_empty()).then(|| {
+        let fields: Vec<&str> = decoded
+            .checksum_mismatches
+            .iter()
+            .map(|mismatch| mismatch.field.as_str())
+            .collect();
+        format!(
+            "{} did not match; the preview will show the recomputed value.",
+            fields.join(", ")
+        )
+    })
 }
 
 fn max_unsigned(scalar: ScalarType) -> u64 {
@@ -578,6 +651,89 @@ mod tests {
 
         // Folding `zone` hides four fields, whatever the depth they sit at.
         assert_eq!(tree[1].size(), 8);
+    }
+
+    /// Four bytes, the last one a checksum, so the round trip is easy to read.
+    const GUARDED: &str = r#"
+name = "Guarded"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+
+[[field]]
+name = "mode"
+type = "enum"
+repr = "u8"
+variants = { IDLE = 0, RUN = 1, FAULT = 2 }
+
+[[field]]
+name = "check"
+type = "xor8"
+covers = { from = "sync", to = "mode" }
+"#;
+
+    fn guarded() -> FrameDef {
+        sim_core::frame::schema::from_toml(GUARDED).expect("fixture should parse")
+    }
+
+    #[test]
+    fn typing_hex_drives_the_fields() {
+        let frame = guarded();
+        let mut state = AppState::default();
+
+        // 0xAA ^ 0x55 ^ 0x02 = 0xFD
+        assert_eq!(apply_hex(&mut state, &frame, "AA 55 02 FD"), None);
+
+        let values = state.frames.values_mut(&frame);
+        assert_eq!(values["sync"], Value::Uint(0xAA55));
+        assert_eq!(values["mode"], Value::Uint(2));
+        // Recomputed on encode, so it is never written back as a value.
+        assert!(!values.contains_key("check"));
+    }
+
+    #[test]
+    fn an_incomplete_byte_is_not_worth_complaining_about() {
+        let frame = guarded();
+        let mut state = AppState::default();
+
+        state
+            .frames
+            .values_mut(&frame)
+            .insert("mode".to_owned(), Value::Uint(2));
+
+        // Mid-keystroke: silent, and what is already there is left alone.
+        assert_eq!(apply_hex(&mut state, &frame, "AA 5"), None);
+        assert_eq!(state.frames.values_mut(&frame)["mode"], Value::Uint(2));
+
+        assert_eq!(
+            apply_hex(&mut state, &frame, "AA ZZ"),
+            Some("Not hexadecimal.".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_short_frame_says_how_short() {
+        let frame = guarded();
+        let mut state = AppState::default();
+        let note = apply_hex(&mut state, &frame, "AA 55").expect("should be reported");
+        assert!(note.contains('2') && note.contains('4'), "got {note}");
+    }
+
+    #[test]
+    fn a_wrong_checksum_is_applied_but_flagged() {
+        let frame = guarded();
+        let mut state = AppState::default();
+
+        // Right bytes, deliberately wrong check byte.
+        let note = apply_hex(&mut state, &frame, "AA 55 02 00").expect("should be reported");
+        assert!(note.contains("check"), "got {note}");
+
+        // The fields still took the pasted values: a capture with a bad
+        // checksum is exactly what you want to look at.
+        assert_eq!(state.frames.values_mut(&frame)["mode"], Value::Uint(2));
     }
 
     #[test]

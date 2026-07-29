@@ -21,6 +21,14 @@ pub struct AppState {
     pub hex_input: String,
     pub hex_target: Option<ConnectionId>,
     pub frames: crate::frames::FrameLibrary,
+    /// Text of the frame editor's hex preview while it is being typed into.
+    ///
+    /// Held apart from the fields because the two disagree mid-edit: half a
+    /// byte typed is not a frame yet, and overwriting the box with the
+    /// re-encoded bytes on every repaint would fight whoever is typing.
+    pub frame_hex: String,
+    /// Why the typed hex was not applied, or what it changed on the way in.
+    pub frame_hex_note: Option<String>,
     pub frame_target: Option<ConnectionId>,
     pub last_error: Option<String>,
 }
