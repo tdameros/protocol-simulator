@@ -30,23 +30,13 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         return;
     };
 
-    let groups = group_fields(&frame);
+    let tree = build_tree(&frame.fields);
     ScrollArea::vertical()
         .id_salt("frame_fields")
         .max_height(ui.available_height() * 0.55)
         .show(ui, |ui| {
             let values = state.frames.values_mut(&frame);
-            for (index, group) in groups.iter().enumerate() {
-                let Some(path) = group.path else {
-                    field_grid(ui, index, &group.fields, values);
-                    continue;
-                };
-                let size: usize = group.fields.iter().map(|field| field.kind.size()).sum();
-                egui::CollapsingHeader::new(RichText::new(format!("{path}  ·  {size} B")).strong())
-                    .id_salt(("frame_group", index))
-                    .default_open(true)
-                    .show(ui, |ui| field_grid(ui, index, &group.fields, values));
-            }
+            show_entries(ui, &tree, values);
         });
 
     ui.separator();
@@ -141,53 +131,113 @@ fn show_failures(ui: &mut Ui, state: &AppState) {
     }
 }
 
-/// Fields that came from one instantiated type, so a block of eight LEDs reads
-/// as eight groups rather than as twenty-four loose rows.
-struct FieldGroup<'a> {
-    /// The shared instance path, or `None` for fields declared directly.
-    path: Option<&'a str>,
-    fields: Vec<&'a FieldDef>,
+/// One level of the field tree rebuilt from the dotted names an instantiated
+/// type produces, so `zone.left` folds away with everything under it.
+enum Entry<'a> {
+    Field(&'a FieldDef),
+    Group(Group<'a>),
 }
 
-fn group_fields(frame: &FrameDef) -> Vec<FieldGroup<'_>> {
-    let mut groups: Vec<FieldGroup<'_>> = Vec::new();
-    for field in &frame.fields {
-        let path = instance_path(&field.name);
-        match groups.last_mut() {
-            Some(group) if group.path == path => group.fields.push(field),
-            _ => groups.push(FieldGroup {
-                path,
-                fields: vec![field],
-            }),
+struct Group<'a> {
+    /// The last path segment, which is what the header shows.
+    label: &'a str,
+    /// The whole path, used to decide what belongs to this group.
+    path: &'a str,
+    /// Name of the first field inside, which unlike the path is always unique
+    /// even when hand-written names interleave two blocks.
+    salt: &'a str,
+    entries: Vec<Entry<'a>>,
+}
+
+impl Entry<'_> {
+    fn size(&self) -> usize {
+        match self {
+            Self::Field(field) => field.kind.size(),
+            Self::Group(group) => group.entries.iter().map(Self::size).sum(),
         }
     }
-    groups
 }
 
-/// Everything before the last separator: `led[2].mode` belongs to `led[2]`.
-fn instance_path(name: &str) -> Option<&str> {
-    name.rfind('.').map(|at| &name[..at])
+fn build_tree(fields: &[FieldDef]) -> Vec<Entry<'_>> {
+    let mut root = Vec::new();
+    for field in fields {
+        insert(&mut root, field, 0);
+    }
+    root
+}
+
+/// Files declare fields in wire order, so a group only ever extends the entry
+/// that precedes it: display order can never drift from the byte order.
+fn insert<'a>(entries: &mut Vec<Entry<'a>>, field: &'a FieldDef, at: usize) {
+    let Some(dot) = field.name[at..].find('.') else {
+        entries.push(Entry::Field(field));
+        return;
+    };
+    let path = &field.name[..at + dot];
+    let next = at + dot + 1;
+
+    if let Some(Entry::Group(group)) = entries.last_mut() {
+        if group.path == path {
+            insert(&mut group.entries, field, next);
+            return;
+        }
+    }
+    let mut group = Group {
+        label: &field.name[at..at + dot],
+        path,
+        salt: &field.name,
+        entries: Vec::new(),
+    };
+    insert(&mut group.entries, field, next);
+    entries.push(Entry::Group(group));
 }
 
 fn leaf_name(name: &str) -> &str {
     name.rfind('.').map_or(name, |at| &name[at + 1..])
 }
 
-fn field_grid(
+fn show_entries(
     ui: &mut Ui,
-    id: usize,
-    fields: &[&FieldDef],
+    entries: &[Entry<'_>],
     values: &mut sim_core::frame::value::FieldValues,
 ) {
-    egui::Grid::new(("frame_field_grid", id))
+    // Consecutive fields share one grid so their columns line up; a group
+    // interrupts the run because its rows are indented one level deeper.
+    let mut run: Vec<&FieldDef> = Vec::new();
+    for entry in entries {
+        match entry {
+            Entry::Field(field) => run.push(field),
+            Entry::Group(group) => {
+                field_grid(ui, &mut run, values);
+                let header = format!("{}  ·  {} B", group.label, entry.size());
+                egui::CollapsingHeader::new(RichText::new(header).strong())
+                    .id_salt(group.salt)
+                    .default_open(true)
+                    .show(ui, |ui| show_entries(ui, &group.entries, values));
+            }
+        }
+    }
+    field_grid(ui, &mut run, values);
+}
+
+fn field_grid(
+    ui: &mut Ui,
+    run: &mut Vec<&FieldDef>,
+    values: &mut sim_core::frame::value::FieldValues,
+) {
+    let Some(first) = run.first() else {
+        return;
+    };
+    egui::Grid::new(("frame_field_grid", &first.name))
         .num_columns(3)
         .striped(true)
         .show(ui, |ui| {
-            for field in fields {
+            for field in run.iter() {
                 field_row(ui, field, values);
                 ui.end_row();
             }
         });
+    run.clear();
 }
 
 fn field_row(ui: &mut Ui, field: &FieldDef, values: &mut sim_core::frame::value::FieldValues) {
@@ -195,7 +245,7 @@ fn field_row(ui: &mut Ui, field: &FieldDef, values: &mut sim_core::frame::value:
     if let Some(description) = &field.description {
         label = label.on_hover_text(description);
     }
-    if instance_path(&field.name).is_some() {
+    if field.name.contains('.') {
         label = label.on_hover_text(&field.name);
     }
     let _ = label;
@@ -471,4 +521,76 @@ fn parse_hex(text: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).ok())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sim_core::frame::Endianness;
+
+    /// Two bytes each, so a group's reported size is unambiguous.
+    fn field(name: &str) -> FieldDef {
+        FieldDef {
+            name: name.to_owned(),
+            description: None,
+            kind: FieldKind::Scalar(ScalarType::U16),
+            endian: Endianness::Big,
+            default: None,
+        }
+    }
+
+    fn shape(entries: &[Entry<'_>]) -> String {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                Entry::Field(field) => field.name.clone(),
+                Entry::Group(group) => format!("{}({})", group.path, shape(&group.entries)),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn nested_instances_nest_in_the_editor_too() {
+        let fields = [
+            field("header"),
+            field("zone.left.led[0].mode"),
+            field("zone.left.led[1].mode"),
+            field("zone.left.accent.red"),
+            field("zone.right.led[0].mode"),
+            field("crc"),
+        ];
+        let tree = build_tree(&fields);
+
+        assert_eq!(
+            shape(&tree),
+            "header \
+             zone(\
+             zone.left(\
+             zone.left.led[0](zone.left.led[0].mode) \
+             zone.left.led[1](zone.left.led[1].mode) \
+             zone.left.accent(zone.left.accent.red)\
+             ) \
+             zone.right(zone.right.led[0](zone.right.led[0].mode))\
+             ) \
+             crc"
+        );
+
+        // Folding `zone` hides four fields, whatever the depth they sit at.
+        assert_eq!(tree[1].size(), 8);
+    }
+
+    #[test]
+    fn a_repeated_builtin_stays_a_plain_row() {
+        let fields = [field("sample[0]"), field("sample[1]")];
+        assert_eq!(shape(&build_tree(&fields)), "sample[0] sample[1]");
+    }
+
+    #[test]
+    fn display_order_never_drifts_from_wire_order() {
+        // Hand-written names can interleave. Reuniting the two `a` blocks would
+        // move `b.y` in the listing while it stays put in the bytes.
+        let fields = [field("a.x"), field("b.y"), field("a.z")];
+        assert_eq!(shape(&build_tree(&fields)), "a(a.x) b(b.y) a(a.z)");
+    }
 }
