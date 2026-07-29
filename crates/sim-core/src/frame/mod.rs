@@ -28,6 +28,19 @@ pub enum ScalarType {
 }
 
 impl ScalarType {
+    pub const ALL: [Self; 10] = [
+        Self::U8,
+        Self::I8,
+        Self::U16,
+        Self::I16,
+        Self::U32,
+        Self::I32,
+        Self::U64,
+        Self::I64,
+        Self::F32,
+        Self::F64,
+    ];
+
     #[must_use]
     pub fn size(self) -> usize {
         match self {

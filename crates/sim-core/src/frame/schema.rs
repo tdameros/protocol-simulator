@@ -38,8 +38,40 @@ pub enum SchemaError {
     #[error("cannot serialise frame: {0}")]
     Serialise(#[from] toml::ser::Error),
 
-    #[error("field {field}: unknown type {kind}")]
-    UnknownType { field: String, kind: String },
+    #[error("field {field}: unknown type {kind}, expected one of {known}")]
+    UnknownType {
+        field: String,
+        kind: String,
+        known: String,
+    },
+
+    #[error("duplicate type name {name}")]
+    DuplicateType { name: String },
+
+    #[error("type {name} has no fields")]
+    EmptyType { name: String },
+
+    #[error("type {name} contains itself, through {path}")]
+    RecursiveType { name: String, path: String },
+
+    #[error("field {field}: repeat and instances cannot both be set")]
+    RepeatAndInstances { field: String },
+
+    #[error("field {field}: repeat must be at least 1")]
+    EmptyRepeat { field: String },
+
+    #[error("field {field}: instances must name at least one instance")]
+    EmptyInstances { field: String },
+
+    #[error("field {field}: duplicate instance name {instance}")]
+    DuplicateInstance { field: String, instance: String },
+
+    #[error("field {field}: {attribute} does not apply to type {kind}")]
+    UnexpectedAttribute {
+        field: String,
+        kind: String,
+        attribute: &'static str,
+    },
 
     #[error("field {field}: {kind} needs {missing}")]
     MissingAttribute {
@@ -83,7 +115,7 @@ pub enum SchemaError {
     DuplicateField { name: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum RawEndian {
     Big,
@@ -108,19 +140,19 @@ impl From<Endianness> for RawEndian {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RawBit {
     name: String,
     width: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RawCovers {
     from: String,
     to: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RawField {
     name: String,
     #[serde(rename = "type")]
@@ -143,6 +175,27 @@ struct RawField {
     algo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     covers: Option<RawCovers>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instances: Option<Vec<String>>,
+}
+
+/// A reusable group of fields, instantiated by naming it as a field type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawType {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, rename = "field")]
+    fields: Vec<RawField>,
+}
+
+/// A file holding nothing but shared type definitions.
+#[derive(Debug, Default, Deserialize)]
+struct RawTypeFile {
+    #[serde(default, rename = "type")]
+    types: Vec<RawType>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,8 +205,99 @@ struct RawFrame {
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     endian: Option<RawEndian>,
+    #[serde(default, rename = "type", skip_serializing_if = "Vec::is_empty")]
+    types: Vec<RawType>,
     #[serde(default, rename = "field")]
     fields: Vec<RawField>,
+}
+
+/// Type definitions shared by every frame in a directory.
+///
+/// A frame may also declare types inline; those win over the library when the
+/// names collide, so a frame can specialise a shared type without renaming it.
+#[derive(Debug, Default, Clone)]
+pub struct TypeLibrary {
+    types: BTreeMap<String, RawType>,
+}
+
+impl TypeLibrary {
+    /// Adds the `[[type]]` blocks found in `text`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the text is not valid TOML or redefines a type the
+    /// library already holds.
+    pub fn merge_toml(&mut self, text: &str) -> Result<(), SchemaError> {
+        let file: RawTypeFile = toml::from_str(text)?;
+        for raw in file.types {
+            if self.types.contains_key(&raw.name) {
+                return Err(SchemaError::DuplicateType { name: raw.name });
+            }
+            self.types.insert(raw.name.clone(), raw);
+        }
+        Ok(())
+    }
+
+    /// Adds the type definitions held in one file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or is not valid.
+    pub fn merge_file(&mut self, path: &Path) -> Result<(), SchemaError> {
+        let text = std::fs::read_to_string(path).map_err(|source| SchemaError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        self.merge_toml(&text)
+    }
+
+    /// Loads every `.toml` file in `directory`, in name order.
+    ///
+    /// A directory that does not exist yields an empty library: sharing types is
+    /// opt-in, so its absence is the normal case rather than a failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be listed or a file is invalid.
+    pub fn load_dir(directory: &Path) -> Result<Self, SchemaError> {
+        let mut library = Self::default();
+        if !directory.is_dir() {
+            return Ok(library);
+        }
+        for path in toml_files(directory)? {
+            library.merge_file(&path)?;
+        }
+        Ok(library)
+    }
+
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        self.types.keys().map(String::as_str).collect()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
+    }
+}
+
+/// Lists the `.toml` files directly inside `directory`, in name order.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be listed.
+pub fn toml_files(directory: &Path) -> Result<Vec<std::path::PathBuf>, SchemaError> {
+    let entries = std::fs::read_dir(directory).map_err(|source| SchemaError::Read {
+        path: directory.display().to_string(),
+        source,
+    })?;
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    paths.sort();
+    Ok(paths)
 }
 
 /// Parses a frame definition from TOML text.
@@ -164,8 +308,18 @@ struct RawFrame {
 /// frame (unknown type, bit widths that do not fill the representation, a
 /// checksum covering a field that does not exist, ...).
 pub fn from_toml(text: &str) -> Result<FrameDef, SchemaError> {
+    from_toml_with(text, &TypeLibrary::default())
+}
+
+/// Parses a frame definition that may instantiate types from a shared library.
+///
+/// # Errors
+///
+/// As [`from_toml`], plus an error if a field names a type that is neither a
+/// builtin nor defined inline or in `library`.
+pub fn from_toml_with(text: &str, library: &TypeLibrary) -> Result<FrameDef, SchemaError> {
     let raw: RawFrame = toml::from_str(text)?;
-    build(raw)
+    build(raw, library)
 }
 
 /// Renders a frame definition back to TOML.
@@ -183,11 +337,20 @@ pub fn to_toml(frame: &FrameDef) -> Result<String, SchemaError> {
 ///
 /// Returns an error if the file cannot be read or is not a valid frame.
 pub fn load(path: &Path) -> Result<FrameDef, SchemaError> {
+    load_with(path, &TypeLibrary::default())
+}
+
+/// Loads a frame definition that may instantiate types from a shared library.
+///
+/// # Errors
+///
+/// As [`load`], plus an error if a field names an unknown type.
+pub fn load_with(path: &Path, library: &TypeLibrary) -> Result<FrameDef, SchemaError> {
     let text = std::fs::read_to_string(path).map_err(|source| SchemaError::Read {
         path: path.display().to_string(),
         source,
     })?;
-    from_toml(&text)
+    from_toml_with(&text, library)
 }
 
 /// Writes a frame definition to disk.
@@ -203,11 +366,27 @@ pub fn save(frame: &FrameDef, path: &Path) -> Result<(), SchemaError> {
     })
 }
 
-fn build(raw: RawFrame) -> Result<FrameDef, SchemaError> {
+fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> {
     let frame_endian: Endianness = raw.endian.map(Into::into).unwrap_or_default();
 
+    let mut types = library.types.clone();
+    let mut declared: Vec<&str> = Vec::new();
+    for local in &raw.types {
+        if declared.contains(&local.name.as_str()) {
+            return Err(SchemaError::DuplicateType {
+                name: local.name.clone(),
+            });
+        }
+        declared.push(&local.name);
+        // An inline definition shadows the shared one, so a frame can specialise
+        // a library type without having to invent a new name for it.
+        types.insert(local.name.clone(), local.clone());
+    }
+
+    let expanded = expand(&raw.fields, &types)?;
+
     let mut seen: Vec<&str> = Vec::new();
-    for field in &raw.fields {
+    for field in &expanded {
         if seen.contains(&field.name.as_str()) {
             return Err(SchemaError::DuplicateField {
                 name: field.name.clone(),
@@ -215,10 +394,10 @@ fn build(raw: RawFrame) -> Result<FrameDef, SchemaError> {
         }
         seen.push(&field.name);
     }
-    let names: Vec<String> = raw.fields.iter().map(|field| field.name.clone()).collect();
+    let names: Vec<String> = expanded.iter().map(|field| field.name.clone()).collect();
 
-    let mut fields = Vec::with_capacity(raw.fields.len());
-    for (index, field) in raw.fields.iter().enumerate() {
+    let mut fields = Vec::with_capacity(expanded.len());
+    for (index, field) in expanded.iter().enumerate() {
         let kind = build_kind(field, index, &names)?;
         fields.push(FieldDef {
             name: field.name.clone(),
@@ -240,6 +419,182 @@ fn build(raw: RawFrame) -> Result<FrameDef, SchemaError> {
         description: raw.description,
         fields,
     })
+}
+
+/// Type names that are not scalars, kept in one place so [`is_builtin_kind`]
+/// and [`build_kind`] cannot drift apart.
+const BUILTIN_KINDS: &[&str] = &[
+    "bytes", "text", "enum", "bits", "xor8", "sum8", "sum16", "crc8", "crc16", "crc32",
+];
+
+fn is_builtin_kind(kind: &str) -> bool {
+    ScalarType::parse(kind).is_some() || BUILTIN_KINDS.contains(&kind)
+}
+
+fn known_kinds(types: &BTreeMap<String, RawType>) -> String {
+    ScalarType::ALL
+        .iter()
+        .map(|scalar| scalar.name())
+        .chain(BUILTIN_KINDS.iter().copied())
+        .chain(types.keys().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Replaces every type instantiation with the fields it stands for.
+///
+/// The rest of the crate only ever sees a flat list, so templates cost the
+/// codec, the checksums and the editor nothing.
+fn expand(
+    fields: &[RawField],
+    types: &BTreeMap<String, RawType>,
+) -> Result<Vec<RawField>, SchemaError> {
+    let mut out = Vec::with_capacity(fields.len());
+    let mut stack: Vec<&str> = Vec::new();
+    expand_into(fields, types, None, None, &mut stack, &mut out)?;
+    Ok(out)
+}
+
+fn expand_into<'a>(
+    fields: &'a [RawField],
+    types: &'a BTreeMap<String, RawType>,
+    prefix: Option<&str>,
+    inherited_endian: Option<RawEndian>,
+    stack: &mut Vec<&'a str>,
+    out: &mut Vec<RawField>,
+) -> Result<(), SchemaError> {
+    for field in fields {
+        let endian = field.endian.or(inherited_endian);
+        let paths = instance_paths(field, prefix)?;
+
+        let Some(definition) = types.get(&field.kind) else {
+            if !is_builtin_kind(&field.kind) {
+                return Err(SchemaError::UnknownType {
+                    field: field.name.clone(),
+                    kind: field.kind.clone(),
+                    known: known_kinds(types),
+                });
+            }
+            for path in paths {
+                out.push(instantiate_builtin(field, path, endian, prefix));
+            }
+            continue;
+        };
+
+        reject_type_only_attributes(field)?;
+        if definition.fields.is_empty() {
+            return Err(SchemaError::EmptyType {
+                name: definition.name.clone(),
+            });
+        }
+        if stack.contains(&definition.name.as_str()) {
+            return Err(SchemaError::RecursiveType {
+                name: definition.name.clone(),
+                path: stack.join(" -> "),
+            });
+        }
+
+        stack.push(&definition.name);
+        for path in paths {
+            expand_into(&definition.fields, types, Some(&path), endian, stack, out)?;
+        }
+        stack.pop();
+    }
+    Ok(())
+}
+
+/// The fully qualified name of every copy this field asks for.
+fn instance_paths(field: &RawField, prefix: Option<&str>) -> Result<Vec<String>, SchemaError> {
+    let labels = match (field.repeat, field.instances.as_ref()) {
+        (Some(_), Some(_)) => {
+            return Err(SchemaError::RepeatAndInstances {
+                field: field.name.clone(),
+            })
+        }
+        (Some(0), None) => {
+            return Err(SchemaError::EmptyRepeat {
+                field: field.name.clone(),
+            })
+        }
+        (Some(count), None) => (0..count)
+            .map(|index| format!("{}[{index}]", field.name))
+            .collect(),
+        (None, Some(instances)) if instances.is_empty() => {
+            return Err(SchemaError::EmptyInstances {
+                field: field.name.clone(),
+            })
+        }
+        (None, Some(instances)) => {
+            let mut seen: Vec<&str> = Vec::new();
+            for instance in instances {
+                if seen.contains(&instance.as_str()) {
+                    return Err(SchemaError::DuplicateInstance {
+                        field: field.name.clone(),
+                        instance: instance.clone(),
+                    });
+                }
+                seen.push(instance);
+            }
+            instances
+                .iter()
+                .map(|instance| format!("{}.{instance}", field.name))
+                .collect()
+        }
+        (None, None) => vec![field.name.clone()],
+    };
+
+    Ok(match prefix {
+        Some(prefix) => labels
+            .into_iter()
+            .map(|label| format!("{prefix}.{label}"))
+            .collect(),
+        None => labels,
+    })
+}
+
+fn instantiate_builtin(
+    field: &RawField,
+    path: String,
+    endian: Option<RawEndian>,
+    prefix: Option<&str>,
+) -> RawField {
+    let mut copy = field.clone();
+    copy.name = path;
+    copy.endian = endian;
+    copy.repeat = None;
+    copy.instances = None;
+    // A checksum declared inside a type covers its own siblings, so its bounds
+    // move with the instance rather than pointing at the first copy.
+    if let (Some(prefix), Some(covers)) = (prefix, copy.covers.as_mut()) {
+        covers.from = format!("{prefix}.{}", covers.from);
+        covers.to = format!("{prefix}.{}", covers.to);
+    }
+    copy
+}
+
+/// Attributes that describe a builtin field cannot mean anything on a type
+/// instantiation, and silently ignoring them would hide a real mistake.
+fn reject_type_only_attributes(field: &RawField) -> Result<(), SchemaError> {
+    let offender = [
+        ("default", field.default.is_some()),
+        ("repr", field.repr.is_some()),
+        ("variants", field.variants.is_some()),
+        ("bits", field.bits.is_some()),
+        ("len", field.len.is_some()),
+        ("algo", field.algo.is_some()),
+        ("covers", field.covers.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(name, present)| present.then_some(name));
+
+    match offender {
+        Some(attribute) => Err(SchemaError::UnexpectedAttribute {
+            field: field.name.clone(),
+            kind: field.kind.clone(),
+            attribute,
+        }),
+        None => Ok(()),
+    }
 }
 
 fn build_kind(field: &RawField, index: usize, names: &[String]) -> Result<FieldKind, SchemaError> {
@@ -348,6 +703,7 @@ fn build_checksum(
             return Err(SchemaError::UnknownType {
                 field: field.name.clone(),
                 kind: kind.to_owned(),
+                known: known_kinds(&BTreeMap::new()),
             })
         }
     };
@@ -360,16 +716,14 @@ fn build_checksum(
             kind: kind.to_owned(),
             missing: "covers",
         })?;
-    let resolve = |target: &String| {
-        names.iter().position(|name| name == target).ok_or_else(|| {
-            SchemaError::UnknownCoverTarget {
-                field: field.name.clone(),
-                target: target.clone(),
-            }
+    let resolve = |target: &String, edge: Edge| {
+        resolve_cover_target(names, target, edge).ok_or_else(|| SchemaError::UnknownCoverTarget {
+            field: field.name.clone(),
+            target: target.clone(),
         })
     };
-    let from = resolve(&covers.from)?;
-    let to = resolve(&covers.to)?;
+    let from = resolve(&covers.from, Edge::First)?;
+    let to = resolve(&covers.to, Edge::Last)?;
     if from > to {
         return Err(SchemaError::BackwardsSpan {
             field: field.name.clone(),
@@ -387,6 +741,30 @@ fn build_checksum(
         spec,
         covers: FieldSpan { from, to },
     })
+}
+
+#[derive(Clone, Copy)]
+enum Edge {
+    First,
+    Last,
+}
+
+/// Resolves one end of a `covers` range, by field name or by group name.
+///
+/// Naming an instantiated type, `led` or `led[2]`, selects the whole block it
+/// expanded into, so a checksum stays correct when the repeat count changes.
+fn resolve_cover_target(names: &[String], target: &str, edge: Edge) -> Option<usize> {
+    if let Some(index) = names.iter().position(|name| name == target) {
+        return Some(index);
+    }
+    let within_group = |name: &String| {
+        name.strip_prefix(target)
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+    };
+    match edge {
+        Edge::First => names.iter().position(within_group),
+        Edge::Last => names.iter().rposition(within_group),
+    }
 }
 
 fn unsigned_repr(field: &RawField) -> Result<ScalarType, SchemaError> {
@@ -450,6 +828,9 @@ fn lower(frame: &FrameDef) -> RawFrame {
         name: frame.name.clone(),
         description: frame.description.clone(),
         endian: None,
+        // Types are resolved at load time, so what is written back is the
+        // expanded layout: identical on the wire, no longer factorised.
+        types: Vec::new(),
         fields: frame
             .fields
             .iter()
@@ -473,6 +854,8 @@ fn lower_field(field: &FieldDef, frame: &FrameDef) -> RawField {
         len: None,
         algo: None,
         covers: None,
+        repeat: None,
+        instances: None,
     };
 
     match &field.kind {
@@ -787,6 +1170,421 @@ variants = { A = 0 }
             from_toml(text).unwrap_err(),
             SchemaError::BadRepr { .. }
         ));
+    }
+
+    /// The case templates exist for: one structure, many identical instances.
+    const LED_BANK: &str = r#"
+name = "LedBank"
+endian = "big"
+
+[[type]]
+name = "LedConfig"
+
+[[type.field]]
+name = "mode"
+type = "enum"
+repr = "u8"
+variants = { OFF = 0, ON = 1, BLINK = 2 }
+
+[[type.field]]
+name = "brightness"
+type = "u8"
+default = 128
+
+[[type.field]]
+name = "period_ms"
+type = "u16"
+
+[[field]]
+name = "header"
+type = "u8"
+default = 0x10
+
+[[field]]
+name = "led"
+type = "LedConfig"
+repeat = 4
+
+[[field]]
+name = "crc"
+type = "crc16"
+algo = "crc16-ccitt"
+covers = { from = "header", to = "led" }
+"#;
+
+    fn names_of(frame: &FrameDef) -> Vec<&str> {
+        frame
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_repeated_type_expands_into_indexed_fields() {
+        let frame = from_toml(LED_BANK).expect("led bank should parse");
+        assert_eq!(
+            names_of(&frame),
+            [
+                "header",
+                "led[0].mode",
+                "led[0].brightness",
+                "led[0].period_ms",
+                "led[1].mode",
+                "led[1].brightness",
+                "led[1].period_ms",
+                "led[2].mode",
+                "led[2].brightness",
+                "led[2].period_ms",
+                "led[3].mode",
+                "led[3].brightness",
+                "led[3].period_ms",
+                "crc",
+            ]
+        );
+        // 1 + 4 * (1 + 1 + 2) + 2
+        assert_eq!(frame.size(), 19);
+        // Defaults belong to the type and reach every copy.
+        assert_eq!(
+            frame.field("led[2].brightness").unwrap().default,
+            Some(Value::Uint(128))
+        );
+    }
+
+    #[test]
+    fn naming_a_type_instance_in_covers_selects_the_whole_block() {
+        let frame = from_toml(LED_BANK).unwrap();
+        let FieldKind::Checksum { covers, .. } = &frame.field("crc").unwrap().kind else {
+            panic!("crc should be a checksum");
+        };
+        assert_eq!(frame.fields[covers.from].name, "header");
+        assert_eq!(frame.fields[covers.to].name, "led[3].period_ms");
+    }
+
+    #[test]
+    fn an_expanded_frame_encodes_and_decodes() {
+        let frame = from_toml(LED_BANK).unwrap();
+        let mut values = FieldValues::new();
+        for index in 0..4 {
+            values.insert(
+                format!("led[{index}].mode"),
+                Value::Text("BLINK".to_owned()),
+            );
+            values.insert(format!("led[{index}].brightness"), Value::Uint(200));
+            values.insert(format!("led[{index}].period_ms"), Value::Uint(500));
+        }
+
+        let bytes = codec::encode(&frame, &values).unwrap();
+        assert_eq!(bytes.len(), 19);
+        let decoded = codec::decode(&frame, &bytes).unwrap();
+        assert!(decoded.checksum_mismatches.is_empty());
+        assert_eq!(decoded.values["led[3].brightness"], Value::Uint(200));
+    }
+
+    #[test]
+    fn named_instances_read_better_than_indices() {
+        let text = r#"
+name = "Rgb"
+
+[[type]]
+name = "Channel"
+[[type.field]]
+name = "level"
+type = "u8"
+
+[[field]]
+name = "led"
+type = "Channel"
+instances = ["red", "green", "blue"]
+"#;
+        let frame = from_toml(text).unwrap();
+        assert_eq!(
+            names_of(&frame),
+            ["led.red.level", "led.green.level", "led.blue.level"]
+        );
+    }
+
+    #[test]
+    fn repeat_also_applies_to_a_builtin_field() {
+        let text = r#"
+name = "Samples"
+[[field]]
+name = "sample"
+type = "u16"
+repeat = 3
+"#;
+        let frame = from_toml(text).unwrap();
+        assert_eq!(names_of(&frame), ["sample[0]", "sample[1]", "sample[2]"]);
+        assert_eq!(frame.size(), 6);
+    }
+
+    #[test]
+    fn types_nest_and_the_endian_override_reaches_the_leaves() {
+        let text = r#"
+name = "Nested"
+endian = "big"
+
+[[type]]
+name = "Inner"
+[[type.field]]
+name = "value"
+type = "u16"
+
+[[type]]
+name = "Outer"
+[[type.field]]
+name = "pair"
+type = "Inner"
+repeat = 2
+
+[[field]]
+name = "block"
+type = "Outer"
+endian = "little"
+"#;
+        let frame = from_toml(text).unwrap();
+        assert_eq!(
+            names_of(&frame),
+            ["block.pair[0].value", "block.pair[1].value"]
+        );
+        // The override sits on the instantiation, three levels above the field.
+        assert!(frame
+            .fields
+            .iter()
+            .all(|field| field.endian == Endianness::Little));
+    }
+
+    #[test]
+    fn a_checksum_inside_a_type_covers_its_own_instance() {
+        let text = r#"
+name = "Blocks"
+
+[[type]]
+name = "Block"
+[[type.field]]
+name = "payload"
+type = "bytes"
+len = 4
+[[type.field]]
+name = "check"
+type = "xor8"
+covers = { from = "payload", to = "payload" }
+
+[[field]]
+name = "block"
+type = "Block"
+repeat = 2
+"#;
+        let frame = from_toml(text).unwrap();
+        let FieldKind::Checksum { covers, .. } = &frame.field("block[1].check").unwrap().kind
+        else {
+            panic!("check should be a checksum");
+        };
+        // Not block[0].payload: the bounds followed the instance.
+        assert_eq!(frame.fields[covers.from].name, "block[1].payload");
+        assert_eq!(frame.fields[covers.to].name, "block[1].payload");
+    }
+
+    #[test]
+    fn a_shared_type_can_be_shadowed_inline() {
+        let mut library = TypeLibrary::default();
+        library
+            .merge_toml(
+                r#"
+[[type]]
+name = "Header"
+[[type.field]]
+name = "version"
+type = "u8"
+"#,
+            )
+            .unwrap();
+        assert_eq!(library.names(), ["Header"]);
+
+        let shared = from_toml_with(
+            "name = \"A\"\n[[field]]\nname = \"h\"\ntype = \"Header\"\n",
+            &library,
+        )
+        .unwrap();
+        assert_eq!(names_of(&shared), ["h.version"]);
+
+        let text = r#"
+name = "B"
+
+[[type]]
+name = "Header"
+[[type.field]]
+name = "version"
+type = "u16"
+[[type.field]]
+name = "length"
+type = "u16"
+
+[[field]]
+name = "h"
+type = "Header"
+"#;
+        let local = from_toml_with(text, &library).unwrap();
+        assert_eq!(names_of(&local), ["h.version", "h.length"]);
+        assert_eq!(local.size(), 4);
+    }
+
+    #[test]
+    fn a_recursive_type_is_rejected() {
+        let text = r#"
+name = "Loop"
+
+[[type]]
+name = "A"
+[[type.field]]
+name = "b"
+type = "B"
+
+[[type]]
+name = "B"
+[[type.field]]
+name = "a"
+type = "A"
+
+[[field]]
+name = "root"
+type = "A"
+"#;
+        let err = from_toml(text).unwrap_err();
+        assert!(
+            matches!(&err, SchemaError::RecursiveType { name, .. } if name == "A"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_type_lists_what_is_available() {
+        let text = r#"
+name = "Typo"
+
+[[type]]
+name = "LedConfig"
+[[type.field]]
+name = "mode"
+type = "u8"
+
+[[field]]
+name = "led"
+type = "LedConfg"
+"#;
+        let message = from_toml(text).unwrap_err().to_string();
+        assert!(message.contains("LedConfg"), "got {message}");
+        assert!(message.contains("LedConfig"), "got {message}");
+        assert!(message.contains("crc16"), "got {message}");
+    }
+
+    #[test]
+    fn a_type_instance_rejects_attributes_that_cannot_apply() {
+        let text = r#"
+name = "Bad"
+
+[[type]]
+name = "Thing"
+[[type.field]]
+name = "value"
+type = "u8"
+
+[[field]]
+name = "thing"
+type = "Thing"
+len = 4
+"#;
+        let err = from_toml(text).unwrap_err();
+        assert!(
+            matches!(&err, SchemaError::UnexpectedAttribute { attribute, .. } if *attribute == "len"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn repetition_counts_must_make_sense() {
+        let base = |extra: &str| {
+            format!("name = \"x\"\n[[field]]\nname = \"f\"\ntype = \"u8\"\n{extra}\n")
+        };
+        assert!(matches!(
+            from_toml(&base("repeat = 0")).unwrap_err(),
+            SchemaError::EmptyRepeat { .. }
+        ));
+        assert!(matches!(
+            from_toml(&base("instances = []")).unwrap_err(),
+            SchemaError::EmptyInstances { .. }
+        ));
+        assert!(matches!(
+            from_toml(&base("repeat = 2\ninstances = [\"a\"]")).unwrap_err(),
+            SchemaError::RepeatAndInstances { .. }
+        ));
+        assert!(matches!(
+            from_toml(&base("instances = [\"a\", \"a\"]")).unwrap_err(),
+            SchemaError::DuplicateInstance { .. }
+        ));
+    }
+
+    #[test]
+    fn an_empty_type_is_rejected_rather_than_dropping_the_field() {
+        let text = r#"
+name = "Bad"
+
+[[type]]
+name = "Nothing"
+
+[[field]]
+name = "gap"
+type = "Nothing"
+"#;
+        assert!(matches!(
+            from_toml(text).unwrap_err(),
+            SchemaError::EmptyType { .. }
+        ));
+    }
+
+    #[test]
+    fn two_instances_of_the_same_name_collide() {
+        let text = r#"
+name = "Bad"
+
+[[type]]
+name = "Thing"
+[[type.field]]
+name = "value"
+type = "u8"
+
+[[field]]
+name = "thing"
+type = "Thing"
+
+[[field]]
+name = "thing"
+type = "Thing"
+"#;
+        assert!(matches!(
+            from_toml(text).unwrap_err(),
+            SchemaError::DuplicateField { .. }
+        ));
+    }
+
+    #[test]
+    fn every_builtin_kind_is_recognised_by_the_parser() {
+        // Guards the one duplicated piece of knowledge: BUILTIN_KINDS decides
+        // whether a name is a type reference, build_kind decides what it means.
+        for kind in BUILTIN_KINDS {
+            let text = format!("name = \"x\"\n[[field]]\nname = \"f\"\ntype = \"{kind}\"\n");
+            if let Err(SchemaError::UnknownType { .. }) = from_toml(&text) {
+                panic!("{kind} is listed as a builtin but the parser rejects it");
+            }
+        }
+    }
+
+    #[test]
+    fn an_expanded_frame_still_round_trips_through_toml() {
+        let frame = from_toml(LED_BANK).unwrap();
+        let reparsed = from_toml(&to_toml(&frame).unwrap()).expect("rendered toml should parse");
+        // The types are gone from the file, the layout is identical.
+        assert_eq!(frame, reparsed);
     }
 
     #[test]
