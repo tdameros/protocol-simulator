@@ -32,6 +32,13 @@ pub enum CodecError {
     #[error("field {field}: unknown variant {variant}")]
     UnknownVariant { field: String, variant: String },
 
+    #[error("field {field}: {value} is outside {range}")]
+    OutOfSubrange {
+        field: String,
+        value: String,
+        range: String,
+    },
+
     #[error("frame {frame}: expected {expected} bytes, got {got}")]
     FrameLength {
         frame: String,
@@ -48,12 +55,23 @@ pub struct Decoded {
     /// Reported rather than raised: a corrupt frame is still worth showing, and
     /// deciding what to do about it belongs to the caller.
     pub checksum_mismatches: Vec<ChecksumMismatch>,
+    /// Fields holding a value their subtype does not allow.
+    ///
+    /// Reported for the same reason: equipment that sends 120 into a 0..99
+    /// field is precisely what you opened the simulator to find out.
+    pub range_violations: Vec<RangeViolation>,
 }
 
 pub struct ChecksumMismatch {
     pub field: String,
     pub found: u64,
     pub expected: u64,
+}
+
+pub struct RangeViolation {
+    pub field: String,
+    pub found: String,
+    pub range: String,
 }
 
 /// Encodes `values` according to `frame`.
@@ -78,6 +96,7 @@ pub fn encode(frame: &FrameDef, values: &FieldValues) -> Result<Vec<u8>, CodecEr
             .ok_or_else(|| CodecError::MissingValue {
                 field: field.name.clone(),
             })?;
+        check_range(field, value)?;
         encode_field(field, value, &mut out[offset..offset + field.kind.size()])?;
     }
 
@@ -93,6 +112,33 @@ pub fn encode(frame: &FrameDef, values: &FieldValues) -> Result<Vec<u8>, CodecEr
     }
 
     Ok(out)
+}
+
+/// Rejects a value its field's subtype does not allow.
+///
+/// Refused on the way out, merely reported on the way in: sending a frame your
+/// own specification forbids is a mistake, receiving one is a finding.
+fn check_range(field: &FieldDef, value: &Value) -> Result<(), CodecError> {
+    let Some(range) = &field.range else {
+        return Ok(());
+    };
+    if range.accepts(value) {
+        return Ok(());
+    }
+    Err(CodecError::OutOfSubrange {
+        field: field.name.clone(),
+        value: describe_value(value),
+        range: range.describe(),
+    })
+}
+
+fn describe_value(value: &Value) -> String {
+    match value {
+        Value::Uint(v) => v.to_string(),
+        Value::Int(v) => v.to_string(),
+        Value::Float(v) => v.to_string(),
+        other => other.type_name().to_owned(),
+    }
 }
 
 /// Decodes `bytes` according to `frame`.
@@ -111,6 +157,7 @@ pub fn decode(frame: &FrameDef, bytes: &[u8]) -> Result<Decoded, CodecError> {
 
     let mut values = FieldValues::new();
     let mut checksum_mismatches = Vec::new();
+    let mut range_violations = Vec::new();
 
     for (index, field) in frame.fields.iter().enumerate() {
         let offset = frame.offset_of(index);
@@ -132,12 +179,23 @@ pub fn decode(frame: &FrameDef, bytes: &[u8]) -> Result<Decoded, CodecError> {
             continue;
         }
 
-        values.insert(field.name.clone(), decode_field(field, raw));
+        let value = decode_field(field, raw);
+        if let Some(range) = &field.range {
+            if !range.accepts(&value) {
+                range_violations.push(RangeViolation {
+                    field: field.name.clone(),
+                    found: describe_value(&value),
+                    range: range.describe(),
+                });
+            }
+        }
+        values.insert(field.name.clone(), value);
     }
 
     Ok(Decoded {
         values,
         checksum_mismatches,
+        range_violations,
     })
 }
 
@@ -397,7 +455,7 @@ fn read_uint(raw: &[u8], endian: Endianness) -> u64 {
 mod tests {
     use super::*;
     use crate::frame::checksum::{ChecksumSpec, CrcSpec};
-    use crate::frame::{BitDef, EnumVariant, FieldSpan};
+    use crate::frame::{BitDef, EnumVariant, FieldSpan, ValueRange};
 
     fn field(name: &str, kind: FieldKind, endian: Endianness) -> FieldDef {
         FieldDef {
@@ -406,7 +464,62 @@ mod tests {
             kind,
             endian,
             default: None,
+            range: None,
         }
+    }
+
+    fn constrained(name: &str, scalar: ScalarType, range: ValueRange) -> FieldDef {
+        FieldDef {
+            range: Some(range),
+            ..field(name, FieldKind::Scalar(scalar), Endianness::Big)
+        }
+    }
+
+    #[test]
+    fn a_value_outside_its_subtype_is_refused_on_the_way_out() {
+        let frame = FrameDef {
+            name: "duty".to_owned(),
+            description: None,
+            fields: vec![constrained(
+                "percent",
+                ScalarType::U8,
+                ValueRange::Uint { min: 0, max: 99 },
+            )],
+        };
+
+        let mut values = FieldValues::new();
+        values.insert("percent".to_owned(), Value::Uint(99));
+        assert!(encode(&frame, &values).is_ok());
+
+        values.insert("percent".to_owned(), Value::Uint(100));
+        let error = encode(&frame, &values).unwrap_err();
+        assert!(
+            matches!(&error, CodecError::OutOfSubrange { field, .. } if field == "percent"),
+            "got {error}"
+        );
+        assert!(error.to_string().contains("0..99"), "got {error}");
+    }
+
+    #[test]
+    fn a_value_outside_its_subtype_is_only_reported_on_the_way_in() {
+        let frame = FrameDef {
+            name: "duty".to_owned(),
+            description: None,
+            fields: vec![constrained(
+                "percent",
+                ScalarType::U8,
+                ValueRange::Uint { min: 0, max: 99 },
+            )],
+        };
+
+        // What the equipment actually sent, out of range and all.
+        let decoded = decode(&frame, &[120]).expect("a bad value is still a readable frame");
+        assert_eq!(decoded.values["percent"], Value::Uint(120));
+        assert_eq!(decoded.range_violations.len(), 1);
+        assert_eq!(decoded.range_violations[0].field, "percent");
+        assert_eq!(decoded.range_violations[0].found, "120");
+
+        assert!(decode(&frame, &[99]).unwrap().range_violations.is_empty());
     }
 
     #[test]

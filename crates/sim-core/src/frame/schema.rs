@@ -5,6 +5,7 @@
 //! attributes out of the model and, more importantly, lets validation report
 //! what is wrong in the file rather than failing with a deserialiser message.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -14,6 +15,7 @@ use super::checksum::{ChecksumSpec, CrcSpec};
 use super::value::Value;
 use super::{
     BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType,
+    ValueRange,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +115,32 @@ pub enum SchemaError {
 
     #[error("duplicate field name {name}")]
     DuplicateField { name: String },
+
+    #[error("field {field}: range does not apply to {kind}")]
+    RangeOnNonScalar { field: String, kind: String },
+
+    #[error("field {field}: range {range} runs backwards")]
+    BackwardsRange { field: String, range: String },
+
+    #[error("field {field}: range {range} does not fit in {repr}")]
+    RangeOutOfType {
+        field: String,
+        range: String,
+        repr: String,
+    },
+
+    #[error("{owner}: range {inner} is not inside {outer}")]
+    RangeNotWithin {
+        owner: String,
+        inner: String,
+        outer: String,
+    },
+
+    #[error("type {name}: base and field cannot both be set")]
+    TypeIsBothRecordAndSubtype { name: String },
+
+    #[error("type {name}: base {base} must be a scalar or another subtype")]
+    BadSubtypeBase { name: String, base: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -144,6 +172,22 @@ impl From<Endianness> for RawEndian {
 struct RawBit {
     name: String,
     width: u32,
+}
+
+/// The `range = { min = .., max = .. }` attribute, still as written.
+///
+/// Held as raw TOML because what the bounds mean depends on the scalar they
+/// constrain, which is only known once the type reference is resolved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawRange {
+    min: toml::Value,
+    max: toml::Value,
+}
+
+impl RawRange {
+    fn describe(&self) -> String {
+        format!("{}..{}", self.min, self.max)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,16 +223,30 @@ struct RawField {
     repeat: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     instances: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range: Option<RawRange>,
 }
 
-/// A reusable group of fields, instantiated by naming it as a field type.
+/// A reusable named type: a record when it lists fields, a scalar subtype when
+/// it gives a `base` instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RawType {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// The scalar, or the subtype, this one narrows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range: Option<RawRange>,
     #[serde(default, rename = "field")]
     fields: Vec<RawField>,
+}
+
+impl RawType {
+    fn is_subtype(&self) -> bool {
+        self.base.is_some()
+    }
 }
 
 /// A file holding nothing but shared type definitions.
@@ -399,6 +457,7 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
     let mut fields = Vec::with_capacity(expanded.len());
     for (index, field) in expanded.iter().enumerate() {
         let kind = build_kind(field, index, &names)?;
+        let range = build_range(field, &kind)?;
         fields.push(FieldDef {
             name: field.name.clone(),
             description: field.description.clone(),
@@ -410,6 +469,7 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
                 .default
                 .as_ref()
                 .and_then(|value| default_value(value, &kind)),
+            range,
             kind,
         });
     }
@@ -480,6 +540,20 @@ fn expand_into<'a>(
             }
             continue;
         };
+
+        // A subtype is one scalar with a narrower range, not a group of fields,
+        // so it replaces the field rather than expanding under it.
+        if definition.is_subtype() {
+            let (scalar, inherited) = resolve_subtype(definition, types, &mut Vec::new())?;
+            let range = narrowest(field, inherited, &definition.name)?;
+            for path in paths {
+                let mut copy = instantiate_builtin(field, path, endian, prefix);
+                copy.kind.clone_from(&scalar);
+                copy.range.clone_from(&range);
+                out.push(copy);
+            }
+            continue;
+        }
 
         reject_type_only_attributes(field)?;
         if definition.fields.is_empty() {
@@ -572,6 +646,161 @@ fn instantiate_builtin(
     copy
 }
 
+/// Turns a declared range into one typed by the scalar it constrains.
+fn build_range(field: &RawField, kind: &FieldKind) -> Result<Option<ValueRange>, SchemaError> {
+    let Some(raw) = &field.range else {
+        return Ok(None);
+    };
+    let FieldKind::Scalar(scalar) = kind else {
+        return Err(SchemaError::RangeOnNonScalar {
+            field: field.name.clone(),
+            kind: kind.type_name().to_owned(),
+        });
+    };
+
+    let out_of_type = || SchemaError::RangeOutOfType {
+        field: field.name.clone(),
+        range: raw.describe(),
+        repr: scalar.name().to_owned(),
+    };
+    let range = if scalar.is_unsigned_integer() {
+        ValueRange::Uint {
+            min: unsigned_bound(&raw.min).ok_or_else(out_of_type)?,
+            max: unsigned_bound(&raw.max).ok_or_else(out_of_type)?,
+        }
+    } else if matches!(scalar, ScalarType::F32 | ScalarType::F64) {
+        ValueRange::Float {
+            min: as_float(&raw.min).ok_or_else(out_of_type)?,
+            max: as_float(&raw.max).ok_or_else(out_of_type)?,
+        }
+    } else {
+        ValueRange::Int {
+            min: raw.min.as_integer().ok_or_else(out_of_type)?,
+            max: raw.max.as_integer().ok_or_else(out_of_type)?,
+        }
+    };
+
+    if compare(&raw.min, &raw.max) == Some(Ordering::Greater) {
+        return Err(SchemaError::BackwardsRange {
+            field: field.name.clone(),
+            range: raw.describe(),
+        });
+    }
+    if !range.is_within(&scalar.representable()) {
+        return Err(out_of_type());
+    }
+    Ok(Some(range))
+}
+
+fn unsigned_bound(value: &toml::Value) -> Option<u64> {
+    u64::try_from(value.as_integer()?).ok()
+}
+
+/// Follows a subtype down to the scalar it ultimately narrows.
+///
+/// Returns that scalar's spelling and the tightest range met on the way, each
+/// level having to stay inside the one above it.
+fn resolve_subtype<'a>(
+    definition: &'a RawType,
+    types: &'a BTreeMap<String, RawType>,
+    stack: &mut Vec<&'a str>,
+) -> Result<(String, Option<RawRange>), SchemaError> {
+    if !definition.fields.is_empty() {
+        return Err(SchemaError::TypeIsBothRecordAndSubtype {
+            name: definition.name.clone(),
+        });
+    }
+    let base = definition.base.as_ref().expect("caller checked is_subtype");
+
+    if ScalarType::parse(base).is_some() {
+        return Ok((base.clone(), definition.range.clone()));
+    }
+
+    let parent = types
+        .get(base)
+        .filter(|parent| parent.is_subtype())
+        .ok_or_else(|| SchemaError::BadSubtypeBase {
+            name: definition.name.clone(),
+            base: base.clone(),
+        })?;
+    if stack.contains(&definition.name.as_str()) {
+        return Err(SchemaError::RecursiveType {
+            name: definition.name.clone(),
+            path: stack.join(" -> "),
+        });
+    }
+
+    stack.push(&definition.name);
+    let (scalar, inherited) = resolve_subtype(parent, types, stack)?;
+    stack.pop();
+
+    let range = tighten(
+        definition.range.clone(),
+        inherited,
+        &format!("type {}", definition.name),
+    )?;
+    Ok((scalar, range))
+}
+
+/// Combines a field's own range with the one its type brings.
+fn narrowest(
+    field: &RawField,
+    inherited: Option<RawRange>,
+    type_name: &str,
+) -> Result<Option<RawRange>, SchemaError> {
+    tighten(
+        field.range.clone(),
+        inherited,
+        &format!("field {} of type {type_name}", field.name),
+    )
+}
+
+/// Keeps `own` when it is given, having checked it stays inside `outer`.
+fn tighten(
+    own: Option<RawRange>,
+    outer: Option<RawRange>,
+    owner: &str,
+) -> Result<Option<RawRange>, SchemaError> {
+    let (Some(own), Some(outer)) = (own.clone(), outer.clone()) else {
+        return Ok(own.or(outer));
+    };
+    let inside = matches!(
+        compare(&own.min, &outer.min),
+        Some(Ordering::Greater | Ordering::Equal)
+    ) && matches!(
+        compare(&own.max, &outer.max),
+        Some(Ordering::Less | Ordering::Equal)
+    );
+    if !inside {
+        return Err(SchemaError::RangeNotWithin {
+            owner: owner.to_owned(),
+            inner: own.describe(),
+            outer: outer.describe(),
+        });
+    }
+    Ok(Some(own))
+}
+
+/// Orders two TOML numbers, exactly when both are integers.
+fn compare(a: &toml::Value, b: &toml::Value) -> Option<Ordering> {
+    match (a, b) {
+        (toml::Value::Integer(a), toml::Value::Integer(b)) => Some(a.cmp(b)),
+        _ => as_float(a)?.partial_cmp(&as_float(b)?),
+    }
+}
+
+fn as_float(value: &toml::Value) -> Option<f64> {
+    match value {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "only reached when one side is a float, where the bound is approximate anyway"
+        )]
+        toml::Value::Integer(v) => Some(*v as f64),
+        toml::Value::Float(v) => Some(*v),
+        _ => None,
+    }
+}
+
 /// Attributes that describe a builtin field cannot mean anything on a type
 /// instantiation, and silently ignoring them would hide a real mistake.
 fn reject_type_only_attributes(field: &RawField) -> Result<(), SchemaError> {
@@ -583,6 +812,7 @@ fn reject_type_only_attributes(field: &RawField) -> Result<(), SchemaError> {
         ("len", field.len.is_some()),
         ("algo", field.algo.is_some()),
         ("covers", field.covers.is_some()),
+        ("range", field.range.is_some()),
     ]
     .into_iter()
     .find_map(|(name, present)| present.then_some(name));
@@ -823,6 +1053,24 @@ fn default_to_toml(value: &Value) -> Option<toml::Value> {
     }
 }
 
+fn range_to_raw(range: &ValueRange) -> RawRange {
+    let integer = |value: u64| toml::Value::Integer(i64::try_from(value).unwrap_or(i64::MAX));
+    match range {
+        ValueRange::Uint { min, max } => RawRange {
+            min: integer(*min),
+            max: integer(*max),
+        },
+        ValueRange::Int { min, max } => RawRange {
+            min: toml::Value::Integer(*min),
+            max: toml::Value::Integer(*max),
+        },
+        ValueRange::Float { min, max } => RawRange {
+            min: toml::Value::Float(*min),
+            max: toml::Value::Float(*max),
+        },
+    }
+}
+
 fn lower(frame: &FrameDef) -> RawFrame {
     RawFrame {
         name: frame.name.clone(),
@@ -848,6 +1096,7 @@ fn lower_field(field: &FieldDef, frame: &FrameDef) -> RawField {
         // round trip cannot silently change a field's byte order.
         endian: Some(field.endian.into()),
         default: field.default.as_ref().and_then(default_to_toml),
+        range: field.range.as_ref().map(range_to_raw),
         repr: None,
         variants: None,
         bits: None,
@@ -1565,6 +1814,204 @@ type = "Thing"
             from_toml(text).unwrap_err(),
             SchemaError::DuplicateField { .. }
         ));
+    }
+
+    /// Named subtypes, chained, plus an anonymous constraint.
+    const SUBTYPES: &str = r#"
+name = "Constrained"
+endian = "big"
+
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 99 }
+
+[[type]]
+name = "LowPercent"
+base = "Percent"
+range = { min = 0, max = 9 }
+
+[[field]]
+name = "duty"
+type = "Percent"
+default = 50
+
+[[field]]
+name = "trim"
+type = "LowPercent"
+
+[[field]]
+name = "gain"
+type = "i16"
+range = { min = -500, max = 500 }
+"#;
+
+    #[test]
+    fn a_subtype_is_its_base_scalar_plus_a_range() {
+        let frame = from_toml(SUBTYPES).expect("subtypes should parse");
+        // Three scalars, nothing added to the wire.
+        assert_eq!(frame.size(), 4);
+
+        let duty = frame.field("duty").unwrap();
+        assert_eq!(duty.kind, FieldKind::Scalar(ScalarType::U8));
+        assert_eq!(duty.range, Some(ValueRange::Uint { min: 0, max: 99 }));
+        assert_eq!(duty.default, Some(Value::Uint(50)));
+
+        // A subtype of a subtype keeps the tighter bound.
+        assert_eq!(
+            frame.field("trim").unwrap().range,
+            Some(ValueRange::Uint { min: 0, max: 9 })
+        );
+
+        // And a constraint needs no name at all.
+        let gain = frame.field("gain").unwrap();
+        assert_eq!(gain.kind, FieldKind::Scalar(ScalarType::I16));
+        assert_eq!(
+            gain.range,
+            Some(ValueRange::Int {
+                min: -500,
+                max: 500
+            })
+        );
+    }
+
+    #[test]
+    fn subtypes_survive_a_round_trip_through_toml() {
+        let frame = from_toml(SUBTYPES).unwrap();
+        let reparsed = from_toml(&to_toml(&frame).unwrap()).expect("rendered toml should parse");
+        assert_eq!(frame, reparsed);
+    }
+
+    #[test]
+    fn a_field_may_narrow_the_subtype_it_uses_but_not_widen_it() {
+        let narrow = r#"
+name = "x"
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 99 }
+[[field]]
+name = "duty"
+type = "Percent"
+range = { min = 10, max = 20 }
+"#;
+        assert_eq!(
+            from_toml(narrow).unwrap().field("duty").unwrap().range,
+            Some(ValueRange::Uint { min: 10, max: 20 })
+        );
+
+        let widen = narrow.replace("min = 10, max = 20", "min = 0, max = 200");
+        let err = from_toml(&widen).unwrap_err();
+        assert!(
+            matches!(&err, SchemaError::RangeNotWithin { owner, .. } if owner.contains("duty")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_subtype_cannot_escape_its_base_representation() {
+        let text = r#"
+name = "x"
+[[type]]
+name = "Big"
+base = "u8"
+range = { min = 0, max = 300 }
+[[field]]
+name = "v"
+type = "Big"
+"#;
+        let err = from_toml(text).unwrap_err();
+        assert!(
+            matches!(&err, SchemaError::RangeOutOfType { repr, .. } if repr == "u8"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_backwards_range_is_rejected() {
+        let text = r#"
+name = "x"
+[[field]]
+name = "v"
+type = "u8"
+range = { min = 90, max = 10 }
+"#;
+        assert!(matches!(
+            from_toml(text).unwrap_err(),
+            SchemaError::BackwardsRange { .. }
+        ));
+    }
+
+    #[test]
+    fn a_range_only_means_something_on_a_scalar() {
+        let text = r#"
+name = "x"
+[[field]]
+name = "label"
+type = "text"
+len = 4
+range = { min = 0, max = 9 }
+"#;
+        let err = from_toml(text).unwrap_err();
+        assert!(
+            matches!(&err, SchemaError::RangeOnNonScalar { kind, .. } if kind == "text"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_subtype_cannot_be_a_record_as_well() {
+        let text = r#"
+name = "x"
+[[type]]
+name = "Muddled"
+base = "u8"
+[[type.field]]
+name = "inner"
+type = "u8"
+[[field]]
+name = "v"
+type = "Muddled"
+"#;
+        assert!(matches!(
+            from_toml(text).unwrap_err(),
+            SchemaError::TypeIsBothRecordAndSubtype { .. }
+        ));
+    }
+
+    #[test]
+    fn a_subtype_reaches_inside_a_record_and_a_repeat() {
+        let text = r#"
+name = "Bank"
+
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 99 }
+
+[[type]]
+name = "Led"
+[[type.field]]
+name = "brightness"
+type = "Percent"
+
+[[field]]
+name = "led"
+type = "Led"
+repeat = 2
+"#;
+        let frame = from_toml(text).unwrap();
+        assert_eq!(frame.size(), 2);
+        for index in 0..2 {
+            assert_eq!(
+                frame
+                    .field(&format!("led[{index}].brightness"))
+                    .unwrap()
+                    .range,
+                Some(ValueRange::Uint { min: 0, max: 99 }),
+                "the constraint must reach every copy"
+            );
+        }
     }
 
     #[test]

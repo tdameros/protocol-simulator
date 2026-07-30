@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use sim_core::frame::codec;
 use sim_core::frame::schema::{self, TypeLibrary};
 use sim_core::frame::value::{FieldValues, Value};
-use sim_core::frame::{FieldKind, FrameDef, ScalarType};
+use sim_core::frame::{FieldKind, FrameDef, ScalarType, ValueRange};
 
 fn examples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/frames")
@@ -39,10 +39,25 @@ fn load_examples() -> Vec<(String, FrameDef)> {
 fn seed(frame: &FrameDef) -> FieldValues {
     let mut values = FieldValues::new();
     for field in &frame.fields {
+        // Clamped, so a field declared 40..60 is exercised at 40 rather than
+        // failing the encode on a value its own subtype forbids.
         let value = match &field.kind {
-            FieldKind::Scalar(ScalarType::F32 | ScalarType::F64) => Value::Float(1.5),
-            FieldKind::Scalar(scalar) if scalar.is_unsigned_integer() => Value::Uint(1),
-            FieldKind::Scalar(_) => Value::Int(-1),
+            FieldKind::Scalar(ScalarType::F32 | ScalarType::F64) => {
+                Value::Float(match field.range {
+                    Some(ValueRange::Float { min, max }) => 1.5_f64.clamp(min, max),
+                    _ => 1.5,
+                })
+            }
+            FieldKind::Scalar(scalar) if scalar.is_unsigned_integer() => {
+                Value::Uint(match field.range {
+                    Some(ValueRange::Uint { min, max }) => 1u64.clamp(min, max),
+                    _ => 1,
+                })
+            }
+            FieldKind::Scalar(_) => Value::Int(match field.range {
+                Some(ValueRange::Int { min, max }) => (-1i64).clamp(min, max),
+                _ => -1,
+            }),
             FieldKind::Bytes { len } => Value::Bytes(vec![0xA5; *len]),
             FieldKind::Text { len } => Value::Text("x".repeat(*len)),
             FieldKind::Enum { variants, .. } => Value::Uint(variants[0].value),
