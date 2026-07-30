@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::SystemTime;
 
@@ -30,6 +30,15 @@ pub struct AppState {
     /// Why the typed hex was not applied, or what it changed on the way in.
     pub frame_hex_note: Option<String>,
     pub frame_target: Option<ConnectionId>,
+    /// Traffic tabs, each a different view of the one shared buffer.
+    pub monitors: BTreeMap<MonitorId, MonitorState>,
+    next_monitor: usize,
+    next_seq: u64,
+    /// A tab the panel asked for. The dock cannot be touched while it draws, so
+    /// the request waits for the frame to end.
+    pub monitor_requested: bool,
+    /// Bytes a traffic row sent to the frame editor, waiting to be decoded.
+    pub pending_frame_hex: Option<Vec<u8>>,
     pub last_error: Option<String>,
 }
 
@@ -73,11 +82,37 @@ impl AppState {
         });
     }
 
-    pub fn push_log(&mut self, entry: LogEntry) {
+    /// Appends a frame to the shared buffer, stamping it with its position.
+    pub fn push_log(&mut self, mut entry: LogEntry) {
+        entry.seq = self.next_seq;
+        self.next_seq += 1;
         if self.log.len() == MAX_LOG_ENTRIES {
             self.log.pop_front();
         }
         self.log.push_back(entry);
+    }
+
+    /// Sequence number the next frame will carry.
+    #[must_use]
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    pub fn open_monitor(&mut self) -> MonitorId {
+        self.next_monitor += 1;
+        let id = MonitorId(self.next_monitor);
+        let title = if self.next_monitor == 1 {
+            "Traffic".to_owned()
+        } else {
+            format!("Traffic {}", self.next_monitor)
+        };
+        self.monitors
+            .insert(id, MonitorState::new(title, self.next_seq));
+        id
+    }
+
+    pub fn close_monitor(&mut self, id: MonitorId) {
+        self.monitors.remove(&id);
     }
 
     pub fn status_of(&self, id: &ConnectionId) -> Option<ConnectionStatus> {
@@ -97,11 +132,246 @@ pub struct ConnectionEntry {
 }
 
 pub struct LogEntry {
+    /// Position in the stream, never reused.
+    ///
+    /// The buffer drops its oldest entries, so an index into it means something
+    /// different a minute later; a monitor remembering where it paused needs a
+    /// number that stays put.
+    pub seq: u64,
     pub id: ConnectionId,
     pub direction: Direction,
     pub bytes: Vec<u8>,
     pub source: Option<SocketAddr>,
     pub timestamp: SystemTime,
+}
+
+/// One Traffic tab. Several may watch the same buffer through different filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MonitorId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DirectionFilter {
+    #[default]
+    Both,
+    Sent,
+    Received,
+}
+
+impl DirectionFilter {
+    pub const ALL: [Self; 3] = [Self::Both, Self::Sent, Self::Received];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Sent => "sent",
+            Self::Received => "received",
+        }
+    }
+
+    fn wanted(self) -> Option<Direction> {
+        match self {
+            Self::Both => None,
+            Self::Sent => Some(Direction::Sent),
+            Self::Received => Some(Direction::Received),
+        }
+    }
+}
+
+/// Where in the frame a hex pattern has to sit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HexAnchor {
+    #[default]
+    Anywhere,
+    At(usize),
+}
+
+/// A byte pattern in which `??` stands for any byte.
+///
+/// Byte granularity rather than nibble: `A?` reads like a typo far more often
+/// than it reads like an intent, so it is refused rather than guessed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HexPattern(Vec<Option<u8>>);
+
+impl HexPattern {
+    /// `None` when the text is not a usable pattern.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let cleaned: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
+            return None;
+        }
+        cleaned
+            .chunks(2)
+            .map(|pair| {
+                if pair == ['?', '?'] {
+                    return Some(None);
+                }
+                let byte: String = pair.iter().collect();
+                u8::from_str_radix(&byte, 16).ok().map(Some)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self)
+    }
+
+    fn matches_at(&self, bytes: &[u8], offset: usize) -> bool {
+        let Some(window) = bytes.get(offset..offset + self.0.len()) else {
+            return false;
+        };
+        self.0
+            .iter()
+            .zip(window)
+            .all(|(expected, actual)| expected.is_none_or(|byte| byte == *actual))
+    }
+
+    #[must_use]
+    pub fn found_in(&self, bytes: &[u8], anchor: HexAnchor) -> bool {
+        match anchor {
+            HexAnchor::At(offset) => self.matches_at(bytes, offset),
+            HexAnchor::Anywhere => (0..bytes.len()).any(|offset| self.matches_at(bytes, offset)),
+        }
+    }
+}
+
+/// What a Traffic tab shows, as the operator set it up.
+#[derive(Debug, Default, Clone)]
+pub struct TrafficFilter {
+    /// Empty means every connection, which is also the state of a fresh tab.
+    pub connections: BTreeSet<String>,
+    pub direction: DirectionFilter,
+    /// Substring of the peer address. An entry with no source never matches a
+    /// non-empty one, which is what makes it useful on a multicast group.
+    pub source: String,
+    pub min_len: Option<usize>,
+    pub max_len: Option<usize>,
+    pub hex: String,
+    pub anchor: HexAnchor,
+    /// Looked for in the frame bytes, not in the dotted rendering, so a match
+    /// means the characters really are there.
+    pub text: String,
+    /// Keep what matches, or drop it. Inverting is how you hide heartbeats.
+    pub invert: bool,
+}
+
+impl TrafficFilter {
+    /// Resolves everything that costs more than a comparison, once per repaint
+    /// rather than once per entry.
+    #[must_use]
+    pub fn compile(&self) -> CompiledFilter<'_> {
+        CompiledFilter {
+            filter: self,
+            pattern: HexPattern::parse(&self.hex),
+        }
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.connections.is_empty()
+            || self.direction != DirectionFilter::Both
+            || !self.source.trim().is_empty()
+            || self.min_len.is_some()
+            || self.max_len.is_some()
+            || !self.hex.trim().is_empty()
+            || !self.text.is_empty()
+    }
+}
+
+pub struct CompiledFilter<'a> {
+    filter: &'a TrafficFilter,
+    pattern: Option<HexPattern>,
+}
+
+impl CompiledFilter<'_> {
+    #[must_use]
+    pub fn keeps(&self, entry: &LogEntry) -> bool {
+        self.matches(entry) != self.filter.invert
+    }
+
+    /// Whether the typed pattern is usable. A broken one is ignored rather than
+    /// left to silently hide the whole stream.
+    #[must_use]
+    pub fn hex_is_valid(&self) -> bool {
+        self.filter.hex.trim().is_empty() || self.pattern.is_some()
+    }
+
+    fn matches(&self, entry: &LogEntry) -> bool {
+        let filter = self.filter;
+
+        if !filter.connections.is_empty() && !filter.connections.contains(&entry.id.0) {
+            return false;
+        }
+        if filter
+            .direction
+            .wanted()
+            .is_some_and(|wanted| wanted != entry.direction)
+        {
+            return false;
+        }
+
+        let source = filter.source.trim();
+        if !source.is_empty()
+            && !entry
+                .source
+                .is_some_and(|addr| addr.to_string().contains(source))
+        {
+            return false;
+        }
+
+        if filter.min_len.is_some_and(|min| entry.bytes.len() < min)
+            || filter.max_len.is_some_and(|max| entry.bytes.len() > max)
+        {
+            return false;
+        }
+
+        if let Some(pattern) = &self.pattern {
+            if !pattern.found_in(&entry.bytes, filter.anchor) {
+                return false;
+            }
+        }
+
+        if !filter.text.is_empty() {
+            let needle = filter.text.as_bytes();
+            if !entry
+                .bytes
+                .windows(needle.len())
+                .any(|window| window == needle)
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+pub struct MonitorState {
+    pub title: String,
+    pub filter: TrafficFilter,
+    pub show_filter: bool,
+    pub follow: bool,
+    /// The last sequence number admitted, frozen while paused.
+    pub paused_at: Option<u64>,
+    /// Hides everything logged before this view was last cleared.
+    pub since: u64,
+}
+
+impl MonitorState {
+    fn new(title: String, since: u64) -> Self {
+        Self {
+            title,
+            filter: TrafficFilter::default(),
+            show_filter: false,
+            follow: true,
+            paused_at: None,
+            since,
+        }
+    }
+
+    /// Whether an entry is inside this view's window, filters aside.
+    #[must_use]
+    pub fn in_window(&self, entry: &LogEntry) -> bool {
+        entry.seq >= self.since && self.paused_at.is_none_or(|last| entry.seq <= last)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +547,167 @@ mod tests {
         }
     }
 
+    fn logged(id: &str, direction: Direction, bytes: &[u8], source: Option<&str>) -> LogEntry {
+        LogEntry {
+            seq: 0,
+            id: ConnectionId(id.to_owned()),
+            direction,
+            bytes: bytes.to_vec(),
+            source: source.map(|addr| addr.parse().unwrap()),
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    fn sample() -> Vec<LogEntry> {
+        vec![
+            logged("bus", Direction::Sent, &[0xAA, 0x55, 0x01, 0x02], None),
+            logged(
+                "bus",
+                Direction::Received,
+                &[0xAA, 0x55, 0x02, 0x02],
+                Some("192.168.1.10:9000"),
+            ),
+            logged(
+                "serial",
+                Direction::Received,
+                b"AT+OK\r\n",
+                Some("10.0.0.4:9000"),
+            ),
+        ]
+    }
+
+    fn kept(filter: &TrafficFilter) -> Vec<usize> {
+        let compiled = filter.compile();
+        sample()
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| compiled.keeps(entry))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn an_untouched_filter_keeps_everything() {
+        let filter = TrafficFilter::default();
+        assert!(!filter.is_active());
+        assert_eq!(kept(&filter), [0, 1, 2]);
+    }
+
+    #[test]
+    fn connection_and_direction_narrow_independently() {
+        let mut filter = TrafficFilter {
+            connections: BTreeSet::from(["bus".to_owned()]),
+            ..TrafficFilter::default()
+        };
+        assert_eq!(kept(&filter), [0, 1]);
+
+        filter.direction = DirectionFilter::Received;
+        assert_eq!(kept(&filter), [1]);
+    }
+
+    #[test]
+    fn inverting_hides_what_it_would_have_shown() {
+        let filter = TrafficFilter {
+            connections: BTreeSet::from(["bus".to_owned()]),
+            invert: true,
+            ..TrafficFilter::default()
+        };
+        // Which is how a heartbeat gets out of the way.
+        assert_eq!(kept(&filter), [2]);
+    }
+
+    #[test]
+    fn a_hex_pattern_matches_with_wildcards_and_can_be_anchored() {
+        let mut filter = TrafficFilter {
+            hex: "AA 55 ?? 02".to_owned(),
+            ..TrafficFilter::default()
+        };
+        assert!(filter.compile().hex_is_valid());
+        assert_eq!(kept(&filter), [0, 1]);
+
+        // The same pattern one byte along matches nothing.
+        filter.anchor = HexAnchor::At(1);
+        assert_eq!(kept(&filter), Vec::<usize>::new());
+
+        filter.anchor = HexAnchor::At(0);
+        assert_eq!(kept(&filter), [0, 1]);
+    }
+
+    #[test]
+    fn a_pattern_can_sit_anywhere_in_the_frame() {
+        let filter = TrafficFilter {
+            hex: "0102".to_owned(),
+            ..TrafficFilter::default()
+        };
+        assert_eq!(kept(&filter), [0]);
+    }
+
+    #[test]
+    fn a_broken_pattern_is_ignored_rather_than_hiding_the_stream() {
+        let filter = TrafficFilter {
+            // Half a byte typed, or a nibble wildcard, which is refused.
+            hex: "AA 5".to_owned(),
+            ..TrafficFilter::default()
+        };
+        assert!(!filter.compile().hex_is_valid());
+        assert_eq!(
+            kept(&filter),
+            [0, 1, 2],
+            "an unusable pattern filters nothing"
+        );
+
+        assert!(HexPattern::parse("A?").is_none());
+        assert!(HexPattern::parse("??").is_some());
+    }
+
+    #[test]
+    fn source_and_length_narrow_the_view() {
+        let by_source = TrafficFilter {
+            source: "192.168".to_owned(),
+            ..TrafficFilter::default()
+        };
+        // The sent frame has no peer, so it cannot match a source filter.
+        assert_eq!(kept(&by_source), [1]);
+
+        let by_length = TrafficFilter {
+            min_len: Some(5),
+            ..TrafficFilter::default()
+        };
+        assert_eq!(kept(&by_length), [2]);
+    }
+
+    #[test]
+    fn text_is_looked_for_in_the_bytes_themselves() {
+        let filter = TrafficFilter {
+            text: "AT+".to_owned(),
+            ..TrafficFilter::default()
+        };
+        assert_eq!(kept(&filter), [2]);
+    }
+
+    #[test]
+    fn a_paused_monitor_stops_at_the_frame_it_froze_on() {
+        let mut state = AppState::default();
+        let id = state.open_monitor();
+        for _ in 0..3 {
+            state.push_log(logged("bus", Direction::Sent, &[1], None));
+        }
+
+        let monitor = state.monitors.get_mut(&id).unwrap();
+        monitor.paused_at = Some(1);
+        let monitor = &state.monitors[&id];
+        let visible = state.log.iter().filter(|e| monitor.in_window(e)).count();
+        assert_eq!(visible, 2, "frames 0 and 1, not the one that came after");
+
+        // Clearing the view hides what came before without touching the buffer.
+        let monitor = state.monitors.get_mut(&id).unwrap();
+        monitor.paused_at = None;
+        monitor.since = 2;
+        let monitor = &state.monitors[&id];
+        assert_eq!(state.log.len(), 3);
+        assert_eq!(state.log.iter().filter(|e| monitor.in_window(e)).count(), 1);
+    }
+
     #[test]
     fn a_dropped_connection_reconnects_with_the_settings_it_had() {
         let id = ConnectionId("link".to_owned());
@@ -371,6 +802,7 @@ mod tests {
         let mut state = AppState::default();
         for n in 0..MAX_LOG_ENTRIES + 50 {
             state.push_log(LogEntry {
+                seq: 0,
                 id: ConnectionId::from("c"),
                 direction: Direction::Sent,
                 bytes: vec![u8::try_from(n % 256).unwrap()],
@@ -381,5 +813,7 @@ mod tests {
         assert_eq!(state.log.len(), MAX_LOG_ENTRIES);
         // The 50 oldest were dropped, so the buffer now starts at entry 50.
         assert_eq!(state.log.front().unwrap().bytes, vec![50]);
+        // And the stamp survives the drop, which is why a monitor can rely on it.
+        assert_eq!(state.log.front().unwrap().seq, 50);
     }
 }

@@ -13,6 +13,10 @@ const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const WARNING: Color32 = Color32::from_rgb(200, 120, 40);
 
 pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
+    // Taken unconditionally: bytes sent here with no frame to decode them into
+    // are dropped now rather than surfacing later against an unrelated frame.
+    let handed_over = state.pending_frame_hex.take();
+
     library_bar(ui, state);
 
     if state.frames.frames.is_empty() {
@@ -30,6 +34,12 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     let Some(frame) = state.frames.selected_frame().cloned() else {
         return;
     };
+
+    if let Some(bytes) = handed_over {
+        let typed = to_hex_spaced(&bytes);
+        state.frame_hex_note = apply_hex(state, &frame, &typed);
+        state.frame_hex = typed;
+    }
 
     let tree = build_tree(&frame.fields);
     ScrollArea::vertical()
@@ -100,6 +110,8 @@ fn frame_picker(ui: &mut Ui, state: &mut AppState) {
                         .clicked()
                     {
                         state.frames.selected = Some(index);
+                        // Whatever the note said, it said it about another frame.
+                        state.frame_hex_note = None;
                     }
                 }
             });
@@ -509,7 +521,6 @@ fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: Optio
     // With nothing to mirror, the typed text stays put rather than being wiped.
     if let (false, Some(bytes)) = (ui.memory(|memory| memory.has_focus(id)), bytes) {
         state.frame_hex = to_hex_spaced(bytes);
-        state.frame_hex_note = None;
     }
 
     let response = ui.add(

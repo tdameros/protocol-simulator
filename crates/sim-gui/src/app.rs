@@ -24,7 +24,8 @@ impl SimApp {
             state.frames.load_from(directory);
         }
 
-        let mut dock_state = DockState::new(vec![Tab::LiveMonitor]);
+        let first = state.open_monitor();
+        let mut dock_state = DockState::new(vec![Tab::LiveMonitor(first)]);
         let surface = dock_state.main_surface_mut();
         let [live, _connections] =
             surface.split_left(NodeIndex::root(), 0.22, vec![Tab::Connections]);
@@ -51,6 +52,7 @@ impl SimApp {
                     timestamp,
                 } => {
                     self.state.push_log(LogEntry {
+                        seq: 0,
                         id,
                         direction: Direction::Sent,
                         bytes,
@@ -65,6 +67,7 @@ impl SimApp {
                     timestamp,
                 } => {
                     self.state.push_log(LogEntry {
+                        seq: 0,
                         id,
                         direction: Direction::Received,
                         bytes,
@@ -129,6 +132,13 @@ impl eframe::App for SimApp {
                 .style(dock_style(ui.style()))
                 .show_inside(ui, &mut viewer);
         });
+
+        // The dock cannot be rearranged while it is drawing itself, so a panel
+        // asking for a new tab leaves the request here.
+        if std::mem::take(&mut self.state.monitor_requested) {
+            let id = self.state.open_monitor();
+            self.dock_state.push_to_focused_leaf(Tab::LiveMonitor(id));
+        }
     }
 
     /// Anything the panels do not paint shows this colour. eframe defaults it to
