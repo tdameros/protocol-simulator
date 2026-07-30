@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use sim_core::frame::schema;
 use sim_core::frame::value::{FieldValues, Value};
-use sim_core::frame::{FieldKind, FrameDef, ScalarType};
+use sim_core::frame::{FieldDef, FieldKind, FrameDef, ScalarType, ValueRange};
 
 /// Subdirectory holding the type definitions every frame in the folder can use.
 const TYPES_DIR: &str = "types";
@@ -122,7 +122,7 @@ fn seed_values(frame: &FrameDef) -> FieldValues {
             values.insert(field.name.clone(), default.clone());
             continue;
         }
-        let Some(value) = neutral_value(&field.kind) else {
+        let Some(value) = neutral_value(field) else {
             continue;
         };
         values.insert(field.name.clone(), value);
@@ -130,11 +130,26 @@ fn seed_values(frame: &FrameDef) -> FieldValues {
     values
 }
 
-fn neutral_value(kind: &FieldKind) -> Option<Value> {
-    Some(match kind {
-        FieldKind::Scalar(ScalarType::F32 | ScalarType::F64) => Value::Float(0.0),
-        FieldKind::Scalar(scalar) if scalar.is_unsigned_integer() => Value::Uint(0),
-        FieldKind::Scalar(_) => Value::Int(0),
+/// Zero, unless the field's subtype forbids it.
+///
+/// A field declared `10..20` has to start at 10: seeding it at zero would leave
+/// a freshly opened frame refusing to encode.
+fn neutral_value(field: &FieldDef) -> Option<Value> {
+    Some(match &field.kind {
+        FieldKind::Scalar(ScalarType::F32 | ScalarType::F64) => Value::Float(match field.range {
+            Some(ValueRange::Float { min, max }) => 0.0_f64.clamp(min, max),
+            _ => 0.0,
+        }),
+        FieldKind::Scalar(scalar) if scalar.is_unsigned_integer() => {
+            Value::Uint(match field.range {
+                Some(ValueRange::Uint { min, .. }) => min,
+                _ => 0,
+            })
+        }
+        FieldKind::Scalar(_) => Value::Int(match field.range {
+            Some(ValueRange::Int { min, max }) => 0i64.clamp(min, max),
+            _ => 0,
+        }),
         FieldKind::Bytes { len } => Value::Bytes(vec![0; *len]),
         FieldKind::Text { .. } => Value::Text(String::new()),
         FieldKind::Enum { variants, .. } => {
@@ -282,6 +297,44 @@ repeat = 3
         assert_eq!(library.frames.len(), 1);
         assert_eq!(library.frames[0].fields.len(), 6);
         assert_eq!(library.frames[0].size(), 9);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_constrained_field_starts_inside_its_subtype() {
+        let dir = scratch("subtype");
+        std::fs::write(
+            dir.join("clamped.toml"),
+            r#"
+name = "Clamped"
+[[field]]
+name = "duty"
+type = "u8"
+range = { min = 10, max = 20 }
+[[field]]
+name = "trim"
+type = "i8"
+range = { min = -50, max = -10 }
+"#,
+        )
+        .unwrap();
+
+        let mut library = FrameLibrary::default();
+        library.load_from(dir.clone());
+        let frame = library.selected_frame().unwrap().clone();
+
+        // Zero is outside both, so neither may start there.
+        assert_eq!(
+            library.values_mut(&frame).get("duty"),
+            Some(&Value::Uint(10))
+        );
+        assert_eq!(
+            library.values_mut(&frame).get("trim"),
+            Some(&Value::Int(-10))
+        );
+        // Which is the whole point: an untouched frame has to encode.
+        assert!(sim_core::frame::codec::encode(&frame, library.values_mut(&frame)).is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
     }

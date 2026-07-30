@@ -1,6 +1,6 @@
 use sim_core::frame::codec;
 use sim_core::frame::value::Value;
-use sim_core::frame::{BitDef, EnumVariant, FieldDef, FieldKind, FrameDef, ScalarType};
+use sim_core::frame::{BitDef, EnumVariant, FieldDef, FieldKind, FrameDef, ScalarType, ValueRange};
 use sim_core::ConnectionStatus;
 
 use egui::{Color32, ComboBox, DragValue, RichText, ScrollArea, TextStyle, Ui};
@@ -268,9 +268,16 @@ fn type_label(field: &FieldDef) -> String {
         sim_core::frame::Endianness::Big => "be",
         sim_core::frame::Endianness::Little => "le",
     };
+    let constraint = field
+        .range
+        .as_ref()
+        .map(|range| format!(" {}", range.describe()))
+        .unwrap_or_default();
     match &field.kind {
-        FieldKind::Scalar(scalar) if scalar.size() > 1 => format!("{} {endian}", scalar.name()),
-        FieldKind::Scalar(scalar) => scalar.name().to_owned(),
+        FieldKind::Scalar(scalar) if scalar.size() > 1 => {
+            format!("{} {endian}{constraint}", scalar.name())
+        }
+        FieldKind::Scalar(scalar) => format!("{}{constraint}", scalar.name()),
         FieldKind::Bytes { len } => format!("bytes[{len}]"),
         FieldKind::Text { len } => format!("text[{len}]"),
         FieldKind::Enum { repr, .. } => format!("enum {}", repr.name()),
@@ -298,18 +305,27 @@ fn value_widget(
     match kind {
         FieldKind::Scalar(ScalarType::F32 | ScalarType::F64) => {
             let mut current = entry.as_float().unwrap_or(0.0);
-            if ui.add(DragValue::new(&mut current).speed(0.1)).changed() {
+            let mut widget = DragValue::new(&mut current).speed(0.1);
+            // The declared subtype, not the representation, is what the editor
+            // lets you reach: a 0..99 field simply will not go to 100.
+            if let Some(ValueRange::Float { min, max }) = field.range {
+                widget = widget.range(min..=max);
+            }
+            if ui.add(widget).changed() {
                 *entry = Value::Float(current);
             }
         }
         FieldKind::Scalar(scalar) if scalar.is_unsigned_integer() => {
             let mut current = entry.as_uint().unwrap_or(0);
-            let max = max_unsigned(*scalar);
+            let (min, max) = match field.range {
+                Some(ValueRange::Uint { min, max }) => (min, max),
+                _ => (0, max_unsigned(*scalar)),
+            };
             // Decimal rather than hex: egui's hex mode shows no 0x prefix, so
             // typing "10" would silently mean 16. The byte preview below already
             // gives the hexadecimal view.
             if ui
-                .add(DragValue::new(&mut current).range(0..=max))
+                .add(DragValue::new(&mut current).range(min..=max))
                 .changed()
             {
                 *entry = Value::Uint(current);
@@ -318,8 +334,10 @@ fn value_widget(
         FieldKind::Scalar(scalar) => {
             let mut current = entry.as_int().unwrap_or(0);
             let bits = scalar.size() * 8;
-            let min = -(1i64 << (bits - 1));
-            let max = (1i64 << (bits - 1)) - 1;
+            let (min, max) = match field.range {
+                Some(ValueRange::Int { min, max }) => (min, max),
+                _ => (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1),
+            };
             if ui
                 .add(DragValue::new(&mut current).range(min..=max))
                 .changed()
@@ -418,11 +436,11 @@ fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, fr
     };
 
     ui.heading("Preview");
-    match &encoded {
-        Ok(bytes) => hex_preview(ui, state, frame, bytes),
-        Err(error) => {
-            ui.colored_label(ERROR, error.to_string());
-        }
+    // Shown even when the fields do not encode: a frame refused because a value
+    // sits outside its subtype is precisely the one you want to keep looking at.
+    hex_preview(ui, state, frame, encoded.as_deref().ok());
+    if let Err(error) = &encoded {
+        ui.colored_label(ERROR, error.to_string());
     }
     if let Some(note) = &state.frame_hex_note {
         ui.colored_label(WARNING, note);
@@ -486,9 +504,10 @@ fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, fr
 ///
 /// The box only mirrors the encoder while it is not focused. Once it is, the
 /// text is whatever was typed, and the fields follow it instead.
-fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: &[u8]) {
+fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: Option<&[u8]>) {
     let id = egui::Id::new(("frame_hex", &frame.name));
-    if !ui.memory(|memory| memory.has_focus(id)) {
+    // With nothing to mirror, the typed text stays put rather than being wiped.
+    if let (false, Some(bytes)) = (ui.memory(|memory| memory.has_focus(id)), bytes) {
         state.frame_hex = to_hex_spaced(bytes);
         state.frame_hex_note = None;
     }
@@ -542,19 +561,27 @@ fn apply_hex(state: &mut AppState, frame: &FrameDef, typed: &str) -> Option<Stri
         }
     }
 
+    let mut notes = Vec::new();
     // Worth saying out loud: paste a capture with a bad checksum and the
     // preview will quietly show the corrected one a moment later.
-    (!decoded.checksum_mismatches.is_empty()).then(|| {
+    if !decoded.checksum_mismatches.is_empty() {
         let fields: Vec<&str> = decoded
             .checksum_mismatches
             .iter()
             .map(|mismatch| mismatch.field.as_str())
             .collect();
-        format!(
+        notes.push(format!(
             "{} did not match; the preview will show the recomputed value.",
             fields.join(", ")
-        )
-    })
+        ));
+    }
+    for violation in &decoded.range_violations {
+        notes.push(format!(
+            "{} is {}, outside {}.",
+            violation.field, violation.found, violation.range
+        ));
+    }
+    (!notes.is_empty()).then(|| notes.join(" "))
 }
 
 fn max_unsigned(scalar: ScalarType) -> u64 {
@@ -609,6 +636,7 @@ mod tests {
             kind: FieldKind::Scalar(ScalarType::U16),
             endian: Endianness::Big,
             default: None,
+            range: None,
         }
     }
 
