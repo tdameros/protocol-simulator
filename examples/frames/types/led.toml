@@ -4,6 +4,13 @@
 # blocks become available to all of them. A frame can also declare a type inline
 # with the same syntax; an inline definition wins over the shared one.
 
+# A subtype: one scalar, narrowed. `u8` still says one byte goes on the wire;
+# the range says which of those 256 values the protocol actually allows.
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 100 }
+
 [[type]]
 name = "LedConfig"
 description = "One addressable LED"
@@ -16,8 +23,8 @@ variants = { OFF = 0, ON = 1, BLINK = 2, PULSE = 3 }
 
 [[type.field]]
 name = "brightness"
-type = "u8"
-default = 128
+type = "Percent"
+default = 80
 
 [[type.field]]
 name = "period_ms"

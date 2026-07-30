@@ -17,6 +17,7 @@ Read the files in order; each one introduces what the previous did not.
 | `04-checksums.toml` | checksums, and the range each protects |
 | `05-telemetry.toml` | a realistic frame using all of it |
 | `06-templates.toml` | reusable types, for structures that repeat |
+| `07-subtypes.toml` | scalars restricted to the values the protocol allows |
 | `types/led.toml` | types shared by every frame in the folder |
 
 Every file here is checked by `cargo test -p sim-core --test examples`: it must
@@ -38,7 +39,7 @@ Fields are written in wire order, one `[[field]]` per entry. Every field takes
 
 | `type` | Extra attributes | Size |
 | --- | --- | --- |
-| `u8` `i8` `u16` `i16` `u32` `i32` `u64` `i64` `f32` `f64` | `default` | 1 to 8 bytes |
+| `u8` `i8` `u16` `i16` `u32` `i32` `u64` `i64` `f32` `f64` | `default`, `range` | 1 to 8 bytes |
 | `bytes` | `len` | `len` |
 | `text` | `len`, `default` | `len`, NUL padded |
 | `enum` | `repr`, `variants`, `default` | size of `repr` |
@@ -60,6 +61,46 @@ crc8   crc16-ccitt   crc16-x25   crc16-xmodem   crc16-modbus   crc32
 ```
 
 `crc8` and `crc32` have one dominant variant, so `algo` may be omitted for them.
+
+## Subtypes
+
+A `range` restricts a scalar to part of what its representation can hold, the
+way an Ada subtype does. The wire format does not change — a `u8` is still one
+byte — but the editor will not let you dial a value outside it, sending one is
+refused, and receiving one is flagged.
+
+```toml
+[[field]]
+name = "gain"
+type = "i16"
+range = { min = -500, max = 500 }
+```
+
+Give the constraint a name and it becomes reusable, as a `[[type]]` with a
+`base` instead of fields:
+
+```toml
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 100 }
+
+[[field]]
+name = "duty"
+type = "Percent"
+```
+
+A subtype may narrow another subtype, and a field may narrow the subtype it
+uses, as long as each stays inside the one above it. Widening is refused, and so
+is a range that does not fit the base representation — `{ min = 0, max = 300 }`
+on a `u8` fails at load time rather than truncating quietly.
+
+Ranges apply to scalars only, integer or float. On a `text`, `bytes`, `enum`,
+`bits` or checksum field they are rejected rather than ignored.
+
+The asymmetry between the two directions is deliberate: **sending** a value your
+own specification forbids is a mistake, so the encoder refuses it; **receiving**
+one is a finding, so the decoder reports it and still shows you the frame.
 
 ## Reusable types
 
@@ -108,6 +149,8 @@ instance.
 
 ## Known limitations
 
+- **Range bounds go through TOML integers**, so a `u64` bound above
+  9 223 372 036 854 775 807 cannot be written. Every other bound is exact.
 - **Fixed size only.** A `bytes` field sized by an upstream `length` field is
   not supported yet; `len` must be a constant.
 - **Saving from the GUI writes the expanded layout.** Types are resolved when
