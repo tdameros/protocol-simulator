@@ -1,9 +1,10 @@
 GUI_PKG := sim-gui
+VERSION := 0.0.0
 CORE_PKG := sim-core
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-release run run-release check test test-core \
-        clippy clippy-fix fmt fmt-check doc clean ci toolchain watch
+        clippy clippy-fix fmt fmt-check doc clean ci toolchain watch bundle-macos
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "\033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -48,6 +49,12 @@ clean: ## Remove build artifacts
 	cargo clean
 
 ci: fmt-check clippy test ## Run all quality gates (format, lint, tests)
+
+bundle-macos: ## Build the universal macOS .app locally (needs ~3 GB of disk)
+	rustup target add aarch64-apple-darwin x86_64-apple-darwin
+	cargo build --release -p $(GUI_PKG) --target aarch64-apple-darwin
+	cargo build --release -p $(GUI_PKG) --target x86_64-apple-darwin
+	packaging/macos/bundle.sh $(VERSION)
 
 toolchain: ## Update the stable Rust toolchain via rustup
 	rustup update stable
