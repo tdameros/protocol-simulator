@@ -6,6 +6,7 @@ use sim_core::{
 };
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -47,7 +48,25 @@ async fn wait_all_connected(rx: &mut mpsc::Receiver<Event>, expected: &[&str]) {
         }
     })
     .await
-    .expect("timed out waiting for connections to report Connected");
+    .unwrap_or_else(|_| panic!("timed out waiting for {pending:?} to report Connected"));
+}
+
+/// Waits until a server holds its port.
+///
+/// A client that dials before the listener exists is refused, and a refusal
+/// ends its task for good, so the two commands cannot simply be fired off back
+/// to back.
+async fn wait_until_listening(rx: &mut mpsc::Receiver<Event>, name: &str) {
+    wait_for(rx, |event| {
+        matches!(
+            event,
+            Event::ConnectionStatus {
+                id,
+                status: ConnectionStatus::Listening
+            } if id.0 == name
+        )
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -113,6 +132,8 @@ async fn tcp_round_trip() {
     })
     .await
     .unwrap();
+    wait_until_listening(&mut rx, "server").await;
+
     tx.send(Command::Connect {
         id: ConnectionId::from("client"),
         config: TransportConfig::Tcp {
@@ -191,12 +212,17 @@ async fn udp_multicast_round_trip() {
 async fn dead_connection_frees_its_name() {
     let (tx, mut rx) = Engine::spawn();
 
-    // Connecting to a closed port fails, so the task exits right away.
-    let dead = "127.0.0.1:19987".parse().unwrap();
+    // A port that cannot be opened, so the task exits right away without
+    // assuming anything about what this machine happens to be running.
     tx.send(Command::Connect {
         id: ConnectionId::from("probe"),
-        config: TransportConfig::Tcp {
-            mode: TcpMode::Client { addr: dead },
+        config: TransportConfig::Serial {
+            port_name: "sim-core-test-no-such-port".to_owned(),
+            baud_rate: 115_200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
         },
         retry: None,
     })
@@ -338,15 +364,24 @@ async fn a_retrying_connection_comes_up_when_the_peer_appears() {
 }
 
 /// A capped policy stops on its own rather than retrying forever.
+///
+/// Opening a serial port that cannot exist, rather than dialling a TCP port
+/// assumed to be closed: the failure is immediate and identical on every
+/// platform, where a port nobody is supposed to be listening on is only an
+/// assumption about the machine the tests happen to run on.
 #[tokio::test]
 async fn a_capped_retry_gives_up_after_its_budget() {
     let (tx, mut rx) = Engine::spawn();
-    let dead: std::net::SocketAddr = "127.0.0.1:19962".parse().unwrap();
 
     tx.send(Command::Connect {
         id: ConnectionId::from("probe"),
-        config: TransportConfig::Tcp {
-            mode: TcpMode::Client { addr: dead },
+        config: TransportConfig::Serial {
+            port_name: "sim-core-test-no-such-port".to_owned(),
+            baud_rate: 115_200,
+            data_bits: DataBits::Eight,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow_control: FlowControl::None,
         },
         retry: Some(RetryPolicy {
             max_attempts: Some(2),
