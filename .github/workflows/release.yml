@@ -1,0 +1,110 @@
+name: release
+
+# A tag publishes. The manual button builds the same artifacts and attaches them
+# to the run instead, so the workflow can be exercised without burning a tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: protocol-simulator
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 rather than latest: it fixes the glibc floor at 2.35, which is
+          # what lets the binary run on Debian 12 and RHEL 9 as well.
+          - os: ubuntu-22.04
+            artifact: protocol-simulator-linux-x86_64.tar.gz
+          - os: windows-latest
+            artifact: protocol-simulator-windows-x86_64.exe
+          - os: macos-latest
+            artifact: protocol-simulator-macos-universal.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare the toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Work out the version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >>"$GITHUB_ENV"
+          else
+            echo "VERSION=0.0.0" >>"$GITHUB_ENV"
+          fi
+
+      - name: Install desktop libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Build and package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked -p sim-gui
+          # tar rather than a bare file: it carries the executable bit, which a
+          # browser download would otherwise strip.
+          tar -C target/release -czf "${{ matrix.artifact }}" "$BIN"
+
+      - name: Build and package (Windows)
+        if: runner.os == 'Windows'
+        # Statically linked CRT, so the exe needs no Visual C++ redistributable.
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --locked -p sim-gui
+          Copy-Item "target/release/$env:BIN.exe" "${{ matrix.artifact }}"
+
+      - name: Build and package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked -p sim-gui --target aarch64-apple-darwin
+          cargo build --release --locked -p sim-gui --target x86_64-apple-darwin
+          packaging/macos/bundle.sh "$VERSION"
+          # ditto, not zip: it preserves the bundle layout and the exec bits.
+          ditto -c -k --keepParent target/ProtocolSimulator.app "${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write the release notes
+        run: |
+          sed "s/__VERSION__/${GITHUB_REF_NAME}/g" packaging/release-notes.md >notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes
