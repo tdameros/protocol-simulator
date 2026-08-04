@@ -1,5 +1,9 @@
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
+// Without this, Windows gives a GUI binary a console as well, which sits behind
+// the window doing nothing. Only in release: a debug build keeps its console so
+// panics and logs stay visible while working on it.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
 mod engine_handle;
