@@ -3,6 +3,12 @@ name = "sim-gui"
 version = "0.1.0"
 edition = "2021"
 
+# The crate is named for its place in the workspace; the file people download
+# is named for what it is.
+[[bin]]
+name = "protocol-simulator"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 sim-core = { version = "0.1.0", path = "../sim-core" }
