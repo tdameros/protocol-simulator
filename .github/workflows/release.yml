@@ -2,8 +2,8 @@ name: release
 
 # One way in: the Run workflow button. Nothing here fires on a push, so no merge
 # can ever publish anything. Leaving `publish` off builds the three artifacts and
-# attaches them to the run, which is how you exercise the pipeline without
-# spending a version number; turning it on tags the commit and publishes.
+# attaches them to the run; turning it on goes all the way to a GitHub release —
+# a real one from main, a draft from any other branch.
 on:
   workflow_dispatch:
     inputs:
@@ -24,6 +24,7 @@ jobs:
       version: ${{ steps.read.outputs.version }}
       tag: ${{ steps.read.outputs.tag }}
       prerelease: ${{ steps.read.outputs.prerelease }}
+      draft: ${{ steps.read.outputs.draft }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,17 +43,24 @@ jobs:
             *-*) echo "prerelease=true" >>"$GITHUB_OUTPUT" ;;
             *) echo "prerelease=false" >>"$GITHUB_OUTPUT" ;;
           esac
+          # Only main cuts a real release. Anywhere else is a rehearsal, and goes
+          # out as a draft: the whole publish path runs and the artifacts land on
+          # a real release page, but GitHub holds the tag back until someone
+          # presses Publish, so the version stays free and deleting the draft
+          # leaves no trace.
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            echo "draft=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "draft=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::$GITHUB_REF_NAME is not main — publishing v$version as a draft"
+          fi
           echo "Building v$version"
 
-      - name: Check the version is releasable
+      - name: Refuse a version that is already out
         if: inputs.publish
         env:
           TAG: ${{ steps.read.outputs.tag }}
         run: |
-          if [ "$GITHUB_REF_NAME" != "main" ]; then
-            echo "::error::releases are cut from main, not $GITHUB_REF_NAME"
-            exit 1
-          fi
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "::error::$TAG is already released — bump the workspace version first"
             exit 1
@@ -157,7 +165,8 @@ jobs:
         run: sed "s/__VERSION__/$TAG/g" packaging/release-notes.md >notes.md
 
       # No tag was pushed to get here, so this call creates it, on the exact
-      # commit the artifacts above were built from.
+      # commit the artifacts above were built from — unless it is a draft, where
+      # GitHub records the target and creates nothing until the draft is published.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -165,6 +174,9 @@ jobs:
           flags=()
           if [ "${{ needs.version.outputs.prerelease }}" = "true" ]; then
             flags+=(--prerelease)
+          fi
+          if [ "${{ needs.version.outputs.draft }}" = "true" ]; then
+            flags+=(--draft)
           fi
           gh release create "$TAG" dist/* \
             --target "$GITHUB_SHA" \
