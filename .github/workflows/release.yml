@@ -26,7 +26,7 @@ jobs:
       prerelease: ${{ steps.read.outputs.prerelease }}
       draft: ${{ steps.read.outputs.draft }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Tags, so the guard below can see what has already been released.
           fetch-depth: 0
@@ -94,7 +94,7 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Prepare the toolchain
         run: |
@@ -139,7 +139,7 @@ jobs:
           # ditto, not zip: it preserves the bundle layout and the exec bits.
           ditto -c -k --keepParent target/ProtocolSimulator.app "${{ matrix.artifact }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -154,9 +154,9 @@ jobs:
     env:
       TAG: ${{ needs.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

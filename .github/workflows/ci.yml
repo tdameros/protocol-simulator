@@ -20,7 +20,7 @@ jobs:
         os: [ubuntu-22.04, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # winit and glow link these; a headless runner still has to build against
       # them even though no window is ever opened.
@@ -38,7 +38,7 @@ jobs:
           rustup default stable
           rustup component add rustfmt clippy
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
