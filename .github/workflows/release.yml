@@ -19,7 +19,7 @@ env:
 jobs:
   version:
     name: version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.read.outputs.version }}
       tag: ${{ steps.read.outputs.tag }}
@@ -74,18 +74,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 22.04 rather than latest: it fixes the glibc floor at 2.35, which is
-          # what lets the binary run on Debian 12 and RHEL 9 as well.
+          # Every image is named outright. `-latest` is reassigned by GitHub
+          # without notice, and what a downloaded binary links against is not
+          # something that should change on someone else's schedule; moving an
+          # image is a commit here, with the rebuild that goes with it.
+          #
+          # 22.04, three images behind, is a further deliberate step: it fixes
+          # the glibc floor at 2.35, which is what lets the binary run on Debian
+          # 12 and RHEL 9 as well.
           - os: ubuntu-22.04
             artifact: protocol-simulator-linux-x86_64.tar.gz
             rustflags: ""
-          - os: windows-latest
+          - os: windows-2025
             artifact: protocol-simulator-windows-x86_64.exe
             # Statically linked CRT, so the exe needs no Visual C++
             # redistributable. Set for the whole job rather than the build step:
             # changing RUSTFLAGS invalidates everything the tests just compiled.
             rustflags: "-C target-feature=+crt-static"
-          - os: macos-latest
+          # arm64, like macos-latest. Both slices of the universal binary are
+          # cross-compiled from here anyway.
+          - os: macos-26
             artifact: protocol-simulator-macos-universal.zip
             rustflags: ""
 
@@ -148,7 +156,7 @@ jobs:
   publish:
     needs: [version, build]
     if: inputs.publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:

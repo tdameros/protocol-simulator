@@ -17,7 +17,10 @@ jobs:
       # One platform failing should still tell you about the other two.
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest]
+        # Named outright, and the same images the release builds on, so a green
+        # run here means the artifacts will build too. See release.yml for why
+        # Linux stays on 22.04.
+        os: [ubuntu-22.04, windows-2025, macos-26]
 
     steps:
       - uses: actions/checkout@v7
