@@ -1,7 +1,7 @@
 [package]
 name = "sim-gui"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 # The crate is named for its place in the workspace; the file people download
 # is named for what it is.
@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-sim-core = { version = "0.1.0", path = "../sim-core" }
+sim-core = { path = "../sim-core" }
 eframe = "0.35"
 egui = "0.35"
 egui-phosphor = "0.13.0"
