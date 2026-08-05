@@ -114,13 +114,24 @@ async fn run(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>)
                 )
                 .await;
             }
-            // A task that ended on its own frees its name straight away, so the
-            // same connection can be recreated without a manual disconnect first.
+            // A task that ended on its own frees its name here, and the
+            // disconnection is announced from here too, in that order. That
+            // ordering is the whole point: this loop is single-threaded, so a
+            // caller reacting the instant it sees `Disconnected` cannot have its
+            // `Connect` handled before the slot was freed, and cannot be told the
+            // name is still taken.
+            //
             // The generation guards against a stale notice evicting the newer
             // connection that has since taken the name.
             Some((id, generation)) = finished_rx.recv() => {
                 if connections.get(&id).is_some_and(|handle| handle.generation == generation) {
                     connections.remove(&id);
+                    let _ = events
+                        .send(Event::ConnectionStatus {
+                            id,
+                            status: ConnectionStatus::Disconnected,
+                        })
+                        .await;
                 }
             }
         }
@@ -136,18 +147,6 @@ async fn handle_command(
 ) {
     match command {
         Command::Connect { id, config, retry } => {
-            // An entry whose task already exited is just garbage awaiting its
-            // notification on `finished_rx`. Checking the task directly keeps
-            // reconnecting deterministic: a caller acting the instant it sees
-            // `Disconnected` would otherwise race that notification and be told
-            // the name is taken.
-            let stale = connections
-                .get(&id)
-                .is_some_and(|handle| handle.task.is_finished());
-            if stale {
-                connections.remove(&id);
-            }
-
             if connections.contains_key(&id) {
                 report_error(
                     events,
@@ -196,10 +195,10 @@ async fn handle_command(
                 return;
             }
             // A closed channel means the connection task already exited on its
-            // own (transport error, peer hang-up). Drop the dead entry rather
-            // than leaving it around to fail every later send.
+            // own (transport error, peer hang-up). Its notice is on its way to
+            // the loop above, which owns removing the entry and announcing it;
+            // dropping the entry here would swallow that announcement.
             if handle.outgoing_tx.send(bytes).await.is_err() {
-                connections.remove(&id);
                 report_error(events, Some(id.clone()), EngineError::ConnectionDown(id)).await;
             }
         }
@@ -295,12 +294,9 @@ fn start_connection(
             failures = failures.saturating_add(1);
         }
 
-        let _ = events
-            .send(Event::ConnectionStatus {
-                id: id.clone(),
-                status: ConnectionStatus::Disconnected,
-            })
-            .await;
+        // The engine announces the disconnection when it picks this up, once the
+        // name is free again. Announcing it from here would let a caller learn of
+        // it while the slot is still held.
         let _ = finished_tx.send((id, generation)).await;
     });
 

@@ -19,7 +19,7 @@ impl UdpTransport {
     ///
     /// The socket is deliberately left unconnected: a connected UDP socket only
     /// accepts datagrams coming from `remote`, which silently hides traffic sent
-    /// from an unexpected source port — usually the very thing worth seeing.
+    /// from an unexpected source port, usually the very thing worth seeing.
     ///
     /// # Errors
     ///
@@ -49,8 +49,8 @@ impl UdpTransport {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
         // Lets several listeners (including other tools on this machine) share the
-        // group port. On BSD/macOS SO_REUSEADDR alone is not enough for that —
-        // sharing a UDP port there requires SO_REUSEPORT — whereas on Windows
+        // group port. On BSD/macOS SO_REUSEADDR alone is not enough for that,
+        // since sharing a UDP port there requires SO_REUSEPORT, whereas on Windows
         // SO_REUSEADDR already carries those semantics and SO_REUSEPORT is absent.
         socket.set_reuse_address(true)?;
         #[cfg(unix)]

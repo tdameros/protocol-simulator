@@ -1,49 +1,113 @@
 name: release
 
-# A tag publishes. The manual button builds the same artifacts and attaches them
-# to the run instead, so the workflow can be exercised without burning a tag.
+# One way in: the Run workflow button. Nothing here fires on a push, so no merge
+# can ever publish anything. Leaving `publish` off builds the three artifacts and
+# attaches them to the run; turning it on goes all the way to a GitHub release:
+# a real one from main, a draft from any other branch.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Tag this commit and publish a GitHub release"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
   BIN: protocol-simulator
 
 jobs:
+  version:
+    name: version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+      prerelease: ${{ steps.read.outputs.prerelease }}
+      draft: ${{ steps.read.outputs.draft }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Tags, so the guard below can see what has already been released.
+          fetch-depth: 0
+
+      - name: Read the workspace version
+        id: read
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps --locked |
+            jq -r '.packages[] | select(.name == "sim-gui") | .version')
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "tag=v$version" >>"$GITHUB_OUTPUT"
+          # 0.2.0-rc.1 must not become the download every visitor is offered.
+          case "$version" in
+            *-*) echo "prerelease=true" >>"$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >>"$GITHUB_OUTPUT" ;;
+          esac
+          # Only main cuts a real release. Anywhere else is a rehearsal, and goes
+          # out as a draft: the whole publish path runs and the artifacts land on
+          # a real release page, but GitHub holds the tag back until someone
+          # presses Publish, so the version stays free and deleting the draft
+          # leaves no trace.
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            echo "draft=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "draft=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::$GITHUB_REF_NAME is not main, publishing v$version as a draft"
+          fi
+          echo "Building v$version"
+
+      - name: Refuse a version that is already out
+        if: inputs.publish
+        env:
+          TAG: ${{ steps.read.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::$TAG is already released. Bump the workspace version first"
+            exit 1
+          fi
+
   build:
     name: ${{ matrix.os }}
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # 22.04 rather than latest: it fixes the glibc floor at 2.35, which is
-          # what lets the binary run on Debian 12 and RHEL 9 as well.
+          # Every image is named outright. `-latest` is reassigned by GitHub
+          # without notice, and what a downloaded binary links against is not
+          # something that should change on someone else's schedule; moving an
+          # image is a commit here, with the rebuild that goes with it.
+          #
+          # 22.04, three images behind, is a further deliberate step: it fixes
+          # the glibc floor at 2.35, which is what lets the binary run on Debian
+          # 12 and RHEL 9 as well.
           - os: ubuntu-22.04
             artifact: protocol-simulator-linux-x86_64.tar.gz
-          - os: windows-latest
+            rustflags: ""
+          - os: windows-2025
             artifact: protocol-simulator-windows-x86_64.exe
-          - os: macos-latest
+            # Statically linked CRT, so the exe needs no Visual C++
+            # redistributable. Set for the whole job rather than the build step:
+            # changing RUSTFLAGS invalidates everything the tests just compiled.
+            rustflags: "-C target-feature=+crt-static"
+          # arm64, like macos-latest. Both slices of the universal binary are
+          # cross-compiled from here anyway.
+          - os: macos-26
             artifact: protocol-simulator-macos-universal.zip
+            rustflags: ""
+
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      VERSION: ${{ needs.version.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Prepare the toolchain
         run: |
           rustup update stable --no-self-update
           rustup default stable
-
-      - name: Work out the version
-        shell: bash
-        run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "VERSION=${GITHUB_REF_NAME#v}" >>"$GITHUB_ENV"
-          else
-            echo "VERSION=0.0.0" >>"$GITHUB_ENV"
-          fi
 
       - name: Install desktop libraries
         if: runner.os == 'Linux'
@@ -52,6 +116,12 @@ jobs:
           sudo apt-get install -y \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev
+
+      # ci.yml only guards main, and a release can be cut from any commit. This
+      # is the gate that makes the artifact itself trustworthy, so it runs
+      # before anything is packaged and in the profile that ships.
+      - name: Test
+        run: cargo test --workspace --release --locked
 
       - name: Build and package (Linux)
         if: runner.os == 'Linux'
@@ -63,9 +133,6 @@ jobs:
 
       - name: Build and package (Windows)
         if: runner.os == 'Windows'
-        # Statically linked CRT, so the exe needs no Visual C++ redistributable.
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
         run: |
           cargo build --release --locked -p sim-gui
           Copy-Item "target/release/$env:BIN.exe" "${{ matrix.artifact }}"
@@ -80,31 +147,48 @@ jobs:
           # ditto, not zip: it preserves the bundle layout and the exec bits.
           ditto -c -k --keepParent target/ProtocolSimulator.app "${{ matrix.artifact }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
 
   publish:
-    needs: build
-    if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    needs: [version, build]
+    if: inputs.publish
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Write the release notes
-        run: |
-          sed "s/__VERSION__/${GITHUB_REF_NAME}/g" packaging/release-notes.md >notes.md
+        run: sed "s/__VERSION__/$TAG/g" packaging/release-notes.md >notes.md
 
+      # No tag was pushed to get here, so this call creates it, on the exact
+      # commit the artifacts above were built from. A draft is the exception:
+      # GitHub records the target and creates nothing until it is published.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --generate-notes
+        run: |
+          flags=()
+          if [ "${{ needs.version.outputs.prerelease }}" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          if [ "${{ needs.version.outputs.draft }}" = "true" ]; then
+            flags+=(--draft)
+          fi
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --generate-notes \
+            "${flags[@]}"

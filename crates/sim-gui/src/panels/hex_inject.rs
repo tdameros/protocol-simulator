@@ -11,7 +11,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
     // Only a connection removed from the list clears the selection. A target that
     // merely dropped stays selected, so it does not silently vanish from the combo
-    // the moment a send fails — the reason is spelled out below instead.
+    // the moment a send fails. The reason is spelled out below instead.
     if state
         .hex_target
         .as_ref()
@@ -56,7 +56,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     if let (Some(id), false) = (state.hex_target.as_ref(), target_ready) {
         ui.colored_label(
             Color32::from_rgb(200, 120, 40),
-            format!("\"{}\" is not connected — reconnect it to send.", id.0),
+            format!("\"{}\" is not connected. Reconnect it to send.", id.0),
         );
     }
 

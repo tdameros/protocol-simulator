@@ -19,7 +19,7 @@ IDENTIFIER="dev.tdameros.protocol-simulator"
 for arch in aarch64 x86_64; do
     binary="target/${arch}-apple-darwin/release/${BIN}"
     if [ ! -f "$binary" ]; then
-        echo "missing $binary — build that target first" >&2
+        echo "missing $binary. Build that target first" >&2
         exit 1
     fi
 done

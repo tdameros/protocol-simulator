@@ -1,8 +1,8 @@
 # Subtypes: a scalar restricted to the values the protocol actually allows.
 #
 # The Ada idea. `u8` says one byte goes on the wire; `range` says which of those
-# 256 values mean anything. The wire format is unchanged — this frame is 9 bytes
-# either way — but the editor will not let you dial a value your own
+# 256 values mean anything. The wire format is unchanged (this frame is 9 bytes
+# either way), but the editor will not let you dial a value your own
 # specification forbids, and a received frame that breaks the rule is flagged.
 #
 # A subtype is a `[[type]]` with a `base` instead of fields:

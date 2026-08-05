@@ -1,6 +1,9 @@
 GUI_PKG := sim-gui
-VERSION := 0.0.0
 CORE_PKG := sim-core
+# Same source of truth as the release workflow. Recursive, not `:=`, so only the
+# bundle target pays for it.
+VERSION = $(shell cargo metadata --format-version 1 --no-deps | \
+	jq -r '.packages[] | select(.name == "$(GUI_PKG)") | .version')
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-release run run-release check test test-core \
