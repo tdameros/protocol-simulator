@@ -494,7 +494,7 @@ fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, fr
     if let (Some(id), false) = (state.frame_target.as_ref(), target_ready) {
         ui.colored_label(
             WARNING,
-            format!("\"{}\" is not connected — reconnect it to send.", id.0),
+            format!("\"{}\" is not connected. Reconnect it to send.", id.0),
         );
     }
 

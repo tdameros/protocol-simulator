@@ -1,4 +1,4 @@
-Protocol Simulator __VERSION__ — one executable per platform, nothing to install.
+Protocol Simulator __VERSION__: one executable per platform, nothing to install.
 
 ## Linux (x86_64)
 

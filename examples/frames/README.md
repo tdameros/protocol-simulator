@@ -1,7 +1,7 @@
 # Example frames
 
-Frame definitions are plain TOML. Point the simulator at this folder — **Frame
-editor → Frames folder** — or pass it on the command line:
+Frame definitions are plain TOML. Point the simulator at this folder with
+**Frame editor → Frames folder**, or pass it on the command line:
 
 ```sh
 cargo run -p sim-gui -- examples/frames
@@ -65,8 +65,8 @@ crc8   crc16-ccitt   crc16-x25   crc16-xmodem   crc16-modbus   crc32
 ## Subtypes
 
 A `range` restricts a scalar to part of what its representation can hold, the
-way an Ada subtype does. The wire format does not change — a `u8` is still one
-byte — but the editor will not let you dial a value outside it, sending one is
+way an Ada subtype does. The wire format does not change (a `u8` is still one
+byte), but the editor will not let you dial a value outside it, sending one is
 refused, and receiving one is flagged.
 
 ```toml
@@ -92,7 +92,7 @@ type = "Percent"
 
 A subtype may narrow another subtype, and a field may narrow the subtype it
 uses, as long as each stays inside the one above it. Widening is refused, and so
-is a range that does not fit the base representation — `{ min = 0, max = 300 }`
+is a range that does not fit the base representation: `{ min = 0, max = 300 }`
 on a `u8` fails at load time rather than truncating quietly.
 
 Ranges apply to scalars only, integer or float. On a `text`, `bytes`, `enum`,
@@ -124,7 +124,7 @@ repeat = 8
 ```
 
 Types may be declared inline in a frame or, as in `types/led.toml`, in any file
-under `types/` — those are shared by every frame in the folder. An inline
+under `types/`, which are shared by every frame in the folder. An inline
 definition wins over a shared one of the same name. Types may contain other
 types.
 
@@ -156,4 +156,4 @@ instance.
 - **Saving from the GUI writes the expanded layout.** Types are resolved when
   the file is read, so a frame saved from the editor lists every field
   individually. The bytes on the wire are identical, but the factorisation is
-  lost — keep the hand-written file if you care about it.
+  lost, so keep the hand-written file if you care about it.

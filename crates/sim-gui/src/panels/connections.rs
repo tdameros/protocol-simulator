@@ -177,7 +177,7 @@ fn interface_picker(ui: &mut Ui, selected: &mut Ipv4Addr) {
             .show_ui(ui, |ui| {
                 ui.selectable_value(selected, Ipv4Addr::UNSPECIFIED, "auto (0.0.0.0)");
                 for (name, addr) in local_ipv4_interfaces() {
-                    ui.selectable_value(selected, addr, format!("{name} — {addr}"));
+                    ui.selectable_value(selected, addr, format!("{name} ({addr})"));
                 }
             });
     });

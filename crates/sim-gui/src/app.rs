@@ -150,7 +150,7 @@ impl eframe::App for SimApp {
 
 /// `egui_dock` derives panel corner radius from the interactive widget styles, so the
 /// rounding meant for buttons and text fields ends up on surfaces that must tile
-/// edge to edge — leaving uncovered notches at every junction. Square those off
+/// edge to edge, leaving uncovered notches at every junction. Square those off
 /// while leaving the tabs themselves rounded.
 fn dock_style(ui_style: &egui::Style) -> Style {
     let mut style = Style::from_egui(ui_style);

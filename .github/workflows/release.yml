@@ -2,7 +2,7 @@ name: release
 
 # One way in: the Run workflow button. Nothing here fires on a push, so no merge
 # can ever publish anything. Leaving `publish` off builds the three artifacts and
-# attaches them to the run; turning it on goes all the way to a GitHub release —
+# attaches them to the run; turning it on goes all the way to a GitHub release:
 # a real one from main, a draft from any other branch.
 on:
   workflow_dispatch:
@@ -52,7 +52,7 @@ jobs:
             echo "draft=false" >>"$GITHUB_OUTPUT"
           else
             echo "draft=true" >>"$GITHUB_OUTPUT"
-            echo "::notice::$GITHUB_REF_NAME is not main — publishing v$version as a draft"
+            echo "::notice::$GITHUB_REF_NAME is not main, publishing v$version as a draft"
           fi
           echo "Building v$version"
 
@@ -62,7 +62,7 @@ jobs:
           TAG: ${{ steps.read.outputs.tag }}
         run: |
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "::error::$TAG is already released — bump the workspace version first"
+            echo "::error::$TAG is already released. Bump the workspace version first"
             exit 1
           fi
 
@@ -173,8 +173,8 @@ jobs:
         run: sed "s/__VERSION__/$TAG/g" packaging/release-notes.md >notes.md
 
       # No tag was pushed to get here, so this call creates it, on the exact
-      # commit the artifacts above were built from — unless it is a draft, where
-      # GitHub records the target and creates nothing until the draft is published.
+      # commit the artifacts above were built from. A draft is the exception:
+      # GitHub records the target and creates nothing until it is published.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
