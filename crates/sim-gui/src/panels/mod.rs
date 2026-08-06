@@ -3,7 +3,7 @@ pub mod frame_editor;
 pub mod hex_inject;
 pub mod live_monitor;
 
-use egui::{Ui, WidgetText};
+use egui::{Color32, Layout, Response, TextStyle, Ui, WidgetText};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::TabViewer;
 
@@ -22,6 +22,49 @@ pub enum Tab {
 pub struct AppTabViewer<'a> {
     pub state: &'a mut AppState,
     pub engine: &'a EngineHandle,
+}
+
+/// How wide the widest of `samples` renders, in the given style.
+///
+/// Columns are sized from strings chosen up front rather than from whatever is
+/// on the row being drawn. A width taken from the content moves as the content
+/// does, which is the whole defect this exists to avoid.
+pub fn widest(ui: &Ui, style: &TextStyle, samples: &[&str]) -> f32 {
+    let font = style.resolve(ui.style());
+    samples
+        .iter()
+        .map(|text| {
+            ui.painter()
+                .layout_no_wrap((*text).to_owned(), font.clone(), Color32::PLACEHOLDER)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max)
+}
+
+/// Lays out `contents` in a slot of exactly `width`, so whatever comes after it
+/// starts at the same place on every row.
+///
+/// `set_min_width` is what makes it a slot rather than a ceiling: the desired
+/// size handed to `allocate_ui_with_layout` only caps the room the contents may
+/// use, and the space actually taken shrinks back to whatever they drew. Short
+/// contents would then still let the next widget slide left, which is the whole
+/// thing this is here to stop.
+pub fn column<R>(ui: &mut Ui, width: f32, contents: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_width(width);
+            contents(ui)
+        },
+    )
+    .inner
+}
+
+/// A label filling a fixed column, for the left edge of a form.
+pub fn field_label(ui: &mut Ui, text: &str, width: f32) -> Response {
+    column(ui, width, |ui| ui.label(text))
 }
 
 impl TabViewer for AppTabViewer<'_> {
