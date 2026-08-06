@@ -6,7 +6,7 @@ members = ["crates/sim-core", "crates/sim-gui"]
 # The one place a version is written. Both crates inherit it, the release
 # workflow reads it back with `cargo metadata`, and the tag it publishes is
 # derived from it, so nothing can drift out of step with anything else.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # What gets downloaded, so size matters more than build time here.
