@@ -10,7 +10,7 @@ use egui_dock::TabViewer;
 use crate::engine_handle::EngineHandle;
 use crate::state::{AppState, MonitorId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
     Connections,
     /// Several may be open at once, each filtering the shared buffer its own way.
@@ -43,6 +43,16 @@ impl TabViewer for AppTabViewer<'_> {
         }
     }
 
+    /// The tab itself, never its title.
+    ///
+    /// `egui_dock` defaults to hashing the title, and hangs the whole tab body
+    /// off the result. A Traffic tab can be renamed from inside itself, so that
+    /// default would give every keystroke a different tab, and the field being
+    /// typed into would lose focus on each character.
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(*tab)
+    }
+
     fn ui(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
         match tab {
             Tab::Connections => connections::show(ui, self.state, self.engine),
@@ -59,5 +69,34 @@ impl TabViewer for AppTabViewer<'_> {
             self.state.close_monitor(*id);
         }
         OnCloseResponse::Close
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renaming_a_traffic_tab_leaves_its_identity_alone() {
+        let mut state = AppState::default();
+        let monitor = state.open_monitor();
+        let engine = EngineHandle::new();
+        let mut viewer = AppTabViewer {
+            state: &mut state,
+            engine: &engine,
+        };
+
+        let mut tab = Tab::LiveMonitor(monitor);
+        let before = viewer.id(&mut tab);
+        assert_eq!(viewer.title(&mut tab).text(), "Traffic");
+
+        if let Some(monitor) = viewer.state.monitors.get_mut(&monitor) {
+            monitor.title = "Heartbeats".to_owned();
+        }
+
+        assert_eq!(viewer.title(&mut tab).text(), "Heartbeats");
+        // Every widget in the tab hangs off this. If it moved with the title,
+        // typing a name would knock the focus out of the field on each letter.
+        assert_eq!(viewer.id(&mut tab), before);
     }
 }
