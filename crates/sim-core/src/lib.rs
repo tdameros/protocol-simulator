@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 
+pub mod config;
 pub mod connection;
 pub mod engine;
 pub mod error;
