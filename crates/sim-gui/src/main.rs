@@ -9,6 +9,7 @@ mod app;
 mod engine_handle;
 mod frames;
 mod panels;
+mod prefs;
 mod project;
 mod state;
 mod theme;
@@ -18,10 +19,11 @@ use std::path::PathBuf;
 use app::SimApp;
 
 fn main() -> eframe::Result {
-    // Optional positional argument: the folder holding frame .toml files, so a
-    // project can be opened straight from the shell instead of clicking through
-    // the picker every launch.
-    let frames_dir = std::env::args().nth(1).map(PathBuf::from);
+    // Optional positional argument: a project file, or a folder of frame .toml
+    // files, so a session can be opened straight from the shell instead of
+    // clicking through the picker every launch. Given neither, the last project
+    // opened on this machine comes back.
+    let opened_with = std::env::args().nth(1).map(PathBuf::from);
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -33,6 +35,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Protocol Simulator",
         native_options,
-        Box::new(move |cc| Ok(Box::new(SimApp::new(cc, frames_dir)))),
+        Box::new(move |cc| Ok(Box::new(SimApp::new(cc, opened_with)))),
     )
 }

@@ -94,6 +94,18 @@ impl Project {
         theme: Theme,
         path: Option<&Path>,
     ) -> Self {
+        let mut project = Self::capture_settings(state, theme, path);
+        project.ui.layout = Some(without_geometry(dock.clone()));
+        project
+    }
+
+    /// Everything but the dock arrangement.
+    ///
+    /// What the title bar compares against, every frame, to know whether there
+    /// is anything left to save. Cloning a layout that the comparison ignores
+    /// anyway would be work done sixty times a second for nothing.
+    #[must_use]
+    pub fn capture_settings(state: &AppState, theme: Theme, path: Option<&Path>) -> Self {
         let base = path.and_then(Path::parent);
         Self {
             version: FORMAT_VERSION,
@@ -117,7 +129,7 @@ impl Project {
             values: state.frames.saved_values().clone(),
             ui: UiSpec {
                 theme: ThemeSpec::from(theme),
-                layout: Some(without_geometry(dock.clone())),
+                layout: None,
             },
         }
     }
@@ -355,6 +367,10 @@ pub enum DirectionSpec {
 }
 
 impl DirectionSpec {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "the signature is serde's, skip_serializing_if hands a reference"
+    )]
     fn is_both(&self) -> bool {
         *self == Self::Both
     }
@@ -431,6 +447,10 @@ fn yes() -> bool {
     true
 }
 
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the signature is serde's, skip_serializing_if hands a reference"
+)]
 fn not_set(value: &bool) -> bool {
     !*value
 }
@@ -475,7 +495,8 @@ fn reconciled(
 
 /// The arrangement a project with no layout of its own opens with, which is
 /// also what a first run gets.
-fn default_layout(monitors: &mut BTreeMap<MonitorId, MonitorState>) -> DockState<Tab> {
+#[must_use]
+pub fn default_layout(monitors: &mut BTreeMap<MonitorId, MonitorState>) -> DockState<Tab> {
     if monitors.is_empty() {
         monitors.insert(MonitorId(1), MonitorState::named("Traffic".to_owned()));
     }
