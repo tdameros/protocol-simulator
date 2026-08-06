@@ -1,9 +1,10 @@
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
-use egui::{Color32, DragValue, RichText, ScrollArea, TextStyle, Ui};
+use egui::{Color32, DragValue, Label, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
+use crate::panels::{column, field_label, widest};
 use crate::state::{
     AppState, Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState,
     TrafficFilter,
@@ -14,6 +15,17 @@ const SENT: Color32 = Color32::from_rgb(70, 130, 200);
 const RECEIVED: Color32 = Color32::from_rgb(40, 160, 90);
 /// Window the frame and byte rates are measured over.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Every label the filter can show, measured as a set so the controls keep the
+/// same left edge from one row to the next.
+const FILTER_LABELS: &[&str] = &[
+    "Tab name:",
+    "Connections:",
+    "Direction:",
+    "Hex:",
+    "Source:",
+    "Length:",
+];
 
 pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
     let next_seq = state.next_seq();
@@ -71,6 +83,10 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
         return;
     }
 
+    // Measured from the whole filtered list, which is already in hand, rather
+    // than from the slice on screen.
+    let columns = RowColumns::measure(ui, rows.iter().any(|entry| entry.source.is_some()));
+
     // show_rows draws only the visible slice. Painting every entry would make
     // the panel crawl once a periodic frame has filled the buffer.
     let row_height = ui.text_style_height(&TextStyle::Monospace);
@@ -85,9 +101,48 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
                         .duration_since(rows[previous].timestamp)
                         .ok()
                 });
-                frame_row(ui, entry, delta, hex_input, pending_frame_hex);
+                frame_row(ui, entry, delta, columns, hex_input, pending_frame_hex);
             }
         });
+}
+
+/// What each column of a traffic row is allowed to take.
+///
+/// Sized from strings chosen here, never from the rows being drawn: `show_rows`
+/// only paints the visible slice, so widths taken from the content would shift
+/// under you as you scroll. Which is also why the hex column, the one you read
+/// vertically, is the one everything else is pinned for.
+#[derive(Clone, Copy)]
+struct RowColumns {
+    timestamp: f32,
+    delta: f32,
+    arrow: f32,
+    name: f32,
+    source: f32,
+}
+
+impl RowColumns {
+    fn measure(ui: &Ui, any_source: bool) -> Self {
+        Self {
+            timestamp: widest(ui, &TextStyle::Body, &["00:00:00.000"]),
+            delta: widest(ui, &TextStyle::Monospace, &["+000.00s"]),
+            arrow: widest(
+                ui,
+                &TextStyle::Body,
+                &[icons::ARROW_RIGHT, icons::ARROW_LEFT],
+            ),
+            // A dozen characters of name. Longer ones are cut short rather than
+            // allowed to push the frame out of line, and shown in full on hover.
+            name: widest(ui, &TextStyle::Body, &["connection-1"]),
+            // Costs nothing on a link that never reports a peer, which is every
+            // serial port and every TCP client.
+            source: if any_source {
+                widest(ui, &TextStyle::Body, &["255.255.255.255:65535"])
+            } else {
+                0.0
+            },
+        }
+    }
 }
 
 fn toolbar(ui: &mut Ui, monitor: &mut MonitorState, next_seq: u64, requested: &mut bool) {
@@ -138,9 +193,15 @@ fn toolbar(ui: &mut Ui, monitor: &mut MonitorState, next_seq: u64, requested: &m
 }
 
 fn filter_bar(ui: &mut Ui, monitor: &mut MonitorState, names: &[String]) {
+    // A fixed label column rather than a grid: these rows hold a wrapped run of
+    // checkboxes, a segmented control and two fields side by side, shapes a
+    // grid would have to invent shared columns for. Only the left edge needs
+    // pinning.
+    let labels = widest(ui, &TextStyle::Body, FILTER_LABELS);
+
     ui.group(|ui| {
         ui.horizontal(|ui| {
-            ui.label("Tab name:");
+            field_label(ui, "Tab name:", labels);
             ui.text_edit_singleline(&mut monitor.title);
             if ui.button("Reset filter").clicked() {
                 monitor.filter = TrafficFilter::default();
@@ -150,7 +211,7 @@ fn filter_bar(ui: &mut Ui, monitor: &mut MonitorState, names: &[String]) {
         let filter = &mut monitor.filter;
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("Connections:");
+            field_label(ui, "Connections:", labels);
             if names.is_empty() {
                 ui.label(RichText::new("none configured").weak());
             }
@@ -169,14 +230,14 @@ fn filter_bar(ui: &mut Ui, monitor: &mut MonitorState, names: &[String]) {
         });
 
         ui.horizontal(|ui| {
-            ui.label("Direction:");
+            field_label(ui, "Direction:", labels);
             for choice in DirectionFilter::ALL {
                 ui.selectable_value(&mut filter.direction, choice, choice.label());
             }
         });
 
         ui.horizontal(|ui| {
-            ui.label("Hex:");
+            field_label(ui, "Hex:", labels);
             ui.add(
                 egui::TextEdit::singleline(&mut filter.hex)
                     .font(TextStyle::Monospace)
@@ -200,14 +261,14 @@ fn filter_bar(ui: &mut Ui, monitor: &mut MonitorState, names: &[String]) {
         });
 
         ui.horizontal(|ui| {
-            ui.label("Source:");
+            field_label(ui, "Source:", labels);
             ui.add(egui::TextEdit::singleline(&mut filter.source).hint_text("192.168.1."));
             ui.label("Text:");
             ui.add(egui::TextEdit::singleline(&mut filter.text).hint_text("AT+"));
         });
 
         ui.horizontal(|ui| {
-            ui.label("Length:");
+            field_label(ui, "Length:", labels);
             length_bound(ui, &mut filter.min_len, "min");
             ui.label("to");
             length_bound(ui, &mut filter.max_len, "max");
@@ -236,6 +297,7 @@ fn frame_row(
     ui: &mut Ui,
     entry: &LogEntry,
     delta: Option<Duration>,
+    columns: RowColumns,
     hex_input: &mut String,
     pending_frame_hex: &mut Option<Vec<u8>>,
 ) {
@@ -259,8 +321,12 @@ fn frame_row(
             }
         });
 
-        ui.label(RichText::new(format_timestamp(entry.timestamp)).weak());
-        ui.label(RichText::new(format_delta(delta)).weak().monospace());
+        column(ui, columns.timestamp, |ui| {
+            ui.label(RichText::new(format_timestamp(entry.timestamp)).weak());
+        });
+        column(ui, columns.delta, |ui| {
+            ui.label(RichText::new(format_delta(delta)).weak().monospace());
+        });
 
         // Phosphor glyphs rather than "→"/"←": the arrows are missing from
         // egui's default font and render as tofu.
@@ -268,11 +334,18 @@ fn frame_row(
             Direction::Sent => (icons::ARROW_RIGHT, SENT),
             Direction::Received => (icons::ARROW_LEFT, RECEIVED),
         };
-        ui.label(RichText::new(arrow).color(color).strong());
-        ui.label(RichText::new(&entry.id.0).strong());
-        if let Some(source) = entry.source {
-            ui.label(RichText::new(source.to_string()).weak());
-        }
+        column(ui, columns.arrow, |ui| {
+            ui.label(RichText::new(arrow).color(color).strong());
+        });
+        column(ui, columns.name, |ui| {
+            ui.add(Label::new(RichText::new(&entry.id.0).strong()).truncate())
+                .on_hover_text(&entry.id.0);
+        });
+        column(ui, columns.source, |ui| {
+            if let Some(source) = entry.source {
+                ui.add(Label::new(RichText::new(source.to_string()).weak()).truncate());
+            }
+        });
         ui.label(RichText::new(format_hex(&entry.bytes)).text_style(TextStyle::Monospace));
         ui.label(
             RichText::new(format_ascii(&entry.bytes))

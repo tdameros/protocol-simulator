@@ -115,6 +115,13 @@ impl AppState {
         self.monitors.remove(&id);
     }
 
+    /// Installs the tabs a project came with, and resumes numbering after them
+    /// so a tab opened later cannot collide with one that was restored.
+    pub fn restore_monitors(&mut self, monitors: BTreeMap<MonitorId, MonitorState>) {
+        self.next_monitor = monitors.keys().map(|id| id.0).max().unwrap_or(0);
+        self.monitors = monitors;
+    }
+
     pub fn status_of(&self, id: &ConnectionId) -> Option<ConnectionStatus> {
         self.connections
             .iter()
@@ -129,6 +136,8 @@ pub struct ConnectionEntry {
     /// Kept so a manual reconnect reuses the policy the connection was made
     /// with, rather than silently dropping it.
     pub retry: Option<RetryPolicy>,
+    /// Whether opening the project this belongs to should open the connection.
+    pub autoconnect: bool,
 }
 
 pub struct LogEntry {
@@ -146,7 +155,9 @@ pub struct LogEntry {
 }
 
 /// One Traffic tab. Several may watch the same buffer through different filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct MonitorId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -356,6 +367,13 @@ pub struct MonitorState {
 }
 
 impl MonitorState {
+    /// A view of everything the buffer holds, for a tab that is not being
+    /// opened in the middle of a running session.
+    #[must_use]
+    pub fn named(title: String) -> Self {
+        Self::new(title, 0)
+    }
+
     fn new(title: String, since: u64) -> Self {
         Self {
             title,
@@ -415,6 +433,7 @@ pub struct NewConnectionForm {
     pub serial_stop_bits: StopBits,
     pub serial_flow_control: FlowControl,
     pub auto_reconnect: bool,
+    pub autoconnect: bool,
     pub error: Option<String>,
 }
 
@@ -434,6 +453,9 @@ impl Default for NewConnectionForm {
             serial_stop_bits: StopBits::One,
             serial_flow_control: FlowControl::None,
             auto_reconnect: false,
+            // On by default: a connection you just set up is one you want back
+            // the next time you open the project.
+            autoconnect: true,
             error: None,
         }
     }
@@ -721,6 +743,7 @@ mod tests {
                     },
                     status: ConnectionStatus::Connected,
                     retry: Some(RetryPolicy::standard()),
+                    autoconnect: true,
                 },
             )],
             ..AppState::default()

@@ -1,40 +1,204 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
 use sim_core::Event;
 
-use egui::{Color32, CornerRadius, Theme};
-use egui_dock::{DockArea, DockState, NodeIndex, Style};
+use egui::{Color32, Context, CornerRadius, Modal, Theme, ViewportCommand};
+use egui_dock::{DockArea, DockState, Style};
 use egui_phosphor::regular as icons;
 
 use crate::engine_handle::EngineHandle;
 use crate::panels::{AppTabViewer, Tab};
+use crate::prefs::Preferences;
+use crate::project::{self, Project, DEFAULT_FILE_NAME};
 use crate::state::{AppState, Direction, LogEntry};
 use crate::theme;
+
+const APP_NAME: &str = "Protocol Simulator";
+
+/// Something that would replace the session, held back until the question of
+/// unsaved changes has been answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pending {
+    New,
+    Open(PathBuf),
+    Browse,
+    Quit,
+}
 
 pub struct SimApp {
     state: AppState,
     engine: EngineHandle,
     dock_state: DockState<Tab>,
+    /// Where the current project lives, once it has anywhere to live.
+    path: Option<PathBuf>,
+    /// The project as the file has it. What the window holds is compared
+    /// against this to know whether anything is left to save.
+    saved: Project,
+    prefs: Preferences,
+    pending: Option<Pending>,
+    /// Set once a close has been allowed through, so the guard does not catch
+    /// the very close it just agreed to.
+    leaving: bool,
+    /// Last title handed to the window manager, to avoid saying it again on
+    /// every frame.
+    title: String,
 }
 
 impl SimApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, frames_dir: Option<std::path::PathBuf>) -> Self {
-        theme::apply(&cc.egui_ctx);
+    pub fn new(cc: &eframe::CreationContext<'_>, opened_with: Option<PathBuf>) -> Self {
+        // Whatever the window last showed, which egui remembers on its own. A
+        // project overrides it on load, having its own opinion; a session
+        // without one has nowhere else to keep the choice.
+        let theme = cc.egui_ctx.theme();
+        theme::apply(&cc.egui_ctx, theme);
 
         let mut state = AppState::default();
-        if let Some(directory) = frames_dir {
-            state.frames.load_from(directory);
-        }
+        let mut monitors = BTreeMap::new();
+        let dock_state = project::default_layout(&mut monitors);
+        state.restore_monitors(monitors);
 
-        let first = state.open_monitor();
-        let mut dock_state = DockState::new(vec![Tab::LiveMonitor(first)]);
-        let surface = dock_state.main_surface_mut();
-        let [live, _connections] =
-            surface.split_left(NodeIndex::root(), 0.22, vec![Tab::Connections]);
-        surface.split_below(live, 0.6, vec![Tab::FrameEditor, Tab::HexInject]);
-
-        Self {
+        let mut app = Self {
             state,
             engine: EngineHandle::new(),
             dock_state,
+            path: None,
+            saved: Project::default(),
+            prefs: Preferences::load(cc.storage),
+            pending: None,
+            leaving: false,
+            title: String::new(),
+        };
+        app.saved = app.snapshot(theme);
+
+        // A project file named on the command line, a frames folder as before,
+        // or failing both, whatever was open last time.
+        match opened_with {
+            Some(path) if path.is_dir() => app.state.frames.load_from(path),
+            Some(path) => app.open(&cc.egui_ctx, &path),
+            None => {
+                if let Some(path) = app.prefs.last().map(Path::to_path_buf) {
+                    app.open(&cc.egui_ctx, &path);
+                }
+            }
+        }
+        app
+    }
+
+    fn snapshot(&self, theme: Theme) -> Project {
+        Project::capture_settings(&self.state, theme, self.path.as_deref())
+    }
+
+    fn is_dirty(&self, theme: Theme) -> bool {
+        self.snapshot(theme) != self.saved
+    }
+
+    fn open(&mut self, ctx: &Context, path: &Path) {
+        let loaded = Project::read(path).and_then(|project| {
+            let restored = project.apply(&mut self.state, Some(path))?;
+            Ok(restored)
+        });
+
+        match loaded {
+            Ok(restored) => {
+                for (id, config, retry) in restored.connect {
+                    self.engine.connect(id, config, retry);
+                }
+                self.dock_state = restored.layout;
+                ctx.set_theme(restored.theme);
+                self.path = Some(path.to_path_buf());
+                self.saved = self.snapshot(restored.theme);
+                self.prefs.remember(path);
+                self.state.last_error = None;
+            }
+            Err(error) => {
+                // A project that will not open is one that should stop being
+                // offered, whether it moved, was deleted, or was hand-edited
+                // into something unreadable.
+                self.prefs.forget(path);
+                self.state.last_error = Some(format!("{error:#}"));
+            }
+        }
+    }
+
+    fn start_new(&mut self, ctx: &Context) {
+        for (id, _) in std::mem::take(&mut self.state.connections) {
+            self.engine.disconnect(id);
+        }
+        self.state = AppState::default();
+        let mut monitors = BTreeMap::new();
+        self.dock_state = project::default_layout(&mut monitors);
+        self.state.restore_monitors(monitors);
+        self.path = None;
+        self.saved = self.snapshot(ctx.theme());
+    }
+
+    /// Writes to the file the project came from, or asks for one.
+    ///
+    /// Returns whether anything reached the disk, which is what tells a pending
+    /// close whether it may go ahead.
+    fn save(&mut self, ctx: &Context) -> bool {
+        match self.path.clone() {
+            Some(path) => self.save_to(ctx, &path),
+            None => self.save_as(ctx),
+        }
+    }
+
+    fn save_as(&mut self, ctx: &Context) -> bool {
+        let chosen = rfd::FileDialog::new()
+            .set_file_name(DEFAULT_FILE_NAME)
+            .add_filter("Project", &["toml"])
+            .save_file();
+        chosen.is_some_and(|path| self.save_to(ctx, &path))
+    }
+
+    fn save_to(&mut self, ctx: &Context, path: &Path) -> bool {
+        // Set first: what the file holds depends on where it sits, paths inside
+        // it being relative to it.
+        self.path = Some(path.to_path_buf());
+        let project = Project::capture(&self.state, &self.dock_state, ctx.theme(), Some(path));
+
+        match project.write(path) {
+            Ok(()) => {
+                self.saved = self.snapshot(ctx.theme());
+                self.prefs.remember(path);
+                self.state.last_error = None;
+                true
+            }
+            Err(error) => {
+                self.state.last_error = Some(format!("{error:#}"));
+                false
+            }
+        }
+    }
+
+    /// Runs a pending action, now that unsaved work is no longer in the way.
+    fn go_ahead(&mut self, ctx: &Context, action: Pending) {
+        match action {
+            Pending::New => self.start_new(ctx),
+            Pending::Open(path) => self.open(ctx, &path),
+            Pending::Browse => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Project", &["toml"])
+                    .pick_file()
+                {
+                    self.open(ctx, &path);
+                }
+            }
+            Pending::Quit => {
+                self.leaving = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Asks for an action, or performs it straight away when there is nothing
+    /// to lose by doing so.
+    fn request(&mut self, ctx: &Context, action: Pending) {
+        if self.is_dirty(ctx.theme()) {
+            self.pending = Some(action);
+        } else {
+            self.go_ahead(ctx, action);
         }
     }
 
@@ -82,35 +246,175 @@ impl SimApp {
         }
     }
 
-    fn toolbar(ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Protocol Simulator");
+    fn toolbar(&mut self, ui: &mut egui::Ui, dirty: bool) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| self.file_menu(ui));
+
+            ui.separator();
+            ui.label(
+                egui::RichText::new(match &self.path {
+                    Some(path) => file_label(path),
+                    None => "Untitled project".to_owned(),
+                })
+                .strong(),
+            );
+            if dirty {
+                ui.label(egui::RichText::new("edited").weak());
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let is_dark = ui.ctx().theme() == Theme::Dark;
-                let icon = if is_dark { icons::SUN } else { icons::MOON };
+                let theme = ui.ctx().theme();
+                let icon = if theme == Theme::Dark {
+                    icons::SUN
+                } else {
+                    icons::MOON
+                };
                 if ui
                     .button(icon)
                     .on_hover_text("Toggle light / dark theme")
                     .clicked()
                 {
-                    ui.ctx().set_visuals(if is_dark {
-                        egui::Visuals::light()
-                    } else {
-                        egui::Visuals::dark()
+                    ui.ctx().set_theme(match theme {
+                        Theme::Dark => Theme::Light,
+                        Theme::Light => Theme::Dark,
                     });
                 }
             });
         });
     }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
+        if ui
+            .button(format!("{} New project", icons::FILE_PLUS))
+            .clicked()
+        {
+            self.request(&ctx, Pending::New);
+            ui.close();
+        }
+        if ui
+            .button(format!("{} Open project...", icons::FOLDER_OPEN))
+            .clicked()
+        {
+            self.request(&ctx, Pending::Browse);
+            ui.close();
+        }
+
+        ui.separator();
+
+        if ui
+            .button(format!("{} Save", icons::FLOPPY_DISK))
+            .on_hover_text("Ctrl+S")
+            .clicked()
+        {
+            self.save(&ctx);
+            ui.close();
+        }
+        if ui
+            .button(format!("{} Save as...", icons::FLOPPY_DISK_BACK))
+            .clicked()
+        {
+            self.save_as(&ctx);
+            ui.close();
+        }
+
+        ui.separator();
+
+        ui.menu_button(format!("{} Recent", icons::LIST), |ui| {
+            if self.prefs.recent.is_empty() {
+                ui.weak("Nothing opened yet.");
+                return;
+            }
+            for path in self.prefs.recent.clone() {
+                if ui
+                    .button(file_label(&path))
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    self.request(&ctx, Pending::Open(path));
+                    ui.close();
+                }
+            }
+        });
+    }
+
+    /// The question asked before a session is thrown away.
+    fn unsaved_changes_modal(&mut self, ctx: &Context) {
+        let Some(action) = self.pending.clone() else {
+            return;
+        };
+
+        let response = Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Unsaved changes");
+            ui.label(match &self.path {
+                Some(path) => format!("{} has changes that are not on disk.", file_label(path)),
+                None => "This project has never been saved.".to_owned(),
+            });
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    // Only proceed once it is really written: a cancelled save
+                    // dialog must not take the session with it.
+                    if self.save(ctx) {
+                        self.pending = None;
+                        self.go_ahead(ctx, action.clone());
+                    }
+                }
+                if ui.button("Discard").clicked() {
+                    self.pending = None;
+                    self.go_ahead(ctx, action.clone());
+                }
+                if ui.button("Cancel").clicked() {
+                    self.pending = None;
+                }
+            });
+        });
+
+        // Clicking outside is a cancel, the safe reading of an ambiguous click.
+        if response.should_close() {
+            self.pending = None;
+        }
+    }
+
+    fn update_title(&mut self, ctx: &Context, dirty: bool) {
+        let name = self
+            .path
+            .as_deref()
+            .map_or_else(|| "Untitled".to_owned(), file_label);
+        let mark = if dirty { " *" } else { "" };
+        let title = format!("{name}{mark} - {APP_NAME}");
+        if title != self.title {
+            ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
+    }
 }
 
 impl eframe::App for SimApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        theme::sync_row_height(ui);
         self.apply_events();
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(100));
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
-        egui::Panel::top("toolbar").show(ui, Self::toolbar);
+        let dirty = self.is_dirty(ctx.theme());
+        self.update_title(&ctx, dirty);
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+            self.save(&ctx);
+        }
+
+        // A close is held back rather than refused: the modal turns it into a
+        // question, and answering it sends the close again.
+        if ctx.input(|input| input.viewport().close_requested()) && dirty && !self.leaving {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.pending = Some(Pending::Quit);
+        }
+
+        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, dirty));
 
         if let Some(error) = self.state.last_error.clone() {
             egui::Panel::bottom("status_bar").show(ui, |ui| {
@@ -133,6 +437,8 @@ impl eframe::App for SimApp {
                 .show_inside(ui, &mut viewer);
         });
 
+        self.unsaved_changes_modal(&ctx);
+
         // The dock cannot be rearranged while it is drawing itself, so a panel
         // asking for a new tab leaves the request here.
         if std::mem::take(&mut self.state.monitor_requested) {
@@ -141,11 +447,24 @@ impl eframe::App for SimApp {
         }
     }
 
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Only what belongs to this machine. The project itself is written when
+        // asked for, never behind your back.
+        self.prefs.store(storage);
+    }
+
     /// Anything the panels do not paint shows this colour. eframe defaults it to
     /// near-black, which would show through as dark notches wherever panels meet.
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// `egui_dock` derives panel corner radius from the interactive widget styles, so the

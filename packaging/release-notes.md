@@ -4,7 +4,7 @@ Protocol Simulator __VERSION__: one executable per platform, nothing to install.
 
 ```sh
 tar xzf protocol-simulator-linux-x86_64.tar.gz
-./protocol-simulator            # optionally: ./protocol-simulator path/to/frames
+./protocol-simulator            # optionally: ./protocol-simulator my-project.toml
 ```
 
 Built against glibc 2.35, so it runs on Ubuntu 22.04+, Debian 12+, Fedora 36+
@@ -33,8 +33,20 @@ xattr -dr com.apple.quarantine /Applications/ProtocolSimulator.app
 
 Only needed once.
 
+## Projects
+
+**File → Save** writes everything you have set up (connections, frames folder,
+Traffic tabs and their filters, the values you typed) into a single `.toml` file
+that is meant to be read, kept in Git, and handed to a colleague. Opening it
+brings the session back, and the connections marked to open with the project
+reopen themselves. Serial port names are the one thing that will not travel:
+what is `/dev/ttyUSB0` on one machine is `COM3` on another.
+
+Launching with no argument reopens the last project used on this machine.
+
 ## Frame definitions
 
 The `examples/frames` folder in the source tree holds documented examples, from
 a three-byte frame up to reusable types and constrained scalars. Point the
-**Frames folder** button at a copy of it, or pass the path on the command line.
+**Frames folder** button at a copy of it, or pass the folder on the command
+line. A project remembers the folder, relative to itself.

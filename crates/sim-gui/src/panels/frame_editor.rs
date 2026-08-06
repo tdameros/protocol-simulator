@@ -382,7 +382,7 @@ fn value_widget(
             }
         }
         FieldKind::Enum { variants, .. } => enum_widget(ui, &field.name, variants, entry),
-        FieldKind::Bits { bits, .. } => bits_widget(ui, bits, entry),
+        FieldKind::Bits { bits, .. } => bits_widget(ui, &field.name, bits, entry),
         FieldKind::Checksum { .. } => {}
     }
 }
@@ -413,14 +413,18 @@ fn enum_widget(ui: &mut Ui, id: &str, variants: &[EnumVariant], entry: &mut Valu
         });
 }
 
-fn bits_widget(ui: &mut Ui, bits: &[BitDef], entry: &mut Value) {
+fn bits_widget(ui: &mut Ui, id: &str, bits: &[BitDef], entry: &mut Value) {
     let mut current = entry.as_bits().cloned().unwrap_or_default();
     let mut changed = false;
 
-    ui.vertical(|ui| {
-        for bit in bits {
-            let slot = current.entry(bit.name.clone()).or_insert(0);
-            ui.horizontal(|ui| {
+    // A grid, so a bitfield mixing single bits and wider ones keeps its names
+    // in one column and its controls in another instead of staggering them.
+    egui::Grid::new(("bits", id))
+        .num_columns(2)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            for bit in bits {
+                let slot = current.entry(bit.name.clone()).or_insert(0);
                 if bit.width == 1 {
                     let mut on = *slot != 0;
                     if ui.checkbox(&mut on, &bit.name).changed() {
@@ -432,9 +436,9 @@ fn bits_widget(ui: &mut Ui, bits: &[BitDef], entry: &mut Value) {
                     let max = (1u64 << bit.width) - 1;
                     changed |= ui.add(DragValue::new(slot).range(0..=max)).changed();
                 }
-            });
-        }
-    });
+                ui.end_row();
+            }
+        });
 
     if changed {
         *entry = Value::Bits(current);
