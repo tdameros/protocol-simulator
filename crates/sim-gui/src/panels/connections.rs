@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use sim_core::{ConnectionStatus, RetryPolicy};
 
-use egui::{Color32, ComboBox, RichText, Ui};
+use egui::{Color32, ComboBox, Grid, RichText, Ui};
 use egui_phosphor::regular as icons;
 
 use crate::engine_handle::EngineHandle;
@@ -47,45 +47,64 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
     let mut to_disconnect = Vec::new();
     let mut to_reconnect = Vec::new();
     let mut to_remove = Vec::new();
-    for (id, entry) in &mut state.connections {
-        ui.horizontal(|ui| {
-            ui.label(status_dot(entry.status))
-                .on_hover_text(status_label(entry.status));
-            ui.label(RichText::new(&id.0).strong());
-            ui.label(kind_summary(entry));
-            if entry.retry.is_some() {
-                ui.label(RichText::new(icons::ARROWS_CLOCKWISE).weak())
-                    .on_hover_text("Reopens itself when the link drops");
-            }
-            ui.checkbox(&mut entry.autoconnect, icons::POWER)
-                .on_hover_text("Open this connection when the project is loaded");
-            match entry.status {
-                ConnectionStatus::Disconnected => {
-                    if ui
-                        .button(icons::PLUG)
-                        .on_hover_text("Reconnect with the same settings")
-                        .clicked()
-                    {
-                        to_reconnect.push(id.clone());
-                    }
-                    if ui.button(icons::TRASH).on_hover_text("Remove").clicked() {
-                        to_remove.push(id.clone());
-                    }
+
+    // A grid rather than a row of horizontals: names and summaries are all
+    // different lengths, and laid out one row at a time the controls end up at
+    // a different place on every line. Cells are aligned left and centred
+    // vertically, which is the other half of what is wanted here.
+    Grid::new("connection_list")
+        .num_columns(6)
+        // Otherwise every column is at least as wide as a button, which the
+        // status dot is not.
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            for (id, entry) in &mut state.connections {
+                ui.label(status_dot(entry.status))
+                    .on_hover_text(status_label(entry.status));
+                ui.label(RichText::new(&id.0).strong());
+                ui.label(kind_summary(entry));
+
+                // Always a cell, even when there is nothing to show: a skipped
+                // one would pull the whole row left.
+                if entry.retry.is_some() {
+                    ui.label(RichText::new(icons::ARROWS_CLOCKWISE).weak())
+                        .on_hover_text("Reopens itself when the link drops");
+                } else {
+                    ui.label("");
                 }
-                ConnectionStatus::Connecting
-                | ConnectionStatus::Listening
-                | ConnectionStatus::Connected => {
-                    if ui
-                        .button(icons::PLUGS)
-                        .on_hover_text("Disconnect")
-                        .clicked()
-                    {
-                        to_disconnect.push(id.clone());
+
+                ui.checkbox(&mut entry.autoconnect, icons::POWER)
+                    .on_hover_text("Open this connection when the project is loaded");
+
+                ui.horizontal(|ui| match entry.status {
+                    ConnectionStatus::Disconnected => {
+                        if ui
+                            .button(icons::PLUG)
+                            .on_hover_text("Reconnect with the same settings")
+                            .clicked()
+                        {
+                            to_reconnect.push(id.clone());
+                        }
+                        if ui.button(icons::TRASH).on_hover_text("Remove").clicked() {
+                            to_remove.push(id.clone());
+                        }
                     }
-                }
+                    ConnectionStatus::Connecting
+                    | ConnectionStatus::Listening
+                    | ConnectionStatus::Connected => {
+                        if ui
+                            .button(icons::PLUGS)
+                            .on_hover_text("Disconnect")
+                            .clicked()
+                        {
+                            to_disconnect.push(id.clone());
+                        }
+                    }
+                });
+
+                ui.end_row();
             }
         });
-    }
 
     for id in to_disconnect {
         engine.disconnect(id);
