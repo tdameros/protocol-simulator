@@ -1,7 +1,10 @@
-use egui::{Color32, Context, CornerRadius, FontDefinitions, Stroke, Theme, Visuals};
+use egui::{
+    Color32, Context, CornerRadius, FontDefinitions, Stroke, TextStyle, Theme, Ui, Visuals,
+};
 use egui_phosphor::Variant;
 
 const CORNER_RADIUS: CornerRadius = CornerRadius::same(6);
+const BUTTON_PADDING: egui::Vec2 = egui::vec2(10.0, 5.0);
 const ACCENT: Color32 = Color32::from_rgb(45, 110, 200);
 const LIGHT_INPUT_BORDER: Color32 = Color32::from_gray(200);
 const DARK_INPUT_BORDER: Color32 = Color32::from_gray(90);
@@ -22,9 +25,28 @@ pub fn apply(ctx: &Context, theme: Theme) {
 
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.button_padding = BUTTON_PADDING;
         style.spacing.window_margin = egui::Margin::same(10);
     });
+}
+
+/// Keeps the height a row assumes in step with the height its contents really
+/// have.
+///
+/// `Ui::horizontal` decides how tall a row is going to be before anything has
+/// been put in it, and guesses `interact_size.y`. Everything shorter than that
+/// guess is then centred against the guess rather than against the row, so a
+/// label next to a button sits a couple of pixels high. egui's default guess is
+/// 18, while a button of ours is the text plus `BUTTON_PADDING` twice, which is
+/// where the two fell out of step.
+///
+/// Measured rather than written down, so it still holds after a zoom.
+pub fn sync_row_height(ui: &Ui) {
+    let wanted = ui.text_style_height(&TextStyle::Body) + 2.0 * BUTTON_PADDING.y;
+    if (ui.spacing().interact_size.y - wanted).abs() > f32::EPSILON {
+        ui.ctx()
+            .all_styles_mut(|style| style.spacing.interact_size.y = wanted);
+    }
 }
 
 fn palette(theme: Theme) -> Visuals {

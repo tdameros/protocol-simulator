@@ -396,6 +396,7 @@ impl SimApp {
 impl eframe::App for SimApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        theme::sync_row_height(ui);
         self.apply_events();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
