@@ -28,6 +28,7 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
                     config,
                     status: ConnectionStatus::Connecting,
                     retry,
+                    autoconnect: state.new_connection.autoconnect,
                 },
             ));
             state.new_connection.name.clear();
@@ -46,7 +47,7 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
     let mut to_disconnect = Vec::new();
     let mut to_reconnect = Vec::new();
     let mut to_remove = Vec::new();
-    for (id, entry) in &state.connections {
+    for (id, entry) in &mut state.connections {
         ui.horizontal(|ui| {
             ui.label(status_dot(entry.status))
                 .on_hover_text(status_label(entry.status));
@@ -56,6 +57,8 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
                 ui.label(RichText::new(icons::ARROWS_CLOCKWISE).weak())
                     .on_hover_text("Reopens itself when the link drops");
             }
+            ui.checkbox(&mut entry.autoconnect, icons::POWER)
+                .on_hover_text("Open this connection when the project is loaded");
             match entry.status {
                 ConnectionStatus::Disconnected => {
                     if ui
@@ -131,6 +134,8 @@ fn new_connection_form(ui: &mut Ui, form: &mut NewConnectionForm) {
 
     ui.checkbox(&mut form.auto_reconnect, "Auto-reconnect")
         .on_hover_text("Keep retrying when the link drops, backing off from 0.5 s up to 10 s");
+    ui.checkbox(&mut form.autoconnect, "Open with the project")
+        .on_hover_text("Open this connection as soon as the project is loaded");
 }
 
 fn udp_fields(ui: &mut Ui, form: &mut NewConnectionForm) {

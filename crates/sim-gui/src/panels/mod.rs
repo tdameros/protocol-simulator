@@ -10,7 +10,7 @@ use egui_dock::TabViewer;
 use crate::engine_handle::EngineHandle;
 use crate::state::{AppState, MonitorId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
     Connections,
     /// Several may be open at once, each filtering the shared buffer its own way.

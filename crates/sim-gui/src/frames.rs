@@ -53,6 +53,54 @@ impl FrameLibrary {
         self.frames.sort_by(|a, b| a.name.cmp(&b.name));
         self.selected = (!self.frames.is_empty()).then_some(0);
         self.directory = Some(directory);
+        // Also on a plain reload: a definition edited on disk can have changed
+        // the shape of a field someone already typed a value into.
+        self.conform_values();
+    }
+
+    /// Drops everything, for a window about to be given a different project.
+    pub fn forget(&mut self) {
+        *self = Self::default();
+    }
+
+    #[must_use]
+    pub fn saved_values(&self) -> &BTreeMap<String, FieldValues> {
+        &self.values
+    }
+
+    /// Takes in values written down elsewhere, against the definitions loaded
+    /// now.
+    ///
+    /// Values whose frame is not loaded are kept untouched rather than dropped:
+    /// a frames folder that is missing today may well be back tomorrow, and
+    /// saving in the meantime must not quietly empty the file.
+    pub fn restore_values(&mut self, values: BTreeMap<String, FieldValues>) {
+        self.values = values;
+        self.conform_values();
+    }
+
+    /// Rebuilds each loaded frame's values from its defaults, overlaid with
+    /// whatever was supplied that still fits.
+    fn conform_values(&mut self) {
+        let frames = &self.frames;
+        let stored = &mut self.values;
+        for frame in frames {
+            let Some(supplied) = stored.remove(&frame.name) else {
+                continue;
+            };
+            let mut values = seed_values(frame);
+            for field in &frame.fields {
+                let Some(value) = supplied.get(&field.name) else {
+                    continue;
+                };
+                // A value that cannot mean anything for this field leaves the
+                // default in place rather than an unencodable frame.
+                if let Some(value) = value.clone().coerced_to(&field.kind) {
+                    values.insert(field.name.clone(), value);
+                }
+            }
+            stored.insert(frame.name.clone(), values);
+        }
     }
 
     /// Reads `types/`, one file at a time so a broken one costs only itself.
