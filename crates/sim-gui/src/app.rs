@@ -249,6 +249,7 @@ impl SimApp {
     fn toolbar(&mut self, ui: &mut egui::Ui, dirty: bool) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| self.file_menu(ui));
+            ui.menu_button("View", |ui| self.view_menu(ui));
 
             ui.separator();
             ui.label(
@@ -337,6 +338,81 @@ impl SimApp {
                 }
             }
         });
+    }
+
+    /// Where a closed panel is found again.
+    ///
+    /// Closing the Connections tab used to be one way, and with the layout
+    /// saved alongside the project it stayed that way across restarts: no
+    /// Connections panel means no way to create a connection, so the project
+    /// became unusable rather than merely untidy.
+    ///
+    /// Entries never close anything. A menu that shuts a panel you meant to
+    /// jump to would be a worse surprise than the one it fixes; the tab keeps
+    /// its own close button for that.
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        for (tab, label) in [
+            (Tab::Connections, "Connections"),
+            (Tab::FrameEditor, "Frames"),
+            (Tab::HexInject, "Hex Inject"),
+        ] {
+            self.reveal_entry(ui, tab, label);
+        }
+
+        let traffic: Vec<(Tab, String)> = self
+            .state
+            .monitors
+            .iter()
+            .map(|(id, monitor)| (Tab::LiveMonitor(*id), monitor.title.clone()))
+            .collect();
+        for (tab, label) in traffic {
+            self.reveal_entry(ui, tab, &label);
+        }
+
+        ui.separator();
+
+        if ui
+            .button(format!("{} New Traffic tab", icons::PLUS))
+            .clicked()
+        {
+            self.state.monitor_requested = true;
+            ui.close();
+        }
+        if ui
+            .button(format!("{} Reset layout", icons::ARROW_COUNTER_CLOCKWISE))
+            .on_hover_text("Put the panels back where they started, keeping every Traffic tab")
+            .clicked()
+        {
+            self.reset_layout();
+            ui.close();
+        }
+    }
+
+    /// One panel in the View menu, ticked when it is already somewhere on
+    /// screen. Clicking brings it into view either way.
+    fn reveal_entry(&mut self, ui: &mut egui::Ui, tab: Tab, label: &str) {
+        let found = self.dock_state.find_tab(&tab);
+        let mark = if found.is_some() { icons::CHECK } else { " " };
+
+        if ui.button(format!("{mark}  {label}")).clicked() {
+            match found {
+                Some(path) => {
+                    let _ = self.dock_state.set_active_tab(path);
+                    self.dock_state
+                        .set_focused_node_and_surface(path.node_path());
+                }
+                None => self.dock_state.push_to_focused_leaf(tab),
+            }
+            ui.close();
+        }
+    }
+
+    /// Rebuilds the starting arrangement around the tabs that exist now, so a
+    /// reset costs you the layout and nothing else.
+    fn reset_layout(&mut self) {
+        let mut monitors = std::mem::take(&mut self.state.monitors);
+        self.dock_state = project::default_layout(&mut monitors);
+        self.state.restore_monitors(monitors);
     }
 
     /// The question asked before a session is thrown away.
