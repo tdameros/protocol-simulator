@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::SystemTime;
 
+pub use sim_core::pattern::{Anchor as HexAnchor, HexPattern};
 use sim_core::{
     ConnectionId, ConnectionStatus, EngineError, RetryPolicy, TcpMode, TransportConfig,
 };
@@ -185,61 +186,6 @@ impl DirectionFilter {
             Self::Both => None,
             Self::Sent => Some(Direction::Sent),
             Self::Received => Some(Direction::Received),
-        }
-    }
-}
-
-/// Where in the frame a hex pattern has to sit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HexAnchor {
-    #[default]
-    Anywhere,
-    At(usize),
-}
-
-/// A byte pattern in which `??` stands for any byte.
-///
-/// Byte granularity rather than nibble: `A?` reads like a typo far more often
-/// than it reads like an intent, so it is refused rather than guessed at.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HexPattern(Vec<Option<u8>>);
-
-impl HexPattern {
-    /// `None` when the text is not a usable pattern.
-    #[must_use]
-    pub fn parse(text: &str) -> Option<Self> {
-        let cleaned: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
-        if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
-            return None;
-        }
-        cleaned
-            .chunks(2)
-            .map(|pair| {
-                if pair == ['?', '?'] {
-                    return Some(None);
-                }
-                let byte: String = pair.iter().collect();
-                u8::from_str_radix(&byte, 16).ok().map(Some)
-            })
-            .collect::<Option<Vec<_>>>()
-            .map(Self)
-    }
-
-    fn matches_at(&self, bytes: &[u8], offset: usize) -> bool {
-        let Some(window) = bytes.get(offset..offset + self.0.len()) else {
-            return false;
-        };
-        self.0
-            .iter()
-            .zip(window)
-            .all(|(expected, actual)| expected.is_none_or(|byte| byte == *actual))
-    }
-
-    #[must_use]
-    pub fn found_in(&self, bytes: &[u8], anchor: HexAnchor) -> bool {
-        match anchor {
-            HexAnchor::At(offset) => self.matches_at(bytes, offset),
-            HexAnchor::Anywhere => (0..bytes.len()).any(|offset| self.matches_at(bytes, offset)),
         }
     }
 }
@@ -677,9 +623,6 @@ mod tests {
             [0, 1, 2],
             "an unusable pattern filters nothing"
         );
-
-        assert!(HexPattern::parse("A?").is_none());
-        assert!(HexPattern::parse("??").is_some());
     }
 
     #[test]
