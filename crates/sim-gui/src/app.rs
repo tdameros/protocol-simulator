@@ -242,6 +242,19 @@ impl SimApp {
                 Event::Error { id, error } => {
                     self.state.record_error(id, &error);
                 }
+                Event::ScenarioStep { name, step, pass } => {
+                    self.state
+                        .running
+                        .insert(name, crate::state::ScenarioRun { step, pass });
+                }
+                Event::ScenarioFinished { name, outcome } => {
+                    self.state.running.remove(&name);
+                    // A scenario that gave up says why, where a scenario that
+                    // simply ran out has nothing to report.
+                    if let sim_core::Outcome::Failed(reason) = outcome {
+                        self.state.last_error = Some(format!("[{name}] {reason}"));
+                    }
+                }
             }
         }
     }

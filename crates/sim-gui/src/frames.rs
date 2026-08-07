@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sim_core::frame::schema;
-use sim_core::frame::value::{FieldValues, Value};
-use sim_core::frame::{FieldDef, FieldKind, FrameDef, ScalarType, ValueRange};
+use sim_core::frame::value::{seed_values, FieldValues};
+use sim_core::frame::FrameDef;
 
 /// Subdirectory holding the type definitions every frame in the folder can use.
 const TYPES_DIR: &str = "types";
@@ -161,59 +161,10 @@ fn file_label(path: &Path) -> String {
     )
 }
 
-/// Every field starts at its declared default, or at a neutral value of the
-/// right shape, so the hex preview renders from the moment a frame is opened.
-fn seed_values(frame: &FrameDef) -> FieldValues {
-    let mut values = FieldValues::new();
-    for field in &frame.fields {
-        if let Some(default) = &field.default {
-            values.insert(field.name.clone(), default.clone());
-            continue;
-        }
-        let Some(value) = neutral_value(field) else {
-            continue;
-        };
-        values.insert(field.name.clone(), value);
-    }
-    values
-}
-
-/// Zero, unless the field's subtype forbids it.
-///
-/// A field declared `10..20` has to start at 10: seeding it at zero would leave
-/// a freshly opened frame refusing to encode.
-fn neutral_value(field: &FieldDef) -> Option<Value> {
-    Some(match &field.kind {
-        FieldKind::Scalar(ScalarType::F32 | ScalarType::F64) => Value::Float(match field.range {
-            Some(ValueRange::Float { min, max }) => 0.0_f64.clamp(min, max),
-            _ => 0.0,
-        }),
-        FieldKind::Scalar(scalar) if scalar.is_unsigned_integer() => {
-            Value::Uint(match field.range {
-                Some(ValueRange::Uint { min, .. }) => min,
-                _ => 0,
-            })
-        }
-        FieldKind::Scalar(_) => Value::Int(match field.range {
-            Some(ValueRange::Int { min, max }) => 0i64.clamp(min, max),
-            _ => 0,
-        }),
-        FieldKind::Bytes { len } => Value::Bytes(vec![0; *len]),
-        FieldKind::Text { .. } => Value::Text(String::new()),
-        FieldKind::Enum { variants, .. } => {
-            Value::Uint(variants.first().map_or(0, |variant| variant.value))
-        }
-        FieldKind::Bits { bits, .. } => {
-            Value::Bits(bits.iter().map(|bit| (bit.name.clone(), 0u64)).collect())
-        }
-        // Computed at encode time; nothing for the operator to supply.
-        FieldKind::Checksum { .. } => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sim_core::frame::value::Value;
 
     const GOOD: &str = r#"
 name = "Telemetry"

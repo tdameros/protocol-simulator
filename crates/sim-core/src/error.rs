@@ -29,6 +29,12 @@ pub enum EngineError {
     #[error("connection {0} is down")]
     ConnectionDown(ConnectionId),
 
+    #[error("scenario {0} is already running")]
+    DuplicateScenario(String),
+
+    #[error("scenario {0} is not running")]
+    UnknownScenario(String),
+
     #[error("connection {id}: {source}")]
     Transport {
         id: ConnectionId,

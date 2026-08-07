@@ -38,6 +38,11 @@ pub struct AppState {
     /// A tab the panel asked for. The dock cannot be touched while it draws, so
     /// the request waits for the frame to end.
     pub monitor_requested: bool,
+    /// Scenarios the engine is running, and how far each has got.
+    ///
+    /// Held by name because that is what the engine answers to: starting one
+    /// twice under the same name is refused, so a name is a running instance.
+    pub running: BTreeMap<String, ScenarioRun>,
     /// Bytes a traffic row sent to the frame editor, waiting to be decoded.
     pub pending_frame_hex: Option<Vec<u8>>,
     pub last_error: Option<String>,
@@ -129,6 +134,15 @@ impl AppState {
             .find(|(cid, _)| cid == id)
             .map(|(_, entry)| entry.status)
     }
+}
+
+/// Where a running scenario has got to, as last reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScenarioRun {
+    /// Step being run, counted from one as the file numbers them.
+    pub step: usize,
+    /// Passes completed before this one.
+    pub pass: u32,
 }
 
 pub struct ConnectionEntry {
