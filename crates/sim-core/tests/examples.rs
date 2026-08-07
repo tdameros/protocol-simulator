@@ -119,3 +119,33 @@ fn the_documented_sizes_are_accurate() {
         );
     }
 }
+
+/// The shipped scenarios are held to the same standard: they parse, and every
+/// frame they name is one the example frames actually define.
+#[test]
+fn every_example_scenario_loads_and_names_frames_that_exist() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/scenarios");
+    let paths = schema::toml_files(&dir).expect("scenarios folder should be readable");
+    assert!(!paths.is_empty(), "no scenario found in {}", dir.display());
+
+    let known: Vec<String> = load_examples()
+        .into_iter()
+        .map(|(_, frame)| frame.name)
+        .collect();
+
+    for path in paths {
+        let label = path.file_name().unwrap().to_string_lossy().into_owned();
+        let scenarios =
+            sim_core::scenario::load(&path).unwrap_or_else(|error| panic!("{label}: {error}"));
+
+        for scenario in scenarios {
+            for frame in scenario.frames_used() {
+                assert!(
+                    known.iter().any(|name| name == frame),
+                    "{label}: scenario {} sends {frame}, which no example frame defines",
+                    scenario.name
+                );
+            }
+        }
+    }
+}
