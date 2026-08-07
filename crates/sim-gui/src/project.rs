@@ -762,6 +762,30 @@ mod tests {
     }
 
     #[test]
+    fn the_starting_layout_holds_every_panel_there_is() {
+        let mut monitors = BTreeMap::from([
+            (MonitorId(1), MonitorState::named("Traffic".to_owned())),
+            (MonitorId(4), MonitorState::named("Heartbeats".to_owned())),
+        ]);
+        let dock = default_layout(&mut monitors);
+        let tabs: Vec<Tab> = dock.iter_all_tabs().map(|(_, tab)| *tab).collect();
+
+        // What Reset layout has to hand back. Connections above all: a project
+        // without it cannot be given a connection at all.
+        for expected in [
+            Tab::Connections,
+            Tab::FrameEditor,
+            Tab::HexInject,
+            Tab::LiveMonitor(MonitorId(1)),
+            Tab::LiveMonitor(MonitorId(4)),
+        ] {
+            assert!(tabs.contains(&expected), "{expected:?} is missing");
+        }
+        assert_eq!(tabs.len(), 5, "no tab was invented either");
+        assert_eq!(monitors.len(), 2, "and none was lost on the way");
+    }
+
+    #[test]
     fn a_project_from_a_newer_build_is_refused_rather_than_half_read() {
         let dir = scratch("version");
         let file = dir.join(DEFAULT_FILE_NAME);
