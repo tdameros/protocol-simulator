@@ -50,6 +50,10 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames_dir: Option<String>,
 
+    /// Where the scenarios live, relative to this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenarios_dir: Option<String>,
+
     #[serde(default, rename = "connection", skip_serializing_if = "Vec::is_empty")]
     pub connections: Vec<ConnectionSpec>,
 
@@ -73,6 +77,7 @@ impl Default for Project {
         Self {
             version: FORMAT_VERSION,
             frames_dir: None,
+            scenarios_dir: None,
             connections: Vec::new(),
             monitors: Vec::new(),
             hex_inject: HexSpec::default(),
@@ -111,6 +116,11 @@ impl Project {
             version: FORMAT_VERSION,
             frames_dir: state
                 .frames
+                .directory
+                .as_deref()
+                .map(|directory| write_path(directory, base)),
+            scenarios_dir: state
+                .scenarios
                 .directory
                 .as_deref()
                 .map(|directory| write_path(directory, base)),
@@ -177,6 +187,15 @@ impl Project {
         // After the definitions, never before: a value only knows what shape it
         // should be in once the field declaring it is loaded.
         state.frames.restore_values(self.values.clone());
+
+        state.scenarios.forget();
+        if let Some(directory) = self
+            .scenarios_dir
+            .as_deref()
+            .map(|text| read_path(text, base))
+        {
+            state.scenarios.load_from(directory);
+        }
 
         state.hex_input.clone_from(&self.hex_inject.text);
         state.hex_target = self
@@ -505,7 +524,11 @@ pub fn default_layout(monitors: &mut BTreeMap<MonitorId, MonitorState>) -> DockS
     let mut dock = DockState::new(traffic);
     let surface = dock.main_surface_mut();
     let [live, _connections] = surface.split_left(NodeIndex::root(), 0.22, vec![Tab::Connections]);
-    surface.split_below(live, 0.6, vec![Tab::FrameEditor, Tab::HexInject]);
+    surface.split_below(
+        live,
+        0.6,
+        vec![Tab::FrameEditor, Tab::Scenarios, Tab::HexInject],
+    );
     dock
 }
 
@@ -775,13 +798,14 @@ mod tests {
         for expected in [
             Tab::Connections,
             Tab::FrameEditor,
+            Tab::Scenarios,
             Tab::HexInject,
             Tab::LiveMonitor(MonitorId(1)),
             Tab::LiveMonitor(MonitorId(4)),
         ] {
             assert!(tabs.contains(&expected), "{expected:?} is missing");
         }
-        assert_eq!(tabs.len(), 5, "no tab was invented either");
+        assert_eq!(tabs.len(), 6, "no tab was invented either");
         assert_eq!(monitors.len(), 2, "and none was lost on the way");
     }
 

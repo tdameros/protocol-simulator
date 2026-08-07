@@ -22,6 +22,7 @@ pub struct AppState {
     pub hex_input: String,
     pub hex_target: Option<ConnectionId>,
     pub frames: crate::frames::FrameLibrary,
+    pub scenarios: crate::scenarios::ScenarioLibrary,
     /// Text of the frame editor's hex preview while it is being typed into.
     ///
     /// Held apart from the fields because the two disagree mid-edit: half a

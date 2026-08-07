@@ -11,6 +11,7 @@ mod frames;
 mod panels;
 mod prefs;
 mod project;
+mod scenarios;
 mod state;
 mod theme;
 

@@ -367,6 +367,7 @@ impl SimApp {
         for (tab, label) in [
             (Tab::Connections, "Connections"),
             (Tab::FrameEditor, "Frames"),
+            (Tab::Scenarios, "Scenarios"),
             (Tab::HexInject, "Hex Inject"),
         ] {
             self.reveal_entry(ui, tab, label);

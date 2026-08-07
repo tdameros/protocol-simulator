@@ -44,6 +44,34 @@ what is `/dev/ttyUSB0` on one machine is `COM3` on another.
 
 Launching with no argument reopens the last project used on this machine.
 
+## Scenarios
+
+A scenario is an ordered list of steps run against your connections: send a
+frame with the values you choose, send raw bytes, wait a delay, or wait for a
+frame matching a pattern before going on. Several can run at once, which is
+where concurrency comes from, and a periodic emitter is simply a scenario that
+repeats:
+
+```toml
+[[scenario]]
+name = "Telemetry 10 Hz"
+on = "bus"
+repeat = { every_ms = 100 }
+
+[[scenario.step]]
+send = "Telemetry"
+with = { mode = 1 }
+counters = { seq = { wrap = 255 } }
+```
+
+They live in their own folder beside the frames, one or more per file, and the
+project remembers where. `examples/scenarios` holds documented examples.
+
+Delays are desktop timers: expect millisecond resolution at best, and jitter
+under load. The cadence is pinned to a fixed grid rather than chained delay to
+delay, so a stream does not drift, and a pass that overruns loses its slot
+instead of firing a catch-up burst.
+
 ## Frame definitions
 
 The `examples/frames` folder in the source tree holds documented examples, from
