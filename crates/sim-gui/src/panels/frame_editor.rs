@@ -384,7 +384,7 @@ pub fn value_widget(
             }
         }
         FieldKind::Enum { variants, .. } => enum_widget(ui, &field.name, variants, entry),
-        FieldKind::Bits { bits, .. } => bits_widget(ui, &field.name, bits, entry),
+        FieldKind::Bits { bits, repr } => bits_widget(ui, &field.name, *repr, bits, entry),
         FieldKind::Checksum { .. } => {}
     }
 }
@@ -415,28 +415,68 @@ fn enum_widget(ui: &mut Ui, id: &str, variants: &[EnumVariant], entry: &mut Valu
         });
 }
 
-fn bits_widget(ui: &mut Ui, id: &str, bits: &[BitDef], entry: &mut Value) {
+/// Where each sub-field sits in the word, written as a datasheet writes it.
+///
+/// The file lists them in packing order from the top of the word, which is what
+/// the codec relies on, so the positions fall straight out of the widths. Shown
+/// because nothing else on screen says whether the first row is the top bit or
+/// the bottom one, and that is the first thing anyone checks against a
+/// datasheet.
+///
+/// A width that does not fit what is left gives `None` rather than a wrong
+/// number. The schema refuses such a frame at load, so this is a guard, not a
+/// case anyone should see.
+fn bit_positions(repr: ScalarType, bits: &[BitDef]) -> Vec<Option<String>> {
+    let mut remaining = u32::try_from(repr.size()).unwrap_or(0) * 8;
+    bits.iter()
+        .map(|bit| {
+            remaining = remaining.checked_sub(bit.width)?;
+            let high = remaining + bit.width - 1;
+            Some(if bit.width == 1 {
+                high.to_string()
+            } else {
+                format!("{high}:{remaining}")
+            })
+        })
+        .collect()
+}
+
+fn bits_widget(ui: &mut Ui, id: &str, repr: ScalarType, bits: &[BitDef], entry: &mut Value) {
     let mut current = entry.as_bits().cloned().unwrap_or_default();
     let mut changed = false;
+    let positions = bit_positions(repr, bits);
 
     // A grid, so a bitfield mixing single bits and wider ones keeps its names
-    // in one column and its controls in another instead of staggering them.
+    // in one column, its positions in the next and its controls in a third,
+    // instead of staggering all three.
     egui::Grid::new(("bits", id))
-        .num_columns(2)
+        .num_columns(3)
         .min_col_width(0.0)
         .show(ui, |ui| {
-            for bit in bits {
+            for (bit, position) in bits.iter().zip(&positions) {
                 let slot = current.entry(bit.name.clone()).or_insert(0);
-                if bit.width == 1 {
+                let wide = bit.width > 1;
+
+                if wide {
+                    ui.label(&bit.name);
+                } else {
                     let mut on = *slot != 0;
                     if ui.checkbox(&mut on, &bit.name).changed() {
                         *slot = u64::from(on);
                         changed = true;
                     }
-                } else {
-                    ui.label(format!("{} ({} b)", bit.name, bit.width));
+                }
+
+                match position {
+                    Some(position) => ui.label(RichText::new(format!("[{position}]")).weak()),
+                    None => ui.label(RichText::new("[?]").color(ERROR)),
+                };
+
+                if wide {
                     let max = (1u64 << bit.width) - 1;
                     changed |= ui.add(DragValue::new(slot).range(0..=max)).changed();
+                } else {
+                    ui.label("");
                 }
                 ui.end_row();
             }
@@ -779,6 +819,64 @@ covers = { from = "sync", to = "mode" }
         // The fields still took the pasted values: a capture with a bad
         // checksum is exactly what you want to look at.
         assert_eq!(state.frames.values_mut(&frame)["mode"], Value::Uint(2));
+    }
+
+    #[test]
+    fn a_bitfield_says_where_each_of_its_parts_sits() {
+        let frame = sim_core::frame::schema::from_toml(
+            r#"
+name = "Status"
+[[field]]
+name = "flags"
+type = "bits"
+repr = "u8"
+bits = [
+  { name = "armed",       width = 1 },
+  { name = "heater_on",   width = 1 },
+  { name = "link_up",     width = 1 },
+  { name = "power_level", width = 2 },
+  { name = "spare",       width = 3 },
+]
+"#,
+        )
+        .expect("should parse");
+        let FieldKind::Bits { repr, bits } = &frame.fields[0].kind else {
+            panic!("expected a bitfield");
+        };
+
+        // Listed from the top of the word, which is the order the codec packs
+        // them in and the order the file declares them in.
+        assert_eq!(
+            bit_positions(*repr, bits),
+            [
+                Some("7".to_owned()),
+                Some("6".to_owned()),
+                Some("5".to_owned()),
+                Some("4:3".to_owned()),
+                Some("2:0".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bitfield_wider_than_its_word_says_so_rather_than_lying() {
+        // The schema refuses this at load, so it is a guard rather than a case
+        // anyone should meet, but a wrong number would be worse than a question
+        // mark.
+        let bits = [
+            BitDef {
+                name: "big".to_owned(),
+                width: 6,
+            },
+            BitDef {
+                name: "too_big".to_owned(),
+                width: 6,
+            },
+        ];
+        assert_eq!(
+            bit_positions(ScalarType::U8, &bits),
+            [Some("7:2".to_owned()), None]
+        );
     }
 
     #[test]

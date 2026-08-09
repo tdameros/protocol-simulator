@@ -17,7 +17,11 @@ variants = { IDLE = 0, RUNNING = 1, DEGRADED = 2, FAULT = 3 }
 name = "flags"
 type = "bits"
 repr = "u8"
-# Packed most significant bit first: `armed` is bit 7, `spare` occupies bits 3..0.
+# Packed most significant bit first: `armed` is bit 7, `power_level` takes bits
+# 4 and 3, and `spare` the three that are left, 2 to 0. The editor works those
+# positions out from the widths and shows them beside each name, so the panel
+# can be read against a datasheet without counting.
+#
 # The widths must add up to exactly the size of `repr`, otherwise the file is
 # rejected at load time rather than producing a quietly wrong frame.
 bits = [
