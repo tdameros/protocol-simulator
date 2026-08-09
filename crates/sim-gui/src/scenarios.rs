@@ -191,6 +191,12 @@ impl ScenarioLibrary {
         };
         let name = draft.scenario.name.clone();
 
+        // Never write something that cannot be read back: it would cost every
+        // other scenario sharing the file, not just this one.
+        if let Some(reason) = draft.problem() {
+            bail!("{reason}");
+        }
+
         // Names are the handle everything else uses, so a clash is refused
         // before it reaches the disk rather than dropped on the next reload.
         let taken = self.entries.iter().any(|entry| {
@@ -325,7 +331,9 @@ impl ActionKind {
                 with: BTreeMap::new(),
                 counters: BTreeMap::new(),
             },
-            Self::Raw => Action::Raw { bytes: Vec::new() },
+            // One byte rather than none: an empty `raw` is not a step the
+            // loader accepts, and a half-made step must never be unsavable.
+            Self::Raw => Action::Raw { bytes: vec![0] },
             Self::Wait => Action::Wait {
                 delay: Duration::from_millis(100),
             },
@@ -341,6 +349,27 @@ impl ActionKind {
 }
 
 impl Draft {
+    /// Why the draft could not be read back if it were written, if it could not.
+    ///
+    /// Checked by writing it out and reading it in again, rather than by
+    /// listing the rules here: the loader is the authority on what a scenario
+    /// may be, and a second copy of its rules would drift from it.
+    ///
+    /// This matters more than it looks. Scenarios load a file at a time, so one
+    /// unreadable scenario takes every other scenario in that file down with it
+    /// at the next Reload. Refusing to write is the only place that can be
+    /// stopped.
+    #[must_use]
+    pub fn problem(&self) -> Option<String> {
+        let scenario = std::slice::from_ref(&self.scenario);
+        match scenario::to_toml(scenario) {
+            Err(error) => Some(error.to_string()),
+            Ok(text) => scenario::from_toml(&text)
+                .err()
+                .map(|error| error.to_string()),
+        }
+    }
+
     /// Adds a step at the end, of the simplest kind that can exist here.
     ///
     /// A delay when there is nowhere to send, since a step with no link would
@@ -415,6 +444,29 @@ fn targets_for(kind: ActionKind, links: &[ConnectionId]) -> Vec<ConnectionId> {
     } else {
         Vec::new()
     }
+}
+
+/// Points a `send` step at another frame, dropping what belonged to the old one.
+///
+/// Overrides and counters name fields, and the fields of two frames have
+/// nothing to do with each other. Kept, they would be invisible in the editor,
+/// which only lists the new frame's fields, and would fail the step at run time
+/// with a name nobody could see.
+pub fn set_frame(step: &mut Step, name: &str) {
+    let Action::Send {
+        frame,
+        with,
+        counters,
+    } = &mut step.action
+    else {
+        return;
+    };
+    if frame == name {
+        return;
+    }
+    name.clone_into(frame);
+    with.clear();
+    counters.clear();
 }
 
 /// Starts or stops overriding one field of a `send` step.
@@ -752,6 +804,96 @@ raw = "01"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// One way of breaking a draft, and what to call it.
+    type Break = (&'static str, Box<dyn Fn(&mut Draft)>);
+
+    /// Every way the editor can reach a scenario that would not load, all of
+    /// which used to be written out and take the whole file down at the next
+    /// Reload.
+    #[test]
+    fn a_draft_that_could_not_be_read_back_is_never_written() {
+        let dir = scratch("unreadable");
+        let file = dir.join("good.toml");
+        std::fs::write(&file, GOOD).expect("should write");
+
+        let cases: Vec<Break> = vec![
+            (
+                "a step with no bytes",
+                Box::new(|draft: &mut Draft| {
+                    draft.scenario.steps[0].action = Action::Raw { bytes: Vec::new() };
+                }),
+            ),
+            (
+                "a wait matching on nothing",
+                Box::new(|draft: &mut Draft| {
+                    draft.scenario.steps[0].action = Action::WaitFor {
+                        expect: Expect::Frame {
+                            frame: "Telemetry".to_owned(),
+                            fields: Vec::new(),
+                        },
+                        timeout: None,
+                    };
+                }),
+            ),
+            (
+                "no name at all",
+                Box::new(|draft: &mut Draft| draft.scenario.name = String::new()),
+            ),
+            (
+                "no steps at all",
+                Box::new(|draft: &mut Draft| draft.scenario.steps.clear()),
+            ),
+        ];
+
+        for (label, break_it) in cases {
+            let mut library = loaded(&dir);
+            library.begin_edit();
+            break_it(library.draft.as_mut().expect("editing"));
+
+            assert!(
+                library.draft.as_ref().expect("editing").problem().is_some(),
+                "{label} should be reported"
+            );
+            assert!(
+                library.save_draft(&file).is_err(),
+                "{label} should not reach the disk"
+            );
+            // And the file still holds what it held.
+            assert_eq!(
+                loaded(&dir).entries.len(),
+                1,
+                "{label} cost the file its contents"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_step_added_from_the_panel_can_always_be_saved() {
+        let dir = scratch("addable");
+        let file = dir.join("good.toml");
+        std::fs::write(&file, GOOD).expect("should write");
+        let mut library = loaded(&dir);
+
+        library.begin_edit();
+        library
+            .draft
+            .as_mut()
+            .expect("editing")
+            .add_step(&links(&["bus"]), None);
+
+        assert_eq!(
+            library.draft.as_ref().expect("editing").problem(),
+            None,
+            "a freshly added step must not be a scenario that cannot be saved"
+        );
+        library.save_draft(&file).expect("should save");
+        assert_eq!(loaded(&dir).entries[0].scenario.steps.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_name_already_taken_is_refused_before_the_disk_is_touched() {
         let dir = scratch("clash");
@@ -929,6 +1071,36 @@ send = "Telemetry"
         };
         assert!(!with.contains_key("seq"));
         assert!(counters.contains_key("seq"));
+    }
+
+    #[test]
+    fn pointing_a_send_at_another_frame_drops_the_old_frames_fields() {
+        let mut draft = draft_of(
+            r#"
+[[scenario]]
+name = "S"
+on = "bus"
+[[scenario.step]]
+send = "Telemetry"
+with = { sync = 1 }
+counters = { seq = { wrap = 255 } }
+"#,
+        );
+        let step = &mut draft.scenario.steps[0];
+
+        set_frame(step, "Status");
+        let Action::Send {
+            frame,
+            with,
+            counters,
+        } = &step.action
+        else {
+            panic!("expected a send");
+        };
+        assert_eq!(frame, "Status");
+        // Invisible in the editor if kept, and fatal at run time.
+        assert!(with.is_empty());
+        assert!(counters.is_empty());
     }
 
     #[test]

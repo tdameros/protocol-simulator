@@ -35,6 +35,11 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     // Save says otherwise.
     if state.scenarios.draft.is_some() {
         let dirty = state.scenarios.draft_is_dirty();
+        let problem = state
+            .scenarios
+            .draft
+            .as_ref()
+            .and_then(crate::scenarios::Draft::problem);
         scenario_edit::header(ui, state);
         ui.separator();
         ScrollArea::vertical()
@@ -44,7 +49,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    dirty,
+                    dirty && problem.is_none(),
                     egui::Button::new(format!("{} Save", icons::FLOPPY_DISK)),
                 )
                 .clicked()
@@ -53,6 +58,11 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
             }
             if ui.button("Cancel").clicked() {
                 state.scenarios.cancel_edit();
+            }
+            // Said here rather than after the click: a half-made scenario is a
+            // normal state to be in while building one.
+            if let Some(reason) = &problem {
+                ui.colored_label(ERROR, reason);
             }
         });
         return;
@@ -101,11 +111,17 @@ fn blank() -> Scenario {
 
 fn library_bar(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
+        // Both throw the draft away, so neither is offered while one is open:
+        // losing unsaved work to a stray click is not a trade worth making.
+        let idle = state.scenarios.draft.is_none();
         if ui
-            .button(RichText::new(format!(
-                "{} Scenarios folder",
-                icons::FOLDER_OPEN
-            )))
+            .add_enabled(
+                idle,
+                egui::Button::new(RichText::new(format!(
+                    "{} Scenarios folder",
+                    icons::FOLDER_OPEN
+                ))),
+            )
             .clicked()
         {
             if let Some(directory) = rfd::FileDialog::new().pick_folder() {
@@ -114,7 +130,10 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         }
         if state.scenarios.directory.is_some()
             && ui
-                .button(RichText::new(format!("{} Reload", icons::ARROWS_CLOCKWISE)))
+                .add_enabled(
+                    idle,
+                    egui::Button::new(RichText::new(format!("{} Reload", icons::ARROWS_CLOCKWISE))),
+                )
                 .on_hover_text("Re-read the .toml files from disk")
                 .clicked()
         {
@@ -124,6 +143,13 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         ui.separator();
 
         let editing = state.scenarios.draft.is_some();
+        // A running scenario is keyed by name in the engine, so renaming or
+        // deleting it would leave something running with no row to stop it
+        // from, and a rename would even let a second copy start.
+        let running = state
+            .scenarios
+            .selected_scenario()
+            .is_some_and(|scenario| state.running.contains_key(&scenario.name));
         if ui
             .add_enabled(
                 state.scenarios.directory.is_some() && !editing,
@@ -134,21 +160,28 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         {
             state.scenarios.begin_new(blank());
         }
+        let editable = state.scenarios.selected_entry().is_some() && !editing && !running;
         if ui
             .add_enabled(
-                state.scenarios.selected_entry().is_some() && !editing,
+                editable,
                 egui::Button::new(format!("{} Edit", icons::PENCIL_SIMPLE)),
             )
+            .on_hover_text(if running {
+                "Stop it before editing it"
+            } else {
+                "Edit this scenario"
+            })
             .clicked()
         {
             state.scenarios.begin_edit();
         }
         if ui
-            .add_enabled(
-                state.scenarios.selected_entry().is_some() && !editing,
-                egui::Button::new(icons::TRASH),
-            )
-            .on_hover_text("Delete this scenario from its file")
+            .add_enabled(editable, egui::Button::new(icons::TRASH))
+            .on_hover_text(if running {
+                "Stop it before deleting it"
+            } else {
+                "Delete this scenario from its file"
+            })
             .clicked()
         {
             if let Err(error) = state.scenarios.delete_selected() {

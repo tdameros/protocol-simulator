@@ -173,10 +173,11 @@ fn body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
 }
 
 fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
-    let Action::Send { frame, .. } = &mut step.action else {
+    let Action::Send { frame, .. } = &step.action else {
         return;
     };
     let chosen = frame.clone();
+    let mut picked: Option<String> = None;
     ui.horizontal(|ui| {
         ui.label(RichText::new("frame").weak());
         ComboBox::from_id_salt("frame")
@@ -191,13 +192,16 @@ fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
                         .selectable_label(chosen == known.name, &known.name)
                         .clicked()
                     {
-                        frame.clone_from(&known.name);
+                        picked = Some(known.name.clone());
                     }
                 }
             });
     });
+    if let Some(name) = picked {
+        scenarios::set_frame(step, &name);
+    }
 
-    let Some(definition) = frames.iter().find(|known| known.name == *frame).cloned() else {
+    let Some(definition) = frames.iter().find(|known| known.name == chosen).cloned() else {
         ui.label(RichText::new("No frame of that name is loaded.").weak());
         return;
     };
@@ -370,16 +374,23 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
                             }
                         }
                     });
-                ui.label(RichText::new("matching").weak());
+                ui.label(RichText::new("matching, at its declared value:").weak())
+                    .on_hover_text(
+                        "A ticked field has to carry the value the frame declares as its default.                          There is no way to ask for another value yet.",
+                    );
             });
 
             let Some(definition) = frames.iter().find(|known| known.name == chosen) else {
                 ui.label(RichText::new("No frame of that name is loaded.").weak());
                 return;
             };
+            // Checksums are left out for the same reason the send editor leaves
+            // them out: computed rather than chosen, and matching one would pin
+            // the wait to a frame carrying nothing but defaults.
             let names: Vec<String> = definition
                 .fields
                 .iter()
+                .filter(|field| !matches!(field.kind, sim_core::frame::FieldKind::Checksum { .. }))
                 .map(|field| field.name.clone())
                 .collect();
 
