@@ -29,6 +29,40 @@ where
     .expect("timed out waiting for expected event")
 }
 
+/// Collects events until the ones collected so far satisfy `enough`.
+///
+/// A scenario reports itself finished once it has issued its last send, which
+/// is before that send has crossed the socket, so its own events and the
+/// traffic it causes arrive in no fixed order. A test that cares about both has
+/// to weigh the set rather than the sequence.
+async fn gather_until<F>(rx: &mut mpsc::Receiver<Event>, mut enough: F) -> Vec<Event>
+where
+    F: FnMut(&[Event]) -> bool,
+{
+    let mut seen = Vec::new();
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            seen.push(
+                rx.recv()
+                    .await
+                    .expect("engine event channel closed unexpectedly"),
+            );
+            if enough(&seen) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the expected events");
+    seen
+}
+
+fn finished_with(events: &[Event], scenario: &str, expected: &sim_core::Outcome) -> bool {
+    events.iter().any(|event| {
+        matches!(event, Event::ScenarioFinished { name, outcome } if name == scenario && outcome == expected)
+    })
+}
+
 /// Waits until every id in `expected` has reported `Connected`, regardless of arrival order.
 async fn wait_all_connected(rx: &mut mpsc::Receiver<Event>, expected: &[&str]) {
     let mut pending: std::collections::HashSet<&str> = expected.iter().copied().collect();
@@ -460,4 +494,533 @@ async fn tcp_server_accepts_a_second_peer() {
         // Hang up so the next iteration exercises the re-accept path.
         drop(client);
     }
+}
+
+/// A frame definition small enough to reason about byte by byte: a sync word, a
+/// sequence byte the scenario counts, and a mode byte it overrides.
+fn scenario_frame() -> sim_core::frame::FrameDef {
+    sim_core::frame::schema::from_toml(
+        r#"
+name = "Beacon"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+
+[[field]]
+name = "seq"
+type = "u8"
+
+[[field]]
+name = "mode"
+type = "u8"
+"#,
+    )
+    .expect("the test frame should parse")
+}
+
+fn beacons(events: &[Event], id: &str) -> Vec<Vec<u8>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::FrameReceived { id: got, bytes, .. } if got.0 == id => Some(bytes.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A repeating scenario encodes its frame, advances its counter and lands on
+/// the far side, pass after pass.
+#[tokio::test]
+async fn a_repeating_scenario_emits_encoded_frames_with_a_counter() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let addr_a = "127.0.0.1:19831".parse().unwrap();
+    let addr_b = "127.0.0.1:19832".parse().unwrap();
+    for (name, bind, remote) in [("a", addr_a, addr_b), ("b", addr_b, addr_a)] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["a", "b"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Beacon burst"
+on = "a"
+repeat = { every_ms = 20, times = 3 }
+
+[[scenario.step]]
+send = "Beacon"
+with = { mode = 7 }
+counters = { seq = { from = 10, step = 5 } }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![scenario_frame()],
+    })
+    .await
+    .unwrap();
+
+    // Both conditions, in either order: the scenario announces itself done
+    // before its last frame has finished crossing the loopback.
+    let seen = gather_until(&mut rx, |events| {
+        beacons(events, "b").len() >= 3
+            && finished_with(events, "Beacon burst", &sim_core::Outcome::Completed)
+    })
+    .await;
+
+    let frames = beacons(&seen, "b");
+    assert_eq!(frames.len(), 3, "one frame per pass");
+    // Sync from the frame's own default, mode from the override, seq counting
+    // 10, 15, 20 as the counter declares.
+    assert_eq!(frames[0], vec![0xAA, 0x55, 10, 7]);
+    assert_eq!(frames[1], vec![0xAA, 0x55, 15, 7]);
+    assert_eq!(frames[2], vec![0xAA, 0x55, 20, 7]);
+}
+
+/// `wait_for` holds the sequence until the far side answers, and the step after
+/// it only runs then.
+#[tokio::test]
+async fn a_scenario_waits_for_the_frame_it_was_told_to_expect() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let addr_a = "127.0.0.1:19833".parse().unwrap();
+    let addr_b = "127.0.0.1:19834".parse().unwrap();
+    for (name, bind, remote) in [("a", addr_a, addr_b), ("b", addr_b, addr_a)] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["a", "b"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Handshake"
+on = "a"
+
+[[scenario.step]]
+wait_for = { hex = "C0 ?? FE", at = 0, timeout_ms = 4000 }
+
+[[scenario.step]]
+raw = "01 02"
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    // A frame that does not match must not release the wait.
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("b"),
+        bytes: vec![0x11, 0x22, 0x33],
+    })
+    .await
+    .unwrap();
+    wait_for(&mut rx, |event| {
+        matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == "a" && bytes == &[0x11, 0x22, 0x33])
+    })
+    .await;
+
+    // Then the one it is waiting for, wildcard in the middle.
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("b"),
+        bytes: vec![0xC0, 0x99, 0xFE],
+    })
+    .await
+    .unwrap();
+
+    // The step after the wait is what proves the wait was released at all.
+    gather_until(&mut rx, |events| {
+        let arrived = events.iter().any(|event| {
+            matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == "b" && bytes == &[0x01, 0x02])
+        });
+        arrived && finished_with(events, "Handshake", &sim_core::Outcome::Completed)
+    })
+    .await;
+}
+
+/// A wait that is never answered fails the scenario, naming the step, rather
+/// than hanging forever.
+#[tokio::test]
+async fn a_wait_that_times_out_fails_the_scenario() {
+    let (tx, mut rx) = Engine::spawn();
+
+    tx.send(Command::Connect {
+        id: ConnectionId::from("lonely"),
+        config: TransportConfig::Udp {
+            bind: "127.0.0.1:19835".parse().unwrap(),
+            remote: "127.0.0.1:19836".parse().unwrap(),
+        },
+        retry: None,
+    })
+    .await
+    .unwrap();
+    wait_all_connected(&mut rx, &["lonely"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Hopeful"
+on = "lonely"
+
+[[scenario.step]]
+wait_for = { hex = "AA BB", timeout_ms = 60 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let event = wait_for(
+        &mut rx,
+        |event| matches!(event, Event::ScenarioFinished { name, .. } if name == "Hopeful"),
+    )
+    .await;
+
+    let Event::ScenarioFinished { outcome, .. } = event else {
+        panic!("expected the scenario to finish");
+    };
+    let sim_core::Outcome::Failed(reason) = outcome else {
+        panic!("a timeout is a failure, got {outcome:?}");
+    };
+    assert!(reason.contains("step 1"), "{reason}");
+    assert!(reason.contains("lonely"), "{reason}");
+}
+
+/// Stopping frees the name at once, so the same scenario can be started again
+/// without waiting for anything to settle.
+#[tokio::test]
+async fn a_stopped_scenario_frees_its_name_immediately() {
+    let (tx, mut rx) = Engine::spawn();
+
+    tx.send(Command::Connect {
+        id: ConnectionId::from("link"),
+        config: TransportConfig::Udp {
+            bind: "127.0.0.1:19837".parse().unwrap(),
+            remote: "127.0.0.1:19838".parse().unwrap(),
+        },
+        retry: None,
+    })
+    .await
+    .unwrap();
+    wait_all_connected(&mut rx, &["link"]).await;
+
+    let forever = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Forever"
+on = "link"
+repeat = { every_ms = 10 }
+
+[[scenario.step]]
+raw = "00"
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    for round in 0..2 {
+        tx.send(Command::StartScenario {
+            scenario: Box::new(forever.clone()),
+            frames: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        wait_for(
+            &mut rx,
+            |event| matches!(event, Event::ScenarioStep { name, .. } if name == "Forever"),
+        )
+        .await;
+
+        tx.send(Command::StopScenario {
+            name: "Forever".to_owned(),
+        })
+        .await
+        .unwrap();
+        wait_for(&mut rx, |event| {
+            matches!(
+                event,
+                Event::ScenarioFinished { name, outcome } if name == "Forever" && *outcome == sim_core::Outcome::Stopped
+            )
+        })
+        .await;
+
+        assert!(round < 2, "both rounds ran");
+    }
+}
+
+/// One step, two links: the same bytes go out on both, and a `wait_for` aimed
+/// at both is only satisfied once each has answered.
+#[tokio::test]
+async fn a_step_can_drive_two_links_at_once() {
+    let (tx, mut rx) = Engine::spawn();
+
+    // Two independent loopback pairs, so "uart" and "udp" are genuinely
+    // separate links with their own far side.
+    let pairs = [
+        ("uart", 19841, "uart-peer", 19842),
+        ("udp", 19843, "udp-peer", 19844),
+    ];
+    for (near, near_port, far, far_port) in pairs {
+        for (name, bind, remote) in [(near, near_port, far_port), (far, far_port, near_port)] {
+            tx.send(Command::Connect {
+                id: ConnectionId::from(name),
+                config: TransportConfig::Udp {
+                    bind: format!("127.0.0.1:{bind}").parse().unwrap(),
+                    remote: format!("127.0.0.1:{remote}").parse().unwrap(),
+                },
+                retry: None,
+            })
+            .await
+            .unwrap();
+        }
+    }
+    wait_all_connected(&mut rx, &["uart", "uart-peer", "udp", "udp-peer"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Both"
+on = ["uart", "udp"]
+
+[[scenario.step]]
+raw = "AA 55"
+
+[[scenario.step]]
+wait_for = { hex = "C0 FE", timeout_ms = 4000 }
+
+[[scenario.step]]
+raw = "99"
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    // Step one reached both far sides with the same bytes.
+    gather_until(&mut rx, |events| {
+        ["uart-peer", "udp-peer"].iter().all(|peer| {
+            events.iter().any(|event| {
+                matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == *peer && bytes == &[0xAA, 0x55])
+            })
+        })
+    })
+    .await;
+
+    // Only one side answers, so the wait must hold: the step after it has not
+    // run, which is what "all of them" means.
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("uart-peer"),
+        bytes: vec![0xC0, 0xFE],
+    })
+    .await
+    .unwrap();
+    wait_for(&mut rx, |event| {
+        matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == "uart" && bytes == &[0xC0, 0xFE])
+    })
+    .await;
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            wait_for(&mut rx, |event| matches!(
+                event,
+                Event::FrameReceived { bytes, .. } if bytes == &[0x99]
+            ))
+        )
+        .await
+        .is_err(),
+        "one answer out of two must not release the wait"
+    );
+
+    // The second answer releases it, and the last step runs on both links.
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("udp-peer"),
+        bytes: vec![0xC0, 0xFE],
+    })
+    .await
+    .unwrap();
+    gather_until(&mut rx, |events| {
+        ["uart-peer", "udp-peer"].iter().all(|peer| {
+            events.iter().any(|event| {
+                matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == *peer && bytes == &[0x99])
+            })
+        }) && finished_with(events, "Both", &sim_core::Outcome::Completed)
+    })
+    .await;
+}
+
+/// A wait aimed at two links that only one answers fails, and says which one
+/// stayed silent.
+#[tokio::test]
+async fn a_partial_answer_times_out_naming_who_is_missing() {
+    let (tx, mut rx) = Engine::spawn();
+
+    for (name, bind, remote) in [
+        ("left", 19845, 19846),
+        ("left-peer", 19846, 19845),
+        ("right", 19847, 19848),
+    ] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp {
+                bind: format!("127.0.0.1:{bind}").parse().unwrap(),
+                remote: format!("127.0.0.1:{remote}").parse().unwrap(),
+            },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["left", "left-peer", "right"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Both must answer"
+on = ["left", "right"]
+
+[[scenario.step]]
+wait_for = { hex = "C0 FE", timeout_ms = 300 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("left-peer"),
+        bytes: vec![0xC0, 0xFE],
+    })
+    .await
+    .unwrap();
+
+    let event = wait_for(
+        &mut rx,
+        |event| matches!(event, Event::ScenarioFinished { name, .. } if name == "Both must answer"),
+    )
+    .await;
+
+    let Event::ScenarioFinished { outcome, .. } = event else {
+        panic!("expected the scenario to finish");
+    };
+    let sim_core::Outcome::Failed(reason) = outcome else {
+        panic!("a half answer is a failure, got {outcome:?}");
+    };
+    // Names what is still missing, not what was asked for.
+    assert!(reason.contains("right"), "{reason}");
+    assert!(!reason.contains("left"), "{reason}");
+}
+
+/// A wait must not be released by a frame that arrived before it was reached,
+/// which on a repeating scenario means a pass answering with the previous
+/// pass's reply and reporting success nobody earned.
+#[tokio::test]
+async fn a_wait_is_not_satisfied_by_an_earlier_passs_answer() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let near = "127.0.0.1:19851".parse().unwrap();
+    let far = "127.0.0.1:19852".parse().unwrap();
+    for (name, bind, remote) in [("near", near, far), ("far", far, near)] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["near", "far"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Twice"
+on = "near"
+repeat = { every_ms = 400, times = 2 }
+
+[[scenario.step]]
+wait_ms = 150
+
+[[scenario.step]]
+wait_for = { hex = "C0 FE", timeout_ms = 120 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    // Two answers during the first pass's delay, then silence. The first pass
+    // is satisfied by one of them; the second must not be satisfied by the
+    // leftover.
+    for _ in 0..2 {
+        tx.send(Command::SendRaw {
+            id: ConnectionId::from("far"),
+            bytes: vec![0xC0, 0xFE],
+        })
+        .await
+        .unwrap();
+    }
+
+    let event = wait_for(
+        &mut rx,
+        |event| matches!(event, Event::ScenarioFinished { name, .. } if name == "Twice"),
+    )
+    .await;
+
+    let Event::ScenarioFinished { outcome, .. } = event else {
+        panic!("expected the scenario to finish");
+    };
+    let sim_core::Outcome::Failed(reason) = outcome else {
+        panic!("the second pass was never answered, got {outcome:?}");
+    };
+    assert!(reason.contains("step 2"), "{reason}");
+    assert!(reason.contains("near"), "{reason}");
 }

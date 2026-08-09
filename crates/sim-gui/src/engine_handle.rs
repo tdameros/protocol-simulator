@@ -1,3 +1,5 @@
+use sim_core::frame::FrameDef;
+use sim_core::scenario::Scenario;
 use sim_core::{Command, ConnectionId, Engine, Event, RetryPolicy, TransportConfig};
 
 use tokio::sync::mpsc;
@@ -26,6 +28,17 @@ impl EngineHandle {
 
     pub fn send_raw(&self, id: ConnectionId, bytes: Vec<u8>) {
         self.send(Command::SendRaw { id, bytes });
+    }
+
+    pub fn start_scenario(&self, scenario: Scenario, frames: Vec<FrameDef>) {
+        self.send(Command::StartScenario {
+            scenario: Box::new(scenario),
+            frames,
+        });
+    }
+
+    pub fn stop_scenario(&self, name: String) {
+        self.send(Command::StopScenario { name });
     }
 
     /// Drains every event currently queued from the engine.

@@ -4,11 +4,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::connection::{ConnectionId, ConnectionStatus, RetryPolicy, TcpMode, TransportConfig};
 use crate::error::{EngineError, TransportError};
+use crate::frame::FrameDef;
+use crate::runner::{self, Heard, Outcome};
+use crate::scenario::Scenario;
 use crate::transport::serial::SerialTransport;
 use crate::transport::tcp::TcpTransport;
 use crate::transport::udp::UdpTransport;
@@ -17,6 +20,9 @@ use crate::transport::{Received, Transport};
 const COMMAND_CHANNEL_CAPACITY: usize = 256;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const OUTGOING_CHANNEL_CAPACITY: usize = 256;
+/// Received frames are republished here for scenarios waiting on one. Deep
+/// enough that a step looking for a reply is not outrun by a busy link.
+const RECEIVED_CHANNEL_CAPACITY: usize = 1024;
 
 pub enum Command {
     Connect {
@@ -31,6 +37,18 @@ pub enum Command {
     SendRaw {
         id: ConnectionId,
         bytes: Vec<u8>,
+    },
+    /// Runs a scenario until it ends or is stopped.
+    ///
+    /// It carries the definitions it encodes against rather than reading a
+    /// shared library, so a scenario keeps running against the frames it
+    /// started with however they are edited meanwhile.
+    StartScenario {
+        scenario: Box<Scenario>,
+        frames: Vec<FrameDef>,
+    },
+    StopScenario {
+        name: String,
     },
 }
 
@@ -54,6 +72,17 @@ pub enum Event {
         id: Option<ConnectionId>,
         error: EngineError,
     },
+    /// A scenario is about to run `step`, counted from one, on pass `pass`,
+    /// counted from zero.
+    ScenarioStep {
+        name: String,
+        step: usize,
+        pass: u32,
+    },
+    ScenarioFinished {
+        name: String,
+        outcome: Outcome,
+    },
 }
 
 pub struct Engine;
@@ -69,6 +98,10 @@ impl Engine {
     pub fn spawn() -> (mpsc::Sender<Command>, mpsc::Receiver<Event>) {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        // Weak on purpose: a scenario issues commands back through here, and a
+        // strong handle held by the loop itself would keep the channel open
+        // after every real caller had gone, so the engine would never stop.
+        let issue = command_tx.downgrade();
 
         std::thread::Builder::new()
             .name("sim-engine".to_owned())
@@ -77,7 +110,7 @@ impl Engine {
                     .enable_all()
                     .build()
                     .expect("failed to build engine tokio runtime");
-                runtime.block_on(run(command_rx, event_tx));
+                runtime.block_on(run(command_rx, issue, event_tx));
             })
             .expect("failed to spawn engine thread");
 
@@ -95,10 +128,43 @@ struct ConnectionHandle {
     generation: u64,
 }
 
-async fn run(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>) {
+/// A scenario the engine is running, tagged like a connection so a notice from
+/// one that has already been replaced cannot evict its successor.
+struct ScenarioHandle {
+    task: JoinHandle<()>,
+    generation: u64,
+}
+
+/// Every channel a command handler may need, kept together so that adding one
+/// does not widen every signature.
+struct Wiring {
+    events: mpsc::Sender<Event>,
+    /// Where a scenario posts the sends it wants performed.
+    issue: mpsc::WeakSender<Command>,
+    finished: mpsc::Sender<(ConnectionId, u64)>,
+    ended: mpsc::Sender<(String, u64, Outcome)>,
+    /// Received frames, republished for scenarios waiting on one.
+    heard: broadcast::Sender<Heard>,
+}
+
+async fn run(
+    mut commands: mpsc::Receiver<Command>,
+    issue: mpsc::WeakSender<Command>,
+    events: mpsc::Sender<Event>,
+) {
     let mut connections: HashMap<ConnectionId, ConnectionHandle> = HashMap::new();
+    let mut scenarios: HashMap<String, ScenarioHandle> = HashMap::new();
     let (finished_tx, mut finished_rx) =
         mpsc::channel::<(ConnectionId, u64)>(EVENT_CHANNEL_CAPACITY);
+    let (ended_tx, mut ended_rx) = mpsc::channel::<(String, u64, Outcome)>(EVENT_CHANNEL_CAPACITY);
+    let (heard_tx, _) = broadcast::channel::<Heard>(RECEIVED_CHANNEL_CAPACITY);
+    let wiring = Wiring {
+        events,
+        issue,
+        finished: finished_tx,
+        ended: ended_tx,
+        heard: heard_tx,
+    };
     let mut next_generation: u64 = 0;
 
     loop {
@@ -108,8 +174,8 @@ async fn run(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>)
                 handle_command(
                     command,
                     &mut connections,
-                    &events,
-                    &finished_tx,
+                    &mut scenarios,
+                    &wiring,
                     &mut next_generation,
                 )
                 .await;
@@ -126,11 +192,22 @@ async fn run(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>)
             Some((id, generation)) = finished_rx.recv() => {
                 if connections.get(&id).is_some_and(|handle| handle.generation == generation) {
                     connections.remove(&id);
-                    let _ = events
+                    let _ = wiring.events
                         .send(Event::ConnectionStatus {
                             id,
                             status: ConnectionStatus::Disconnected,
                         })
+                        .await;
+                }
+            }
+            // Same discipline for a scenario that ran itself out: the name is
+            // freed here, and only then is the ending announced, so a caller
+            // restarting it the instant it hears the news finds the slot empty.
+            Some((name, generation, outcome)) = ended_rx.recv() => {
+                if scenarios.get(&name).is_some_and(|handle| handle.generation == generation) {
+                    scenarios.remove(&name);
+                    let _ = wiring.events
+                        .send(Event::ScenarioFinished { name, outcome })
                         .await;
                 }
             }
@@ -141,10 +218,11 @@ async fn run(mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>)
 async fn handle_command(
     command: Command,
     connections: &mut HashMap<ConnectionId, ConnectionHandle>,
-    events: &mpsc::Sender<Event>,
-    finished_tx: &mpsc::Sender<(ConnectionId, u64)>,
+    scenarios: &mut HashMap<String, ScenarioHandle>,
+    wiring: &Wiring,
     next_generation: &mut u64,
 ) {
+    let events = &wiring.events;
     match command {
         Command::Connect { id, config, retry } => {
             if connections.contains_key(&id) {
@@ -163,7 +241,8 @@ async fn handle_command(
                 config,
                 retry,
                 events.clone(),
-                finished_tx.clone(),
+                wiring.finished.clone(),
+                wiring.heard.clone(),
                 generation,
             );
             connections.insert(id, handle);
@@ -202,7 +281,60 @@ async fn handle_command(
                 report_error(events, Some(id.clone()), EngineError::ConnectionDown(id)).await;
             }
         }
+        Command::StartScenario { scenario, frames } => {
+            let name = scenario.name.clone();
+            if scenarios.contains_key(&name) {
+                // Restarting means stopping first, so that a scenario cannot be
+                // running twice under one name and emit everything in duplicate.
+                report_error(events, None, EngineError::DuplicateScenario(name)).await;
+                return;
+            }
+            let generation = *next_generation;
+            *next_generation += 1;
+            let handle = start_scenario(*scenario, frames, wiring, generation);
+            scenarios.insert(name, handle);
+        }
+        Command::StopScenario { name } => match scenarios.remove(&name) {
+            Some(handle) => {
+                handle.task.abort();
+                let _ = events
+                    .send(Event::ScenarioFinished {
+                        name,
+                        outcome: Outcome::Stopped,
+                    })
+                    .await;
+            }
+            None => report_error(events, None, EngineError::UnknownScenario(name)).await,
+        },
     }
+}
+
+fn start_scenario(
+    scenario: Scenario,
+    frames: Vec<FrameDef>,
+    wiring: &Wiring,
+    generation: u64,
+) -> ScenarioHandle {
+    let name = scenario.name.clone();
+    let context = runner::Context {
+        scenario,
+        frames,
+        commands: wiring.issue.clone(),
+        events: wiring.events.clone(),
+        // Subscribed before the first step runs, so a reply arriving between
+        // the send and the wait is still seen.
+        received: wiring.heard.subscribe(),
+    };
+    let ended = wiring.ended.clone();
+
+    let task = tokio::spawn(async move {
+        let outcome = runner::run(context).await;
+        // The loop announces the ending once the name is free again, for the
+        // same reason a connection does.
+        let _ = ended.send((name, generation, outcome)).await;
+    });
+
+    ScenarioHandle { task, generation }
 }
 
 async fn report_error(events: &mpsc::Sender<Event>, id: Option<ConnectionId>, error: EngineError) {
@@ -224,6 +356,7 @@ fn start_connection(
     retry: Option<RetryPolicy>,
     events: mpsc::Sender<Event>,
     finished_tx: mpsc::Sender<(ConnectionId, u64)>,
+    heard_tx: broadcast::Sender<Heard>,
     generation: u64,
 ) -> ConnectionHandle {
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Vec<u8>>(OUTGOING_CHANNEL_CAPACITY);
@@ -264,6 +397,7 @@ fn start_connection(
                         &mut transport,
                         &mut outgoing_rx,
                         &events,
+                        &heard_tx,
                         &task_connected,
                     )
                     .await;
@@ -400,6 +534,7 @@ async fn run_connection<T: Transport>(
     transport: &mut T,
     outgoing_rx: &mut mpsc::Receiver<Vec<u8>>,
     events: &mpsc::Sender<Event>,
+    heard: &broadcast::Sender<Heard>,
     connected: &AtomicBool,
 ) -> Ended {
     loop {
@@ -461,6 +596,9 @@ async fn run_connection<T: Transport>(
             incoming = transport.recv() => {
                 match incoming {
                     Ok(Received { bytes, source }) => {
+                        // Republished for any scenario waiting on this link.
+                        // An error only means nobody is listening.
+                        let _ = heard.send((id.clone(), bytes.clone()));
                         let _ = events
                             .send(Event::FrameReceived { id: id.clone(), bytes, source, timestamp: SystemTime::now() })
                             .await;

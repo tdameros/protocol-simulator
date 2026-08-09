@@ -93,7 +93,22 @@ impl SimApp {
         self.snapshot(theme) != self.saved
     }
 
+    /// Silences the engine before the window is given something else to show.
+    ///
+    /// A scenario lives in the engine, not in `AppState`, so replacing the
+    /// state would leave it running against links that are about to close,
+    /// reporting an error per send, with nothing on screen offering to stop it.
+    fn stop_everything(&mut self) {
+        for name in std::mem::take(&mut self.state.running).into_keys() {
+            self.engine.stop_scenario(name);
+        }
+        for (id, _) in std::mem::take(&mut self.state.connections) {
+            self.engine.disconnect(id);
+        }
+    }
+
     fn open(&mut self, ctx: &Context, path: &Path) {
+        self.stop_everything();
         let loaded = Project::read(path).and_then(|project| {
             let restored = project.apply(&mut self.state, Some(path))?;
             Ok(restored)
@@ -122,9 +137,7 @@ impl SimApp {
     }
 
     fn start_new(&mut self, ctx: &Context) {
-        for (id, _) in std::mem::take(&mut self.state.connections) {
-            self.engine.disconnect(id);
-        }
+        self.stop_everything();
         self.state = AppState::default();
         let mut monitors = BTreeMap::new();
         self.dock_state = project::default_layout(&mut monitors);
@@ -242,6 +255,19 @@ impl SimApp {
                 Event::Error { id, error } => {
                     self.state.record_error(id, &error);
                 }
+                Event::ScenarioStep { name, step, pass } => {
+                    self.state
+                        .running
+                        .insert(name, crate::state::ScenarioRun { step, pass });
+                }
+                Event::ScenarioFinished { name, outcome } => {
+                    self.state.running.remove(&name);
+                    // A scenario that gave up says why, where a scenario that
+                    // simply ran out has nothing to report.
+                    if let sim_core::Outcome::Failed(reason) = outcome {
+                        self.state.last_error = Some(format!("[{name}] {reason}"));
+                    }
+                }
             }
         }
     }
@@ -354,6 +380,7 @@ impl SimApp {
         for (tab, label) in [
             (Tab::Connections, "Connections"),
             (Tab::FrameEditor, "Frames"),
+            (Tab::Scenarios, "Scenarios"),
             (Tab::HexInject, "Hex Inject"),
         ] {
             self.reveal_entry(ui, tab, label);

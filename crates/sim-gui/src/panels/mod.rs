@@ -2,6 +2,7 @@ pub mod connections;
 pub mod frame_editor;
 pub mod hex_inject;
 pub mod live_monitor;
+pub mod scenario_list;
 
 use egui::{Color32, Layout, Response, TextStyle, Ui, WidgetText};
 use egui_dock::tab_viewer::OnCloseResponse;
@@ -17,6 +18,7 @@ pub enum Tab {
     LiveMonitor(MonitorId),
     HexInject,
     FrameEditor,
+    Scenarios,
 }
 
 pub struct AppTabViewer<'a> {
@@ -83,6 +85,7 @@ impl TabViewer for AppTabViewer<'_> {
                 .into(),
             Tab::HexInject => "Hex Inject".into(),
             Tab::FrameEditor => "Frames".into(),
+            Tab::Scenarios => "Scenarios".into(),
         }
     }
 
@@ -102,6 +105,7 @@ impl TabViewer for AppTabViewer<'_> {
             Tab::LiveMonitor(id) => live_monitor::show(ui, self.state, *id),
             Tab::HexInject => hex_inject::show(ui, self.state, self.engine),
             Tab::FrameEditor => frame_editor::show(ui, self.state, self.engine),
+            Tab::Scenarios => scenario_list::show(ui, self.state, self.engine),
         }
     }
 

@@ -1,0 +1,56 @@
+# A scenario is an ordered list of steps run against one or more connections.
+#
+# Several scenarios can run at once. That is where concurrency comes from:
+# there are no parallel tracks inside a file. Background telemetry alongside a
+# boot sequence is two scenarios, not one scenario with two lanes.
+
+[[scenario]]
+name = "Boot sequence"
+description = "Wakes the board, waits for its acknowledgement, then arms it"
+# The connection every step acts on unless it says otherwise. It has to match a
+# connection name from the project.
+on = "bus"
+
+# `send` names a frame from the frames folder. `with` overrides its declared
+# defaults, field by field; anything left out keeps the default from the .toml.
+[[scenario.step]]
+send = "Status"
+with = { mode = 1, error_code = 0 }
+
+# `wait_for` holds until a frame matching the pattern arrives on this step's
+# connection. `??` stands for any byte. Leaving `at` out looks anywhere in the
+# frame; setting it pins the pattern to that offset.
+#
+# The timeout is a failure, not a shrug: when it expires the scenario stops and
+# says which step gave up.
+[[scenario.step]]
+wait_for = { hex = "AA 55 ?? 01", at = 0, timeout_ms = 500 }
+
+# `wait_ms` is a plain pause. Expect millisecond resolution at best: this is a
+# desktop timer, not a real-time clock.
+[[scenario.step]]
+wait_ms = 50
+
+# `raw` sends bytes as they are, bypassing the frame definitions. It is how you
+# reproduce a deliberately malformed frame that no definition would let you
+# express.
+[[scenario.step]]
+raw = "AA 55 00 FF"
+
+# A step can act on another link than the scenario's default, which is what
+# makes a scenario able to speak to two sides of the same exchange.
+[[scenario.step]]
+send = "Status"
+with = { mode = 2 }
+on = "uart"
+
+# `on` also takes a list, at either level. The same bytes then go out on every
+# link named, in one step, so two buses carrying the same simulated device see
+# the same counter on the same pass.
+#
+# A `wait_for` aimed at several is stricter than a send: it holds until *every*
+# one of them has answered, and the timeout says which stayed silent.
+[[scenario.step]]
+send = "Status"
+with = { mode = 3 }
+on = ["bus", "uart"]
