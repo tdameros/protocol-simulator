@@ -778,3 +778,177 @@ raw = "00"
         assert!(round < 2, "both rounds ran");
     }
 }
+
+/// One step, two links: the same bytes go out on both, and a `wait_for` aimed
+/// at both is only satisfied once each has answered.
+#[tokio::test]
+async fn a_step_can_drive_two_links_at_once() {
+    let (tx, mut rx) = Engine::spawn();
+
+    // Two independent loopback pairs, so "uart" and "udp" are genuinely
+    // separate links with their own far side.
+    let pairs = [
+        ("uart", 19841, "uart-peer", 19842),
+        ("udp", 19843, "udp-peer", 19844),
+    ];
+    for (near, near_port, far, far_port) in pairs {
+        for (name, bind, remote) in [(near, near_port, far_port), (far, far_port, near_port)] {
+            tx.send(Command::Connect {
+                id: ConnectionId::from(name),
+                config: TransportConfig::Udp {
+                    bind: format!("127.0.0.1:{bind}").parse().unwrap(),
+                    remote: format!("127.0.0.1:{remote}").parse().unwrap(),
+                },
+                retry: None,
+            })
+            .await
+            .unwrap();
+        }
+    }
+    wait_all_connected(&mut rx, &["uart", "uart-peer", "udp", "udp-peer"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Both"
+on = ["uart", "udp"]
+
+[[scenario.step]]
+raw = "AA 55"
+
+[[scenario.step]]
+wait_for = { hex = "C0 FE", timeout_ms = 4000 }
+
+[[scenario.step]]
+raw = "99"
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    // Step one reached both far sides with the same bytes.
+    gather_until(&mut rx, |events| {
+        ["uart-peer", "udp-peer"].iter().all(|peer| {
+            events.iter().any(|event| {
+                matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == *peer && bytes == &[0xAA, 0x55])
+            })
+        })
+    })
+    .await;
+
+    // Only one side answers, so the wait must hold: the step after it has not
+    // run, which is what "all of them" means.
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("uart-peer"),
+        bytes: vec![0xC0, 0xFE],
+    })
+    .await
+    .unwrap();
+    wait_for(&mut rx, |event| {
+        matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == "uart" && bytes == &[0xC0, 0xFE])
+    })
+    .await;
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            wait_for(&mut rx, |event| matches!(
+                event,
+                Event::FrameReceived { bytes, .. } if bytes == &[0x99]
+            ))
+        )
+        .await
+        .is_err(),
+        "one answer out of two must not release the wait"
+    );
+
+    // The second answer releases it, and the last step runs on both links.
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("udp-peer"),
+        bytes: vec![0xC0, 0xFE],
+    })
+    .await
+    .unwrap();
+    gather_until(&mut rx, |events| {
+        ["uart-peer", "udp-peer"].iter().all(|peer| {
+            events.iter().any(|event| {
+                matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == *peer && bytes == &[0x99])
+            })
+        }) && finished_with(events, "Both", &sim_core::Outcome::Completed)
+    })
+    .await;
+}
+
+/// A wait aimed at two links that only one answers fails, and says which one
+/// stayed silent.
+#[tokio::test]
+async fn a_partial_answer_times_out_naming_who_is_missing() {
+    let (tx, mut rx) = Engine::spawn();
+
+    for (name, bind, remote) in [
+        ("left", 19845, 19846),
+        ("left-peer", 19846, 19845),
+        ("right", 19847, 19848),
+    ] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp {
+                bind: format!("127.0.0.1:{bind}").parse().unwrap(),
+                remote: format!("127.0.0.1:{remote}").parse().unwrap(),
+            },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["left", "left-peer", "right"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Both must answer"
+on = ["left", "right"]
+
+[[scenario.step]]
+wait_for = { hex = "C0 FE", timeout_ms = 300 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("left-peer"),
+        bytes: vec![0xC0, 0xFE],
+    })
+    .await
+    .unwrap();
+
+    let event = wait_for(
+        &mut rx,
+        |event| matches!(event, Event::ScenarioFinished { name, .. } if name == "Both must answer"),
+    )
+    .await;
+
+    let Event::ScenarioFinished { outcome, .. } = event else {
+        panic!("expected the scenario to finish");
+    };
+    let sim_core::Outcome::Failed(reason) = outcome else {
+        panic!("a half answer is a failure, got {outcome:?}");
+    };
+    // Names what is still missing, not what was asked for.
+    assert!(reason.contains("right"), "{reason}");
+    assert!(!reason.contains("left"), "{reason}");
+}

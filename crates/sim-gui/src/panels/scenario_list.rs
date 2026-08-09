@@ -215,7 +215,9 @@ fn steps(ui: &mut Ui, state: &AppState, scenario: &Scenario) {
 
                         let text = RichText::new(describe(step));
                         ui.label(if live { text.strong() } else { text });
-                        ui.label(RichText::new(step.connection.0.clone()).weak());
+                        let targets: Vec<&str> =
+                            step.targets.iter().map(|id| id.0.as_str()).collect();
+                        ui.label(RichText::new(targets.join(", ")).weak());
                         ui.end_row();
                     }
                 });

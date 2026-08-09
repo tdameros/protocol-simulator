@@ -64,6 +64,10 @@ with = { mode = 1 }
 counters = { seq = { wrap = 255 } }
 ```
 
+`on` names the connection a step acts on, and takes a list as readily as a
+single name, so one step can drive a serial port and a UDP socket together. A
+`wait_for` aimed at several waits until every one of them has answered.
+
 They live in their own folder beside the frames, one or more per file, and the
 project remembers where. `examples/scenarios` holds documented examples.
 

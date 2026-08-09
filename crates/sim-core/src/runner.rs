@@ -10,7 +10,7 @@
 //! the engine's own loop alive after the last real caller has gone, since the
 //! loop stops when its command channel closes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
@@ -130,13 +130,15 @@ async fn execute(
             tokio::time::sleep(*delay).await;
             StepResult::Done
         }
-        Action::Raw { bytes } => send(commands, &step.connection, bytes.clone()).await,
+        Action::Raw { bytes } => send_to_all(commands, &step.targets, bytes).await,
         Action::Send {
             frame,
             with,
             counters,
         } => match encode(frame, with, counters, pass, frames) {
-            Ok(bytes) => send(commands, &step.connection, bytes).await,
+            // The same bytes to every target, so two links carrying the same
+            // simulated device see the same counter on the same pass.
+            Ok(bytes) => send_to_all(commands, &step.targets, &bytes).await,
             Err(reason) => StepResult::Failed(reason),
         },
         Action::WaitFor {
@@ -144,12 +146,15 @@ async fn execute(
             anchor,
             timeout,
         } => {
+            // Every target has to answer, so each one is struck off as it does
+            // and the wait ends when none is left.
+            let mut pending: HashSet<&ConnectionId> = step.targets.iter().collect();
             let waiting = async {
-                loop {
+                while !pending.is_empty() {
                     match received.recv().await {
                         Ok((id, bytes)) => {
-                            if id == step.connection && pattern.found_in(&bytes, *anchor) {
-                                return true;
+                            if pattern.found_in(&bytes, *anchor) {
+                                pending.remove(&id);
                             }
                         }
                         // Frames arrived faster than this step could look at
@@ -160,15 +165,18 @@ async fn execute(
                         Err(broadcast::error::RecvError::Closed) => return false,
                     }
                 }
+                true
             };
 
             match timeout {
                 Some(limit) => match tokio::time::timeout(*limit, waiting).await {
                     Ok(true) => StepResult::Done,
                     Ok(false) => StepResult::Stopped,
+                    // Names what is still missing, not what was asked for: on
+                    // several links, which one stayed silent is the answer.
                     Err(_) => StepResult::Failed(format!(
                         "no matching frame on {} within {} ms",
-                        step.connection,
+                        join(&pending),
                         limit.as_millis()
                     )),
                 },
@@ -177,6 +185,27 @@ async fn execute(
             }
         }
     }
+}
+
+/// Sorted, so a message naming several links reads the same twice running.
+fn join(ids: &HashSet<&ConnectionId>) -> String {
+    let mut names: Vec<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+    names.sort_unstable();
+    names.join(", ")
+}
+
+async fn send_to_all(
+    commands: &mpsc::WeakSender<Command>,
+    targets: &[ConnectionId],
+    bytes: &[u8],
+) -> StepResult {
+    for id in targets {
+        match send(commands, id, bytes.to_vec()).await {
+            StepResult::Done => {}
+            other => return other,
+        }
+    }
+    StepResult::Done
 }
 
 async fn send(

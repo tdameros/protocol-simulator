@@ -43,3 +43,14 @@ raw = "AA 55 00 FF"
 send = "Status"
 with = { mode = 2 }
 on = "uart"
+
+# `on` also takes a list, at either level. The same bytes then go out on every
+# link named, in one step, so two buses carrying the same simulated device see
+# the same counter on the same pass.
+#
+# A `wait_for` aimed at several is stricter than a send: it holds until *every*
+# one of them has answered, and the timeout says which stayed silent.
+[[scenario.step]]
+send = "Status"
+with = { mode = 3 }
+on = ["bus", "uart"]

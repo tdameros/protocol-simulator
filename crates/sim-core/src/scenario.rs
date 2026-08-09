@@ -108,8 +108,12 @@ pub struct Repeat {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
-    /// The link this acts on, already resolved from the scenario's default.
-    pub connection: ConnectionId,
+    /// The links this acts on, already resolved from the scenario's default.
+    ///
+    /// Never empty, and never holding the same link twice: a step aimed at
+    /// `["uart", "uart"]` would otherwise send everything in duplicate, and a
+    /// wait would be counting one answer as two.
+    pub targets: Vec<ConnectionId>,
     pub action: Action,
 }
 
@@ -131,7 +135,11 @@ pub enum Action {
     Wait {
         delay: Duration,
     },
-    /// Hold until a frame matching `pattern` arrives on the step's connection.
+    /// Hold until a frame matching `pattern` has arrived on *every* target.
+    ///
+    /// All rather than the first: aimed at one link the two readings agree, and
+    /// aimed at several the strict one is the one worth writing down, since it
+    /// turns the timeout into a test that every side answered.
     WaitFor {
         pattern: crate::pattern::HexPattern,
         anchor: crate::pattern::Anchor,
@@ -184,9 +192,9 @@ struct RawScenario {
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
-    /// Connection every step acts on unless it says otherwise.
+    /// Connections every step acts on unless it says otherwise.
     #[serde(default, rename = "on", skip_serializing_if = "Option::is_none")]
-    connection: Option<String>,
+    connection: Option<RawTargets>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repeat: Option<RawRepeat>,
     #[serde(default, rename = "step")]
@@ -201,10 +209,31 @@ struct RawRepeat {
     times: Option<u32>,
 }
 
+/// One link or several, written whichever way reads better on the day.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RawTargets {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RawTargets {
+    /// The names it holds, trimmed, with the blank ones dropped.
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Self::One(name) => vec![name.trim()],
+            Self::Many(names) => names.iter().map(|name| name.trim()).collect(),
+        }
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawStep {
     #[serde(default, rename = "on", skip_serializing_if = "Option::is_none")]
-    connection: Option<String>,
+    connection: Option<RawTargets>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     send: Option<String>,
@@ -278,15 +307,15 @@ fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
 
     let default = raw
         .connection
-        .as_deref()
-        .map(str::trim)
-        .filter(|connection| !connection.is_empty());
+        .as_ref()
+        .map(RawTargets::names)
+        .unwrap_or_default();
     let steps = raw
         .steps
         .into_iter()
         .enumerate()
         .map(|(index, step)| {
-            build_step(step, default).map_err(|reason| ScenarioError::Step {
+            build_step(step, &default).map_err(|reason| ScenarioError::Step {
                 name: name.clone(),
                 // Counted from one: the file is read by people, and the first
                 // step is the first one.
@@ -307,7 +336,7 @@ fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
     })
 }
 
-fn build_step(raw: RawStep, default: Option<&str>) -> Result<Step, StepError> {
+fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
     let chosen = usize::from(raw.send.is_some())
         + usize::from(raw.raw.is_some())
         + usize::from(raw.wait_ms.is_some())
@@ -361,20 +390,21 @@ fn build_step(raw: RawStep, default: Option<&str>) -> Result<Step, StepError> {
         return Err(StepError::Empty);
     };
 
-    // A wait needs no link, but giving it the default costs nothing and keeps
-    // every step answering the same question.
-    let connection = raw
-        .connection
-        .as_deref()
-        .map(str::trim)
-        .filter(|connection| !connection.is_empty())
-        .or(default)
-        .ok_or(StepError::NoConnection)?;
+    let named = raw.connection.as_ref().map(RawTargets::names);
+    let chosen = named.as_deref().unwrap_or(default);
 
-    Ok(Step {
-        connection: ConnectionId(connection.to_owned()),
-        action,
-    })
+    let mut targets: Vec<ConnectionId> = Vec::new();
+    for name in chosen {
+        let id = ConnectionId((*name).to_owned());
+        if !targets.contains(&id) {
+            targets.push(id);
+        }
+    }
+    if targets.is_empty() {
+        return Err(StepError::NoConnection);
+    }
+
+    Ok(Step { targets, action })
 }
 
 fn parse_bytes(text: &str) -> Option<Vec<u8>> {
@@ -438,7 +468,7 @@ counters = { seq = { wrap = 255 } }
         assert!(scenario.repeat.is_none(), "one pass unless asked");
         assert_eq!(scenario.steps.len(), 4);
 
-        assert_eq!(scenario.steps[0].connection, ConnectionId::from("bus"));
+        assert_eq!(scenario.steps[0].targets, [ConnectionId::from("bus")]);
         assert!(matches!(
             &scenario.steps[0].action,
             Action::Send { frame, with, .. }
@@ -451,7 +481,7 @@ counters = { seq = { wrap = 255 } }
         ));
 
         // A step may act on another link than the scenario's default.
-        assert_eq!(scenario.steps[2].connection, ConnectionId::from("uart"));
+        assert_eq!(scenario.steps[2].targets, [ConnectionId::from("uart")]);
         assert!(matches!(
             &scenario.steps[2].action,
             Action::Raw { bytes } if bytes == &[0xDE, 0xAD, 0xBE, 0xEF]
@@ -462,7 +492,7 @@ counters = { seq = { wrap = 255 } }
             Action::Wait { delay } if delay == Duration::from_millis(100)
         ));
         // And falls back to the default when it says nothing.
-        assert_eq!(scenario.steps[3].connection, ConnectionId::from("bus"));
+        assert_eq!(scenario.steps[3].targets, [ConnectionId::from("bus")]);
     }
 
     #[test]
@@ -524,6 +554,56 @@ counters = { seq = { wrap = 255 } }
                 wrap: Some(255)
             }
         );
+    }
+
+    #[test]
+    fn a_step_can_aim_at_several_links_at_once() {
+        let scenario = one(r#"
+[[scenario]]
+name = "Both buses"
+on = ["uart", "udp"]
+
+[[scenario.step]]
+send = "Telemetry"
+
+[[scenario.step]]
+raw = "AA55"
+on = "uart"
+
+[[scenario.step]]
+wait_for = { hex = "C0FE" }
+on = ["udp", "uart", "udp"]
+"#);
+
+        // The scenario default reaches every step that says nothing.
+        assert_eq!(
+            scenario.steps[0].targets,
+            [ConnectionId::from("uart"), ConnectionId::from("udp")]
+        );
+        // A single name still works, and still overrides the default.
+        assert_eq!(scenario.steps[1].targets, [ConnectionId::from("uart")]);
+        // Order is kept, and a name repeated by accident counted once: sending
+        // twice down one link, or waiting for two answers from it, is never
+        // what the list meant.
+        assert_eq!(
+            scenario.steps[2].targets,
+            [ConnectionId::from("udp"), ConnectionId::from("uart")]
+        );
+    }
+
+    #[test]
+    fn an_empty_list_of_links_is_no_list_at_all() {
+        let error = from_toml(
+            r#"
+[[scenario]]
+name = "Nowhere"
+on = ["  "]
+[[scenario.step]]
+raw = "00"
+"#,
+        )
+        .expect_err("a blank name is not a connection");
+        assert!(error.to_string().contains("no connection"), "{error}");
     }
 
     #[test]
