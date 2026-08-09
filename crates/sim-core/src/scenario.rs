@@ -14,6 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use toml_edit::Item;
 
 use crate::connection::ConnectionId;
 use crate::frame::value::Value;
@@ -36,6 +37,12 @@ pub enum ScenarioError {
 
     #[error("cannot lay out the scenario: {0}")]
     Reparse(toml_edit::TomlError),
+
+    #[error("no scenario named {name} in this file")]
+    NotInFile { name: String },
+
+    #[error("this file's `scenario` key is not a list of scenarios")]
+    NotScenarios,
 
     #[error("a scenario needs a name")]
     Unnamed,
@@ -425,6 +432,234 @@ pub fn to_toml(scenarios: &[Scenario]) -> Result<String, ScenarioError> {
     }
 
     Ok(document.to_string())
+}
+
+/// Replaces one scenario inside a file, leaving everything around it alone.
+///
+/// This is the path the editor takes for a file that already exists. The whole
+/// document is kept and only the entry named `name` is rewritten, key by key,
+/// so the comments a developer wrote survive a technician pressing Save.
+///
+/// `name` is the name the scenario had *in the file*, which is not necessarily
+/// the one it has now: renaming is an edit like any other.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML, holds no `scenario` array,
+/// or holds no scenario of that name.
+pub fn update_in(text: &str, name: &str, scenario: &Scenario) -> Result<String, ScenarioError> {
+    let mut document = parse_document(text)?;
+    let fresh = as_table(scenario)?;
+
+    let entries = array_of_scenarios(&mut document)?;
+    let existing = entries
+        .iter_mut()
+        .find(|entry| entry.get("name").and_then(Item::as_str) == Some(name))
+        .ok_or_else(|| ScenarioError::NotInFile {
+            name: name.to_owned(),
+        })?;
+
+    merge(existing, &fresh);
+    Ok(document.to_string())
+}
+
+/// Adds a scenario at the end of a file, or creates the file's array if it has
+/// none yet.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML or its `scenario` key is
+/// something other than an array of scenarios.
+pub fn append_to(text: &str, scenario: &Scenario) -> Result<String, ScenarioError> {
+    let mut document = parse_document(text)?;
+    let mut fresh = as_table(scenario)?;
+
+    // Without a position of its own, a new section is written wherever
+    // `toml_edit` happens to reach it, which for a scenario means landing
+    // between an earlier one and its own `[[scenario.step]]` sections. Those
+    // steps would then belong to the newcomer, and the scenario above it would
+    // silently lose them.
+    let mut next = last_position(&document);
+    place_after(&mut fresh, &mut next);
+
+    array_of_scenarios(&mut document)?.push(fresh);
+    Ok(document.to_string())
+}
+
+/// The position of the last section in the document.
+fn last_position(document: &toml_edit::DocumentMut) -> isize {
+    fn scan(table: &toml_edit::Table, best: &mut isize) {
+        if let Some(position) = table.position() {
+            *best = (*best).max(position);
+        }
+        for (_, item) in table {
+            match item {
+                Item::Table(inner) => scan(inner, best),
+                Item::ArrayOfTables(entries) => {
+                    for entry in entries {
+                        scan(entry, best);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut best = 0;
+    scan(document.as_table(), &mut best);
+    best
+}
+
+/// Sends a table and everything nested inside it to the end of the document,
+/// in the order they are written.
+fn place_after(table: &mut toml_edit::Table, next: &mut isize) {
+    *next += 1;
+    table.set_position(Some(*next));
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(inner) => place_after(inner, next),
+            Item::ArrayOfTables(entries) => {
+                for entry in entries.iter_mut() {
+                    place_after(entry, next);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Takes a scenario out of a file.
+///
+/// # Errors
+///
+/// As [`update_in`].
+pub fn remove_from(text: &str, name: &str) -> Result<String, ScenarioError> {
+    let mut document = parse_document(text)?;
+    let entries = array_of_scenarios(&mut document)?;
+
+    let found = entries
+        .iter()
+        .position(|entry| entry.get("name").and_then(Item::as_str) == Some(name))
+        .ok_or_else(|| ScenarioError::NotInFile {
+            name: name.to_owned(),
+        })?;
+    entries.remove(found);
+    Ok(document.to_string())
+}
+
+fn parse_document(text: &str) -> Result<toml_edit::DocumentMut, ScenarioError> {
+    text.parse().map_err(ScenarioError::Reparse)
+}
+
+fn array_of_scenarios(
+    document: &mut toml_edit::DocumentMut,
+) -> Result<&mut toml_edit::ArrayOfTables, ScenarioError> {
+    document
+        .entry("scenario")
+        .or_insert(Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .ok_or(ScenarioError::NotScenarios)
+}
+
+/// One scenario laid out on its own, to be merged into a document.
+fn as_table(scenario: &Scenario) -> Result<toml_edit::Table, ScenarioError> {
+    let rendered = to_toml(std::slice::from_ref(scenario))?;
+    parse_document(&rendered)?
+        .get("scenario")
+        .and_then(Item::as_array_of_tables)
+        .and_then(|entries| entries.get(0).cloned())
+        .ok_or(ScenarioError::NotScenarios)
+}
+
+/// Copies `from` over `into`, key by key rather than wholesale.
+///
+/// Replacing the item under a key leaves the key itself in place, and a comment
+/// written above a setting belongs to the key, which is what makes this
+/// preserve them where a straight assignment would not.
+fn merge(into: &mut toml_edit::Table, from: &toml_edit::Table) {
+    let stale: Vec<String> = into
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .filter(|key| key != "step" && from.get(key).is_none())
+        .collect();
+    for key in stale {
+        into.remove(&key);
+    }
+
+    for (key, item) in from {
+        if key == "step" {
+            continue;
+        }
+        match into.get_mut(key) {
+            Some(slot) => *slot = item.clone(),
+            None => {
+                into.insert(key, item.clone());
+            }
+        }
+    }
+
+    merge_steps(into, from);
+}
+
+/// Steps are matched by position, there being nothing else to match them by.
+///
+/// A step edited in place keeps whatever was written above it. A step inserted
+/// or removed in the middle shifts the comments below it by one, which is the
+/// price of keeping them at all rather than dropping the lot.
+fn merge_steps(into: &mut toml_edit::Table, from: &toml_edit::Table) {
+    let Some(wanted) = from.get("step").and_then(Item::as_array_of_tables) else {
+        into.remove("step");
+        return;
+    };
+
+    if into
+        .get("step")
+        .and_then(Item::as_array_of_tables)
+        .is_none()
+    {
+        into.insert("step", Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    }
+    let Some(existing) = into.get_mut("step").and_then(Item::as_array_of_tables_mut) else {
+        return;
+    };
+
+    while existing.len() > wanted.len() {
+        existing.remove(existing.len() - 1);
+    }
+    // A step appended to a scenario needs a position for the same reason a
+    // scenario does, or it is written above the ones already there.
+    let mut next = existing
+        .iter()
+        .filter_map(toml_edit::Table::position)
+        .max()
+        .unwrap_or(0);
+    for (index, step) in wanted.iter().enumerate() {
+        if let Some(slot) = existing.get_mut(index) {
+            merge_step(slot, step);
+        } else {
+            let mut fresh = step.clone();
+            place_after(&mut fresh, &mut next);
+            existing.push(fresh);
+        }
+    }
+}
+
+fn merge_step(into: &mut toml_edit::Table, from: &toml_edit::Table) {
+    let stale: Vec<String> = into
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .filter(|key| from.get(key).is_none())
+        .collect();
+    for key in stale {
+        into.remove(&key);
+    }
+    for (key, item) in from {
+        match into.get_mut(key) {
+            Some(slot) => *slot = item.clone(),
+            None => {
+                into.insert(key, item.clone());
+            }
+        }
+    }
 }
 
 /// Puts an array back on one line. Two connection names do not need four.
@@ -1044,6 +1279,126 @@ raw = "00"
         )
         .expect("should serialise");
         assert!(many.contains(r#"on = ["bus", "uart"]"#), "{many}");
+    }
+
+    const COMMENTED: &str = r#"# What this file is for, and who wrote it.
+# Second line of that.
+
+[[scenario]]
+# Why this scenario exists at all.
+name = "Boot"
+description = "The one with comments"
+on = "bus"
+
+[[scenario.step]]
+# This step has to come first, and here is the reason.
+raw = "00"
+
+[[scenario.step]]
+wait_ms = 50
+
+[[scenario]]
+# A neighbour that must not be touched.
+name = "Other"
+on = "bus"
+
+[[scenario.step]]
+raw = "FF"
+"#;
+
+    #[test]
+    fn editing_one_scenario_leaves_every_comment_where_it_was() {
+        let mut scenarios = from_toml(COMMENTED).expect("should parse");
+        let boot = &mut scenarios[0];
+        boot.description = Some("Edited by the panel".to_owned());
+        let Action::Raw { bytes } = &mut boot.steps[0].action else {
+            panic!("expected a raw step");
+        };
+        *bytes = vec![0x01];
+        let Action::Wait { delay } = &mut boot.steps[1].action else {
+            panic!("expected a delay");
+        };
+        *delay = Duration::from_millis(75);
+
+        let written = update_in(COMMENTED, "Boot", boot).expect("should update");
+
+        for comment in [
+            "# What this file is for, and who wrote it.",
+            "# Second line of that.",
+            "# Why this scenario exists at all.",
+            "# This step has to come first, and here is the reason.",
+            "# A neighbour that must not be touched.",
+        ] {
+            assert!(written.contains(comment), "lost {comment}:\n{written}");
+        }
+
+        // The edits landed.
+        assert!(
+            written.contains(r#"description = "Edited by the panel""#),
+            "{written}"
+        );
+        assert!(written.contains(r#"raw = "01""#), "{written}");
+        assert!(written.contains("wait_ms = 75"), "{written}");
+        assert!(!written.contains("wait_ms = 50"), "{written}");
+
+        // The neighbour is untouched, and the whole thing still reads back.
+        assert!(written.contains(r#"raw = "FF""#), "{written}");
+        let back = from_toml(&written).expect("what it wrote, it can read");
+        assert_eq!(back[0], *boot);
+        assert_eq!(back[1], scenarios[1]);
+    }
+
+    #[test]
+    fn a_step_added_or_removed_keeps_the_rest_of_the_file() {
+        let mut scenarios = from_toml(COMMENTED).expect("should parse");
+        let boot = &mut scenarios[0];
+        boot.steps.push(Step {
+            targets: vec![ConnectionId::from("bus")],
+            action: Action::Raw { bytes: vec![0xEE] },
+        });
+        let written = update_in(COMMENTED, "Boot", boot).expect("should update");
+        assert!(written.contains("# What this file is for"), "{written}");
+        assert!(written.contains(r#"raw = "EE""#), "{written}");
+        // At the end, not wherever the writer happened to reach it.
+        let grown = from_toml(&written).expect("reads back");
+        assert_eq!(grown[0].steps.len(), 3);
+        assert!(matches!(
+            &grown[0].steps[2].action,
+            Action::Raw { bytes } if bytes == &[0xEE]
+        ));
+        assert_eq!(grown[1].steps.len(), 1, "the neighbour keeps its own");
+
+        boot.steps.truncate(1);
+        let shorter = update_in(COMMENTED, "Boot", boot).expect("should update");
+        assert!(!shorter.contains("wait_ms"), "{shorter}");
+        assert_eq!(from_toml(&shorter).expect("reads back")[0].steps.len(), 1);
+    }
+
+    #[test]
+    fn a_scenario_can_be_added_to_a_file_or_taken_out_of_one() {
+        let extra = one(TELEMETRY);
+        let grown = append_to(COMMENTED, &extra).expect("should append");
+        assert!(grown.contains("# What this file is for"), "{grown}");
+        assert_eq!(from_toml(&grown).expect("reads back").len(), 3);
+
+        let shrunk = remove_from(&grown, "Other").expect("should remove");
+        let left = from_toml(&shrunk).expect("reads back");
+        assert_eq!(
+            left.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Boot", "Telemetry 10 Hz"]
+        );
+        // Taking one out does not disturb what surrounds it.
+        assert!(
+            shrunk.contains("# Why this scenario exists at all."),
+            "{shrunk}"
+        );
+    }
+
+    #[test]
+    fn editing_something_the_file_does_not_hold_is_refused() {
+        let scenario = one(TELEMETRY);
+        assert!(update_in(COMMENTED, "Nowhere", &scenario).is_err());
+        assert!(remove_from(COMMENTED, "Nowhere").is_err());
     }
 
     #[test]
