@@ -33,8 +33,12 @@ test: ## Run every test in the workspace
 test-core: ## Run sim-core tests only (includes the UDP/TCP integration tests)
 	cargo test -p $(CORE_PKG)
 
-clippy: ## Lint the whole workspace (build + tests)
-	cargo clippy --workspace --all-targets
+# Word for word what .github/workflows/ci.yml runs. Without `-D warnings` this
+# target printed its complaints and exited 0, so `make ci` went green on code
+# the CI then refused: a gate that lets everything through is worse than none,
+# because it is trusted.
+clippy: ## Lint the whole workspace (build + tests), failing on any warning
+	cargo clippy --workspace --all-targets -- -D warnings
 
 clippy-fix: ## Apply automatic clippy fixes where possible
 	cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged
