@@ -71,6 +71,18 @@ pub enum StepError {
     #[error("{hex} is not a usable byte pattern")]
     BadPattern { hex: String },
 
+    #[error("a wait needs either hex bytes or a frame to match, not both")]
+    AmbiguousWait,
+
+    #[error("a wait needs either hex bytes or a frame to match")]
+    EmptyWait,
+
+    #[error("matching a frame needs at least one field, or it matches on nothing")]
+    NoFieldsToMatch,
+
+    #[error("`at` places a hex pattern, and means nothing when matching a frame")]
+    PointlessOffset,
+
     #[error("{hex} is not an even run of hex digits")]
     BadBytes { hex: String },
 }
@@ -97,7 +109,11 @@ impl Scenario {
             .steps
             .iter()
             .filter_map(|step| match &step.action {
-                Action::Send { frame, .. } => Some(frame.as_str()),
+                Action::Send { frame, .. }
+                | Action::WaitFor {
+                    expect: Expect::Frame { frame, .. },
+                    ..
+                } => Some(frame.as_str()),
                 _ => None,
             })
             .collect();
@@ -148,17 +164,33 @@ pub enum Action {
     Wait {
         delay: Duration,
     },
-    /// Hold until a frame matching `pattern` has arrived on *every* target.
+    /// Hold until a matching frame has arrived on *every* target.
     ///
     /// All rather than the first: aimed at one link the two readings agree, and
     /// aimed at several the strict one is the one worth writing down, since it
     /// turns the timeout into a test that every side answered.
     WaitFor {
-        pattern: crate::pattern::HexPattern,
-        anchor: crate::pattern::Anchor,
+        expect: Expect,
         /// Giving up is a scenario failure, not a silent pass.
         timeout: Option<Duration>,
     },
+}
+
+/// What a wait is watching for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expect {
+    /// Bytes spelled out, wildcards and all. What a developer writes.
+    Pattern {
+        pattern: crate::pattern::HexPattern,
+        anchor: crate::pattern::Anchor,
+    },
+    /// A frame from the library, matched on the fields that were named.
+    ///
+    /// Kept as the intent rather than as the bytes it stands for: a pattern
+    /// frozen at write time would go on claiming to describe the frame long
+    /// after someone had changed it. The bytes are worked out when the scenario
+    /// starts, against the definitions it was handed.
+    Frame { frame: String, fields: Vec<String> },
 }
 
 /// A field that carries a different number on every pass.
@@ -277,12 +309,22 @@ struct RawStep {
 /// Spelt out rather than flattening a `PatternSpec`, because serde refuses to
 /// police unknown keys on a struct that flattens another, and a typo here is
 /// exactly what needs catching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWaitFor {
-    hex: String,
+    /// The developer's way: bytes, wildcards and an offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     at: Option<usize>,
+
+    /// The technician's way, as the editor writes it: a frame and the fields
+    /// that have to match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frame: Option<String>,
+    #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
+    match_fields: Vec<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
 }
@@ -496,16 +538,22 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
             );
         }
         Action::Wait { delay } => raw.wait_ms = Some(as_millis(*delay)),
-        Action::WaitFor {
-            pattern,
-            anchor,
-            timeout,
-        } => {
-            raw.wait_for = Some(RawWaitFor {
-                hex: pattern.to_hex(),
-                at: anchor.offset(),
+        Action::WaitFor { expect, timeout } => {
+            let mut wait = RawWaitFor {
                 timeout_ms: timeout.map(as_millis),
-            });
+                ..RawWaitFor::default()
+            };
+            match expect {
+                Expect::Pattern { pattern, anchor } => {
+                    wait.hex = Some(pattern.to_hex());
+                    wait.at = anchor.offset();
+                }
+                Expect::Frame { frame, fields } => {
+                    wait.frame = Some(frame.clone());
+                    wait.match_fields.clone_from(fields);
+                }
+            }
+            raw.wait_for = Some(wait);
         }
     }
 
@@ -604,16 +652,34 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
             delay: Duration::from_millis(delay),
         }
     } else if let Some(wait) = raw.wait_for {
-        let spec = PatternSpec {
-            hex: wait.hex,
-            at: wait.at,
+        let expect = match (wait.hex, wait.frame) {
+            (Some(_), Some(_)) => return Err(StepError::AmbiguousWait),
+            (None, None) => return Err(StepError::EmptyWait),
+            (Some(hex), None) => {
+                if !wait.match_fields.is_empty() {
+                    return Err(StepError::AmbiguousWait);
+                }
+                let spec = PatternSpec { hex, at: wait.at };
+                let (pattern, anchor) = spec.compile().ok_or_else(|| StepError::BadPattern {
+                    hex: spec.hex.clone(),
+                })?;
+                Expect::Pattern { pattern, anchor }
+            }
+            (None, Some(frame)) => {
+                if wait.at.is_some() {
+                    return Err(StepError::PointlessOffset);
+                }
+                if wait.match_fields.is_empty() {
+                    return Err(StepError::NoFieldsToMatch);
+                }
+                Expect::Frame {
+                    frame,
+                    fields: wait.match_fields,
+                }
+            }
         };
-        let (pattern, anchor) = spec.compile().ok_or_else(|| StepError::BadPattern {
-            hex: spec.hex.clone(),
-        })?;
         Action::WaitFor {
-            pattern,
-            anchor,
+            expect,
             timeout: wait.timeout_ms.map(Duration::from_millis),
         }
     } else {
@@ -1143,6 +1209,72 @@ send = "Telemetry"
         )
         .expect_err("no default and no override");
         assert!(error.to_string().contains("no connection"), "{error}");
+    }
+
+    #[test]
+    fn a_wait_can_name_a_frame_instead_of_spelling_out_bytes() {
+        let scenario = one(r#"
+[[scenario]]
+name = "Answered"
+on = "bus"
+[[scenario.step]]
+wait_for = { frame = "Telemetry", match = ["sync", "mode"], timeout_ms = 500 }
+"#);
+        assert!(matches!(
+            &scenario.steps[0].action,
+            Action::WaitFor {
+                expect: Expect::Frame { frame, fields },
+                timeout: Some(_),
+            } if frame == "Telemetry" && fields == &["sync".to_owned(), "mode".to_owned()]
+        ));
+        // The frame it names is one the engine has to be handed.
+        assert_eq!(scenario.frames_used(), ["Telemetry"]);
+
+        round_trips(
+            r#"
+[[scenario]]
+name = "Answered"
+on = "bus"
+[[scenario.step]]
+wait_for = { frame = "Telemetry", match = ["sync"], timeout_ms = 500 }
+[[scenario.step]]
+wait_for = { hex = "C0 ?? FE", at = 1 }
+"#,
+        );
+    }
+
+    #[test]
+    fn a_wait_has_to_say_one_thing_or_the_other() {
+        for (label, text, expected) in [
+            (
+                "both",
+                r#"wait_for = { hex = "AA55", frame = "Telemetry", match = ["sync"] }"#,
+                "not both",
+            ),
+            ("neither", "wait_for = { timeout_ms = 10 }", "either hex"),
+            (
+                "hex with match",
+                r#"wait_for = { hex = "AA55", match = ["sync"] }"#,
+                "not both",
+            ),
+            (
+                "frame with no fields",
+                r#"wait_for = { frame = "Telemetry" }"#,
+                "at least one field",
+            ),
+            (
+                "frame with an offset",
+                r#"wait_for = { frame = "Telemetry", match = ["sync"], at = 0 }"#,
+                "means nothing when matching a frame",
+            ),
+        ] {
+            let text =
+                format!("[[scenario]]\nname = \"W\"\non = \"bus\"\n[[scenario.step]]\n{text}\n");
+            let error = from_toml(&text)
+                .expect_err(&format!("{label} should be refused"))
+                .to_string();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
     }
 
     #[test]

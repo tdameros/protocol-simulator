@@ -19,7 +19,8 @@ use crate::connection::ConnectionId;
 use crate::engine::{Command, Event};
 use crate::frame::value::{seed_values, Value};
 use crate::frame::{codec, FrameDef};
-use crate::scenario::{Action, Counter, Scenario, Step};
+use crate::pattern::{Anchor, HexPattern};
+use crate::scenario::{Action, Counter, Expect, Scenario, Step};
 
 /// A frame as it arrived, republished for whoever is waiting for one.
 ///
@@ -141,11 +142,15 @@ async fn execute(
             Ok(bytes) => send_to_all(commands, &step.targets, &bytes).await,
             Err(reason) => StepResult::Failed(reason),
         },
-        Action::WaitFor {
-            pattern,
-            anchor,
-            timeout,
-        } => {
+        Action::WaitFor { expect, timeout } => {
+            // Resolved here rather than at load, because turning a frame into
+            // bytes needs the definitions, and only a running scenario has
+            // them.
+            let (pattern, anchor) = match resolve(expect, frames) {
+                Ok(resolved) => resolved,
+                Err(reason) => return StepResult::Failed(reason),
+            };
+            let (pattern, anchor) = (&pattern, &anchor);
             // Started from where the stream is now, not from where the scenario
             // subscribed. Held across steps, the buffer would let a frame from
             // an earlier pass, or from before this wait was ever reached,
@@ -238,6 +243,52 @@ async fn send(
     {
         Ok(()) => StepResult::Done,
         Err(_) => StepResult::Stopped,
+    }
+}
+
+/// The bytes a wait is watching for.
+///
+/// A frame becomes a pattern by being encoded with its own defaults and then
+/// masked down to the fields that were named: everything else is free to be
+/// anything. Anchored at the start, a received frame beginning where the
+/// definition says it does.
+fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor), String> {
+    match expect {
+        Expect::Pattern { pattern, anchor } => Ok((pattern.clone(), *anchor)),
+        Expect::Frame { frame, fields } => {
+            let definition = frames
+                .iter()
+                .find(|known| &known.name == frame)
+                .ok_or_else(|| format!("no frame named {frame}"))?;
+
+            let mut keep = vec![false; definition.size()];
+            let mut offset = 0;
+            for declared in &definition.fields {
+                let width = declared.kind.size();
+                if fields.iter().any(|wanted| wanted == &declared.name) {
+                    for slot in keep.iter_mut().skip(offset).take(width) {
+                        *slot = true;
+                    }
+                }
+                offset += width;
+            }
+
+            // Named a field the frame does not have, which is worth saying
+            // rather than quietly matching on less than was asked for.
+            for wanted in fields {
+                if !definition
+                    .fields
+                    .iter()
+                    .any(|declared| &declared.name == wanted)
+                {
+                    return Err(format!("{frame} has no field named {wanted}"));
+                }
+            }
+
+            let bytes = codec::encode(definition, &seed_values(definition))
+                .map_err(|error| format!("{frame} cannot be encoded: {error}"))?;
+            Ok((HexPattern::masked(&bytes, &keep), Anchor::At(0)))
+        }
     }
 }
 

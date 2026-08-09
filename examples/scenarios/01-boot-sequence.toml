@@ -17,12 +17,20 @@ on = "bus"
 send = "Status"
 with = { mode = 1, error_code = 0 }
 
-# `wait_for` holds until a frame matching the pattern arrives on this step's
-# connection. `??` stands for any byte. Leaving `at` out looks anywhere in the
-# frame; setting it pins the pattern to that offset.
-#
+# `wait_for` holds until a matching frame arrives on this step's connection.
 # The timeout is a failure, not a shrug: when it expires the scenario stops and
 # says which step gave up.
+#
+# Two ways to say what to wait for. Naming a frame and the fields that have to
+# match is the readable one, and the one the editor writes: the bytes are worked
+# out from the definition when the scenario starts, so the wait keeps meaning
+# what it says even after someone edits the frame.
+[[scenario.step]]
+wait_for = { frame = "Status", match = ["mode"], timeout_ms = 500 }
+
+# Spelling out the bytes is the other way, for a reply no definition describes.
+# `??` stands for any byte. Leaving `at` out looks anywhere in the frame;
+# setting it pins the pattern to that offset. The two forms are exclusive.
 [[scenario.step]]
 wait_for = { hex = "AA 55 ?? 01", at = 0, timeout_ms = 500 }
 

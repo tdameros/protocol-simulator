@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use sim_core::scenario::{Action, Scenario, Step};
+use sim_core::scenario::{Action, Expect, Scenario, Step};
 
 use egui::{Color32, Grid, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
@@ -274,20 +274,23 @@ fn describe(step: &Step) -> String {
             format!("send raw {}", hex.join(" "))
         }
         Action::Wait { delay } => format!("wait {} ms", delay.as_millis()),
-        Action::WaitFor {
-            timeout, anchor, ..
-        } => {
-            let where_ = match anchor.offset() {
-                Some(offset) => format!(" at offset {offset}"),
-                None => String::new(),
+        Action::WaitFor { expect, timeout } => {
+            let mut text = match expect {
+                Expect::Frame { frame, fields } => {
+                    format!("wait for {frame} matching {}", fields.join(", "))
+                }
+                Expect::Pattern { pattern, anchor } => {
+                    let mut text = format!("wait for {}", pattern.to_hex());
+                    if let Some(offset) = anchor.offset() {
+                        let _ = write!(text, " at offset {offset}");
+                    }
+                    text
+                }
             };
-            match timeout {
-                Some(limit) => format!(
-                    "wait for a frame{where_}, giving up after {} ms",
-                    limit.as_millis()
-                ),
-                None => format!("wait for a frame{where_}"),
+            if let Some(limit) = timeout {
+                let _ = write!(text, ", giving up after {} ms", limit.as_millis());
             }
+            text
         }
     }
 }
@@ -414,6 +417,8 @@ raw = "AA 55"
 wait_ms = 40
 [[scenario.step]]
 wait_for = { hex = "C0 FE", at = 2, timeout_ms = 500 }
+[[scenario.step]]
+wait_for = { frame = "Telemetry", match = ["sync", "mode"] }
 "#,
         );
 
@@ -423,7 +428,8 @@ wait_for = { hex = "C0 FE", at = 2, timeout_ms = 500 }
         assert_eq!(lines[2], "wait 40 ms");
         assert_eq!(
             lines[3],
-            "wait for a frame at offset 2, giving up after 500 ms"
+            "wait for C0 FE at offset 2, giving up after 500 ms"
         );
+        assert_eq!(lines[4], "wait for Telemetry matching sync, mode");
     }
 }
