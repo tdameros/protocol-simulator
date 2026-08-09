@@ -1,12 +1,13 @@
 use std::fmt::Write as _;
+use std::time::Duration;
 
-use sim_core::scenario::{Action, Expect, Scenario, Step};
+use sim_core::scenario::{Action, Expect, Repeat, Scenario, Step};
 
-use egui::{Color32, Grid, RichText, ScrollArea, Ui};
+use egui::{Color32, DragValue, Grid, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
 
 use crate::engine_handle::EngineHandle;
-use crate::panels::widest;
+use crate::panels::{field_label, widest};
 use crate::state::AppState;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
@@ -19,7 +20,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         ui.colored_label(ERROR, format!("{file}: {reason}"));
     }
 
-    if state.scenarios.scenarios.is_empty() {
+    if state.scenarios.entries.is_empty() {
         if state.scenarios.directory.is_some() && state.scenarios.failures.is_empty() {
             ui.label("No .toml scenario in that folder.");
         }
@@ -28,12 +29,140 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
     ui.separator();
     scenario_list(ui, state, engine);
+    ui.separator();
+
+    // Editing a copy, so what the list and the disk hold is untouched until
+    // Save says otherwise.
+    if state.scenarios.draft.is_some() {
+        editor(ui, state);
+        return;
+    }
 
     let Some(scenario) = state.scenarios.selected_scenario().cloned() else {
         return;
     };
-    ui.separator();
     steps(ui, state, &scenario);
+}
+
+/// The settings a scenario has beyond its steps. The steps themselves are still
+/// shown read-only below, until the editor for them lands.
+fn editor(ui: &mut Ui, state: &mut AppState) {
+    let dirty = state.scenarios.draft_is_dirty();
+    let labels = widest(
+        ui,
+        &egui::TextStyle::Body,
+        &["Name:", "Description:", "Repeat:"],
+    );
+
+    let Some(draft) = state.scenarios.draft.as_mut() else {
+        return;
+    };
+    let scenario = &mut draft.scenario;
+
+    ui.horizontal(|ui| {
+        field_label(ui, "Name:", labels);
+        ui.text_edit_singleline(&mut scenario.name);
+        if dirty {
+            ui.label(RichText::new("edited").weak());
+        }
+    });
+
+    ui.horizontal(|ui| {
+        field_label(ui, "Description:", labels);
+        let mut text = scenario.description.clone().unwrap_or_default();
+        if ui.text_edit_singleline(&mut text).changed() {
+            scenario.description = (!text.trim().is_empty()).then_some(text);
+        }
+    });
+
+    ui.horizontal(|ui| {
+        field_label(ui, "Repeat:", labels);
+        let mut repeats = scenario.repeat.is_some();
+        if ui.checkbox(&mut repeats, "every").changed() {
+            scenario.repeat = repeats.then(|| Repeat {
+                every: Duration::from_millis(100),
+                times: None,
+            });
+        }
+        if let Some(repeat) = &mut scenario.repeat {
+            // Floored at one: a period of zero is no period, and the engine
+            // cannot build a timer from it.
+            let mut period = u64::try_from(repeat.every.as_millis()).unwrap_or(u64::MAX);
+            if ui
+                .add(
+                    DragValue::new(&mut period)
+                        .range(1..=3_600_000)
+                        .suffix(" ms"),
+                )
+                .changed()
+            {
+                repeat.every = Duration::from_millis(period.max(1));
+            }
+
+            let mut counted = repeat.times.is_some();
+            if ui.checkbox(&mut counted, "stop after").changed() {
+                repeat.times = counted.then_some(10);
+            }
+            if let Some(times) = &mut repeat.times {
+                ui.add(DragValue::new(times).range(1..=u32::MAX).suffix(" passes"));
+            }
+        }
+    });
+
+    ui.separator();
+    let steps_of = scenario.clone();
+    steps(ui, state, &steps_of);
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                dirty,
+                egui::Button::new(format!("{} Save", icons::FLOPPY_DISK)),
+            )
+            .clicked()
+        {
+            save(state);
+        }
+        if ui.button("Cancel").clicked() {
+            state.scenarios.cancel_edit();
+        }
+    });
+}
+
+/// Writes the draft out, choosing a file for one that has never had a home.
+fn save(state: &mut AppState) {
+    let Some(directory) = state.scenarios.directory.clone() else {
+        state.last_error = Some("No scenarios folder to save into.".to_owned());
+        return;
+    };
+    let name = state
+        .scenarios
+        .draft
+        .as_ref()
+        .map(|draft| draft.scenario.name.clone())
+        .unwrap_or_default();
+
+    let into = crate::scenarios::suggested_file(&directory, &name);
+    if let Err(error) = state.scenarios.save_draft(&into) {
+        state.last_error = Some(format!("{error:#}"));
+    }
+}
+
+/// What New starts from: one delay, which is the only step that needs nothing
+/// else to exist yet, since there may be no connection configured at all.
+fn blank() -> Scenario {
+    Scenario {
+        name: "New scenario".to_owned(),
+        description: None,
+        steps: vec![Step {
+            targets: Vec::new(),
+            action: Action::Wait {
+                delay: Duration::from_millis(100),
+            },
+        }],
+        repeat: None,
+    }
 }
 
 fn library_bar(ui: &mut Ui, state: &mut AppState) {
@@ -57,6 +186,41 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         {
             state.scenarios.reload();
         }
+
+        ui.separator();
+
+        let editing = state.scenarios.draft.is_some();
+        if ui
+            .add_enabled(
+                state.scenarios.directory.is_some() && !editing,
+                egui::Button::new(format!("{} New", icons::FILE_PLUS)),
+            )
+            .on_hover_text("Start a scenario from scratch")
+            .clicked()
+        {
+            state.scenarios.begin_new(blank());
+        }
+        if ui
+            .add_enabled(
+                state.scenarios.selected_entry().is_some() && !editing,
+                egui::Button::new(format!("{} Edit", icons::PENCIL_SIMPLE)),
+            )
+            .clicked()
+        {
+            state.scenarios.begin_edit();
+        }
+        if ui
+            .add_enabled(
+                state.scenarios.selected_entry().is_some() && !editing,
+                egui::Button::new(icons::TRASH),
+            )
+            .on_hover_text("Delete this scenario from its file")
+            .clicked()
+        {
+            if let Err(error) = state.scenarios.delete_selected() {
+                state.last_error = Some(format!("{error:#}"));
+            }
+        }
     });
 
     match &state.scenarios.directory {
@@ -74,9 +238,9 @@ fn scenario_list(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     // and the borrow checker is right that those cannot overlap.
     let listed: Vec<(usize, Scenario)> = state
         .scenarios
-        .scenarios
+        .entries
         .iter()
-        .cloned()
+        .map(|entry| entry.scenario.clone())
         .enumerate()
         .collect();
 
