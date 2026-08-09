@@ -42,13 +42,16 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         state.frame_hex = typed;
     }
 
+    // Read before the values are borrowed, the whole editor sharing one answer
+    // rather than each field having its own.
+    let hex = state.hex_values;
     let tree = build_tree(&frame.fields);
     ScrollArea::vertical()
         .id_salt("frame_fields")
         .max_height(ui.available_height() * 0.55)
         .show(ui, |ui| {
             let values = state.frames.values_mut(&frame);
-            show_entries(ui, &tree, values);
+            show_entries(ui, &tree, values, hex);
         });
 
     ui.separator();
@@ -118,6 +121,13 @@ fn frame_picker(ui: &mut Ui, state: &mut AppState) {
             });
         if let Some(frame) = state.frames.selected_frame() {
             ui.label(RichText::new(format!("{} bytes", frame.size())).weak());
+        }
+        if ui
+            .selectable_label(state.hex_values, "0x")
+            .on_hover_text("Show whole-number fields in hexadecimal. They still take decimal.")
+            .clicked()
+        {
+            state.hex_values = !state.hex_values;
         }
         if ui
             .button(icons::ARROW_COUNTER_CLOCKWISE)
@@ -214,6 +224,7 @@ fn show_entries(
     ui: &mut Ui,
     entries: &[Entry<'_>],
     values: &mut sim_core::frame::value::FieldValues,
+    hex: bool,
 ) {
     // Consecutive fields share one grid so their columns line up; a group
     // interrupts the run because its rows are indented one level deeper.
@@ -222,22 +233,23 @@ fn show_entries(
         match entry {
             Entry::Field(field) => run.push(field),
             Entry::Group(group) => {
-                field_grid(ui, &mut run, values);
+                field_grid(ui, &mut run, values, hex);
                 let header = format!("{}  ·  {} B", group.label, entry.size());
                 egui::CollapsingHeader::new(RichText::new(header).strong())
                     .id_salt(group.salt)
                     .default_open(true)
-                    .show(ui, |ui| show_entries(ui, &group.entries, values));
+                    .show(ui, |ui| show_entries(ui, &group.entries, values, hex));
             }
         }
     }
-    field_grid(ui, &mut run, values);
+    field_grid(ui, &mut run, values, hex);
 }
 
 fn field_grid(
     ui: &mut Ui,
     run: &mut Vec<&FieldDef>,
     values: &mut sim_core::frame::value::FieldValues,
+    hex: bool,
 ) {
     let Some(first) = run.first() else {
         return;
@@ -247,14 +259,19 @@ fn field_grid(
         .striped(true)
         .show(ui, |ui| {
             for field in run.iter() {
-                field_row(ui, field, values);
+                field_row(ui, field, values, hex);
                 ui.end_row();
             }
         });
     run.clear();
 }
 
-fn field_row(ui: &mut Ui, field: &FieldDef, values: &mut sim_core::frame::value::FieldValues) {
+fn field_row(
+    ui: &mut Ui,
+    field: &FieldDef,
+    values: &mut sim_core::frame::value::FieldValues,
+    hex: bool,
+) {
     let mut label = ui.label(RichText::new(leaf_name(&field.name)).strong());
     if let Some(description) = &field.description {
         label = label.on_hover_text(description);
@@ -270,7 +287,7 @@ fn field_row(ui: &mut Ui, field: &FieldDef, values: &mut sim_core::frame::value:
         FieldKind::Checksum { .. } => {
             ui.label(RichText::new("computed on send").weak());
         }
-        kind => value_widget(ui, field, kind, values),
+        kind => value_widget(ui, field, kind, values, hex),
     }
 }
 
@@ -314,13 +331,15 @@ pub fn value_widget(
     field: &FieldDef,
     kind: &FieldKind,
     values: &mut sim_core::frame::value::FieldValues,
+    hex: bool,
 ) {
     let entry = values.entry(field.name.clone()).or_insert(Value::Uint(0));
 
     match kind {
         FieldKind::Scalar(ScalarType::F32 | ScalarType::F64) => {
             let mut current = entry.as_float().unwrap_or(0.0);
-            let mut widget = number(&mut current).speed(0.1);
+            // A float has no hexadecimal to show, so it stays as it is.
+            let mut widget = number(&mut current, None).speed(0.1);
             // The declared subtype, not the representation, is what the editor
             // lets you reach: a 0..99 field simply will not go to 100.
             if let Some(ValueRange::Float { min, max }) = field.range {
@@ -336,10 +355,13 @@ pub fn value_widget(
                 Some(ValueRange::Uint { min, max }) => (min, max),
                 _ => (0, max_unsigned(*scalar)),
             };
-            // Decimal rather than hex: egui's hex mode shows no 0x prefix, so
-            // typing "10" would silently mean 16. The byte preview below already
-            // gives the hexadecimal view.
-            if ui.add(number(&mut current).range(min..=max)).changed() {
+            // Padded to the width of what holds it, so a u16 reads 0x00FF
+            // rather than 0xFF and lines up with the byte preview below.
+            let digits = hex.then(|| scalar.size() * 2);
+            if ui
+                .add(number(&mut current, digits).range(min..=max))
+                .changed()
+            {
                 *entry = Value::Uint(current);
             }
         }
@@ -350,7 +372,11 @@ pub fn value_widget(
                 Some(ValueRange::Int { min, max }) => (min, max),
                 _ => (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1),
             };
-            if ui.add(number(&mut current).range(min..=max)).changed() {
+            let digits = hex.then(|| scalar.size() * 2);
+            if ui
+                .add(number(&mut current, digits).range(min..=max))
+                .changed()
+            {
                 *entry = Value::Int(current);
             }
         }
@@ -379,7 +405,7 @@ pub fn value_widget(
             }
         }
         FieldKind::Enum { variants, .. } => enum_widget(ui, &field.name, variants, entry),
-        FieldKind::Bits { bits, repr } => bits_widget(ui, &field.name, *repr, bits, entry),
+        FieldKind::Bits { bits, repr } => bits_widget(ui, &field.name, *repr, bits, entry, hex),
         FieldKind::Checksum { .. } => {}
     }
 }
@@ -436,7 +462,14 @@ fn bit_positions(repr: ScalarType, bits: &[BitDef]) -> Vec<Option<String>> {
         .collect()
 }
 
-fn bits_widget(ui: &mut Ui, id: &str, repr: ScalarType, bits: &[BitDef], entry: &mut Value) {
+fn bits_widget(
+    ui: &mut Ui,
+    id: &str,
+    repr: ScalarType,
+    bits: &[BitDef],
+    entry: &mut Value,
+    hex: bool,
+) {
     let mut current = entry.as_bits().cloned().unwrap_or_default();
     let mut changed = false;
     let positions = bit_positions(repr, bits);
@@ -469,7 +502,9 @@ fn bits_widget(ui: &mut Ui, id: &str, repr: ScalarType, bits: &[BitDef], entry: 
 
                 if wide {
                     let max = (1u64 << bit.width) - 1;
-                    changed |= ui.add(number(slot).range(0..=max)).changed();
+                    // Four bits to a digit, so a five-bit part still gets two.
+                    let digits = hex.then(|| bit.width.div_ceil(4) as usize);
+                    changed |= ui.add(number(slot, digits).range(0..=max)).changed();
                 } else {
                     ui.label("");
                 }

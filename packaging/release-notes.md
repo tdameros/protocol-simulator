@@ -87,7 +87,13 @@ instead of firing a catch-up burst.
 
 Every number box takes hexadecimal, binary and octal as readily as decimal, so
 `0xBA` copied off a datasheet can be typed in as it stands. `_` is allowed as a
-separator, so `0xFF_FF` works too. What is shown back is decimal.
+separator, so `0xFF_FF` works too.
+
+The **0x** button beside the frame picker shows whole-number fields in
+hexadecimal, padded to the width of what holds them, so a `u16` reads `0x00FF`
+and lines up with the byte preview. Floats stay as they are, having no
+hexadecimal to show. The choice is remembered with the project, and the boxes go
+on taking decimal whichever way they are showing.
 
 ## Frame definitions
 

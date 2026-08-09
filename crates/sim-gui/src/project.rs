@@ -139,6 +139,7 @@ impl Project {
             values: state.frames.saved_values().clone(),
             ui: UiSpec {
                 theme: ThemeSpec::from(theme),
+                hex_values: state.hex_values,
                 layout: None,
             },
         }
@@ -197,6 +198,7 @@ impl Project {
             state.scenarios.load_from(directory);
         }
 
+        state.hex_values = self.ui.hex_values;
         state.hex_input.clone_from(&self.hex_inject.text);
         state.hex_target = self
             .hex_inject
@@ -419,20 +421,23 @@ impl From<DirectionSpec> for DirectionFilter {
 pub struct UiSpec {
     #[serde(default)]
     pub theme: ThemeSpec,
+    /// Whether whole-number fields are shown in hexadecimal.
+    #[serde(default, skip_serializing_if = "not_set")]
+    pub hex_values: bool,
     /// The dock arrangement, as `egui_dock` describes it. The one section here
     /// not meant to be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<DockState<Tab>>,
 }
 
-/// Compared on the theme alone, and deliberately.
+/// Compared on everything but the layout, and deliberately.
 ///
 /// This is what tells the title bar whether there is anything to save, and
 /// dragging a tab is not a change worth being nagged about. A layout that moved
 /// is still written out by the next save; it just does not ask for one.
 impl PartialEq for UiSpec {
     fn eq(&self, other: &Self) -> bool {
-        self.theme == other.theme
+        self.theme == other.theme && self.hex_values == other.hex_values
     }
 }
 
@@ -610,6 +615,7 @@ mod tests {
         let mut state = AppState::default();
         state.connections = vec![connection("bus", true), connection("probe", false)];
         state.hex_input = "AA 55".to_owned();
+        state.hex_values = true;
         state.hex_target = Some(ConnectionId("bus".to_owned()));
         state.connections[1].1.config = TransportConfig::Tcp {
             mode: TcpMode::Server {
@@ -660,6 +666,10 @@ mod tests {
             .all(|(_, entry)| entry.status == ConnectionStatus::Disconnected));
 
         assert_eq!(reopened.hex_input, "AA 55");
+        assert!(
+            reopened.hex_values,
+            "the base fields are read in comes back"
+        );
         assert_eq!(reopened.hex_target, Some(ConnectionId("bus".to_owned())));
         assert_eq!(restored.theme, Theme::Dark);
 
@@ -762,6 +772,7 @@ mod tests {
         let mut project = Project {
             ui: UiSpec {
                 theme: ThemeSpec::Light,
+                hex_values: false,
                 layout: Some(default_layout(&mut BTreeMap::new())),
             },
             ..Project::default()

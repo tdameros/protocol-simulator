@@ -70,8 +70,34 @@ pub fn column<R>(ui: &mut Ui, width: f32, contents: impl FnOnce(&mut Ui) -> R) -
 /// egui parses decimal and nothing else, so `0xBA` copied off a datasheet has
 /// to be converted by hand before it can be typed anywhere. Every number box in
 /// the app goes through here so that the answer is the same wherever you are.
-pub fn number<Num: egui::emath::Numeric>(value: &mut Num) -> egui::DragValue<'_> {
-    egui::DragValue::new(value).custom_parser(read_number)
+/// `hex` asks for the value to be shown in hexadecimal, padded to that many
+/// digits. What the box *accepts* never changes: decimal stays typeable
+/// whatever it is showing.
+pub fn number<Num: egui::emath::Numeric>(
+    value: &mut Num,
+    hex: Option<usize>,
+) -> egui::DragValue<'_> {
+    let widget = egui::DragValue::new(value).custom_parser(read_number);
+    match hex {
+        Some(digits) => widget.custom_formatter(move |value, _| hex_text(value, digits)),
+        None => widget,
+    }
+}
+
+/// A number as hexadecimal, prefixed so it cannot be mistaken for decimal and
+/// padded to the width of whatever holds it.
+///
+/// The prefix is not decoration: `10` shown bare would read as ten, and the
+/// same box takes decimal input, so the two have to be told apart on sight.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value comes from an integer field and is shown, not computed"
+)]
+fn hex_text(value: f64, digits: usize) -> String {
+    let sign = if value < 0.0 { "-" } else { "" };
+    let magnitude = value.abs() as u64;
+    format!("{sign}0x{magnitude:0digits$X}")
 }
 
 /// Decimal, hexadecimal, binary or octal, signed, with `_` allowed anywhere as
@@ -184,6 +210,22 @@ mod tests {
             ("-7", -7.0),
         ] {
             assert_eq!(read_number(typed), Some(expected), "reading {typed}");
+        }
+    }
+
+    #[test]
+    fn a_number_shown_as_hexadecimal_can_be_read_back() {
+        for (value, digits, shown) in [
+            (186.0, 2, "0xBA"),
+            (43605.0, 4, "0xAA55"),
+            (5.0, 4, "0x0005"),
+            (-16.0, 2, "-0x10"),
+            (0.0, 2, "0x00"),
+        ] {
+            assert_eq!(hex_text(value, digits), shown);
+            // What it shows has to be something it would take back, or a box
+            // could not be edited from the value it is displaying.
+            assert_eq!(read_number(shown), Some(value), "reading back {shown}");
         }
     }
 
