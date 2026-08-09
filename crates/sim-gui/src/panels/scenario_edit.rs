@@ -316,19 +316,13 @@ fn pattern_body(ui: &mut Ui, expect: &mut Expect) {
     match expect {
         Expect::Pattern { pattern, anchor } => {
             ui.horizontal(|ui| {
-                let mut bytes: Vec<u8> = Vec::new();
-                let mut text = pattern.to_hex();
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut text)
-                        .font(TextStyle::Monospace)
-                        .hint_text("AA 55 ?? 01"),
-                );
-                if response.changed() {
+                // The same treatment as a plain hex field, `??` aside: a
+                // pattern is no more typeable one keystroke at a time.
+                if let Some(text) = kept_text(ui, "pattern", &pattern.to_hex(), "AA 55 ?? 01") {
                     if let Some(parsed) = HexPattern::parse(&text) {
                         *pattern = parsed;
                     }
                 }
-                let _ = &mut bytes;
 
                 let mut anchored = anchor.offset().is_some();
                 if ui.checkbox(&mut anchored, "at offset").changed() {
@@ -405,34 +399,42 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
     }
 }
 
-/// A hex box whose text survives being half typed.
+/// A text box whose content survives being half typed, returning what was typed
+/// whenever it changes.
 ///
-/// The bytes are only taken from it once it parses. Mirroring the model back
-/// into the box on every repaint would fight whoever is typing, so the text is
-/// kept aside while the box has focus, exactly as the frame editor's preview
-/// does.
-fn hex_field(ui: &mut Ui, salt: &str, bytes: &mut Vec<u8>) {
+/// Rebuilding the text from the model on every repaint would fight whoever is
+/// typing: `AA 5` is not a byte yet, so the model does not take it, so the box
+/// would snap back to the last good value between two keystrokes. The text is
+/// therefore kept aside while the box has focus, the same trick the frame
+/// editor's hex preview uses.
+fn kept_text(ui: &mut Ui, salt: &str, mirror: &str, hint: &str) -> Option<String> {
     let id = ui.make_persistent_id(salt);
     let focused = ui.memory(|memory| memory.has_focus(id));
     let held: Option<String> = ui.memory(|memory| memory.data.get_temp(id));
 
     let mut text = match (held, focused) {
         (Some(text), true) => text,
-        _ => spaced(bytes),
+        _ => mirror.to_owned(),
     };
 
     let response = ui.add(
         egui::TextEdit::singleline(&mut text)
             .id(id)
             .font(TextStyle::Monospace)
-            .hint_text("DE AD BE EF"),
+            .hint_text(hint),
     );
-    if response.changed() {
+    let changed = response.changed().then(|| text.clone());
+    ui.memory_mut(|memory| memory.data.insert_temp(id, text));
+    changed
+}
+
+/// Bytes, taken from the box only once they parse.
+fn hex_field(ui: &mut Ui, salt: &str, bytes: &mut Vec<u8>) {
+    if let Some(text) = kept_text(ui, salt, &spaced(bytes), "DE AD BE EF") {
         if let Ok(parsed) = parse_hex(&text) {
             *bytes = parsed;
         }
     }
-    ui.memory_mut(|memory| memory.data.insert_temp(id, text));
 }
 
 fn spaced(bytes: &[u8]) -> String {
