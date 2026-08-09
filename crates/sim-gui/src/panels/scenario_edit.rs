@@ -35,6 +35,10 @@ enum Edit {
 pub fn steps(ui: &mut Ui, state: &mut AppState) {
     let links: Vec<ConnectionId> = state.connections.iter().map(|(id, _)| id.clone()).collect();
     let frames: Vec<FrameDef> = state.frames.frames.clone();
+    // The same answer as the frame editor gives: a value written into a step is
+    // the same kind of thing as a value typed into a frame, so it is read in
+    // the same base.
+    let hex = state.hex_values;
 
     if links.is_empty() {
         ui.label(RichText::new("No connection configured, so a step can only wait.").weak());
@@ -100,7 +104,7 @@ pub fn steps(ui: &mut Ui, state: &mut AppState) {
                 if ActionKind::of(&step.action).needs_a_connection() {
                     targets(ui, step, &links);
                 }
-                body(ui, step, &frames);
+                body(ui, step, &frames, hex);
             });
             ui.separator();
         });
@@ -149,7 +153,7 @@ fn targets(ui: &mut Ui, step: &mut Step, links: &[ConnectionId]) {
     });
 }
 
-fn body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
+fn body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
     match &mut step.action {
         Action::Wait { delay } => {
             let mut millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
@@ -167,12 +171,12 @@ fn body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
         Action::Raw { bytes } => {
             hex_field(ui, "bytes", bytes);
         }
-        Action::Send { .. } => send_body(ui, step, frames),
-        Action::WaitFor { .. } => wait_body(ui, step, frames),
+        Action::Send { .. } => send_body(ui, step, frames, hex),
+        Action::WaitFor { .. } => wait_body(ui, step, frames, hex),
     }
 }
 
-fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
+fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
     let Action::Send { frame, .. } = &step.action else {
         return;
     };
@@ -234,7 +238,7 @@ fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
                     return;
                 };
                 if with.contains_key(&field.name) {
-                    value_widget(ui, field, &field.kind, with);
+                    value_widget(ui, field, &field.kind, with, hex);
                 } else if counted {
                     ui.label(RichText::new("counted").weak());
                 } else {
@@ -272,7 +276,7 @@ fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
         });
 }
 
-fn wait_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
+fn wait_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
     let Action::WaitFor { expect, timeout } = &mut step.action else {
         return;
     };
@@ -313,7 +317,7 @@ fn wait_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
         pattern_body(ui, expect);
         return;
     }
-    frame_body(ui, step, frames);
+    frame_body(ui, step, frames, hex);
 }
 
 fn pattern_body(ui: &mut Ui, expect: &mut Expect) {
@@ -345,7 +349,7 @@ fn pattern_body(ui: &mut Ui, expect: &mut Expect) {
     }
 }
 
-fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
+fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
     let Action::WaitFor {
         expect: Expect::Frame { frame, values },
         ..
@@ -421,7 +425,7 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
                             toggled = Some((field.name.clone(), on));
                         }
                         if values.contains_key(&field.name) {
-                            value_widget(ui, field, &field.kind, values);
+                            value_widget(ui, field, &field.kind, values, hex);
                         } else {
                             ui.label(RichText::new("any value").weak());
                         }
