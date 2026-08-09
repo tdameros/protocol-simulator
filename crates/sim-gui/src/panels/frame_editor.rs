@@ -306,7 +306,9 @@ fn type_label(field: &FieldDef) -> String {
     }
 }
 
-fn value_widget(
+/// Shared with the scenario editor: a field is edited the same way whether it
+/// is being sent by hand or written into a step.
+pub fn value_widget(
     ui: &mut Ui,
     field: &FieldDef,
     kind: &FieldKind,

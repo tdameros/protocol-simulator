@@ -93,7 +93,9 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     }
 }
 
-fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
+/// Shared with the scenario editor, which needs the same reading of the same
+/// notation.
+pub fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     if cleaned.is_empty() {
         return Err("Enter hexadecimal bytes (e.g. DEADBEEF).".to_owned());

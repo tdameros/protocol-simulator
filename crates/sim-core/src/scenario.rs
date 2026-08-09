@@ -14,6 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use toml_edit::Item;
 
 use crate::connection::ConnectionId;
 use crate::frame::value::Value;
@@ -30,6 +31,18 @@ pub enum ScenarioError {
 
     #[error("invalid toml: {0}")]
     Toml(#[from] toml::de::Error),
+
+    #[error("cannot serialise the scenario: {0}")]
+    Serialise(#[from] toml::ser::Error),
+
+    #[error("cannot lay out the scenario: {0}")]
+    Reparse(toml_edit::TomlError),
+
+    #[error("no scenario named {name} in this file")]
+    NotInFile { name: String },
+
+    #[error("this file's `scenario` key is not a list of scenarios")]
+    NotScenarios,
 
     #[error("a scenario needs a name")]
     Unnamed,
@@ -59,8 +72,23 @@ pub enum StepError {
     #[error("no connection to act on, and the scenario names no default")]
     NoConnection,
 
+    #[error("a delay acts on no connection, so `on` means nothing here")]
+    PointlessConnection,
+
     #[error("{hex} is not a usable byte pattern")]
     BadPattern { hex: String },
+
+    #[error("a wait needs either hex bytes or a frame to match, not both")]
+    AmbiguousWait,
+
+    #[error("a wait needs either hex bytes or a frame to match")]
+    EmptyWait,
+
+    #[error("matching a frame needs at least one field, or it matches on nothing")]
+    NoFieldsToMatch,
+
+    #[error("`at` places a hex pattern, and means nothing when matching a frame")]
+    PointlessOffset,
 
     #[error("{hex} is not an even run of hex digits")]
     BadBytes { hex: String },
@@ -88,7 +116,11 @@ impl Scenario {
             .steps
             .iter()
             .filter_map(|step| match &step.action {
-                Action::Send { frame, .. } => Some(frame.as_str()),
+                Action::Send { frame, .. }
+                | Action::WaitFor {
+                    expect: Expect::Frame { frame, .. },
+                    ..
+                } => Some(frame.as_str()),
                 _ => None,
             })
             .collect();
@@ -139,16 +171,41 @@ pub enum Action {
     Wait {
         delay: Duration,
     },
-    /// Hold until a frame matching `pattern` has arrived on *every* target.
+    /// Hold until a matching frame has arrived on *every* target.
     ///
     /// All rather than the first: aimed at one link the two readings agree, and
     /// aimed at several the strict one is the one worth writing down, since it
     /// turns the timeout into a test that every side answered.
     WaitFor {
-        pattern: crate::pattern::HexPattern,
-        anchor: crate::pattern::Anchor,
+        expect: Expect,
         /// Giving up is a scenario failure, not a silent pass.
         timeout: Option<Duration>,
+    },
+}
+
+/// What a wait is watching for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expect {
+    /// Bytes spelled out, wildcards and all. What a developer writes.
+    Pattern {
+        pattern: crate::pattern::HexPattern,
+        anchor: crate::pattern::Anchor,
+    },
+    /// A frame from the library, matched on the fields named here and the
+    /// values they must carry.
+    ///
+    /// Values rather than bare names, so that waiting for `mode = FAULT` is
+    /// sayable at all. Naming a field alone would mean whatever the frame
+    /// happens to declare as its default, which for a sync word is exactly
+    /// right and for anything else is almost never what was meant.
+    ///
+    /// Kept as the intent rather than as the bytes it stands for: a pattern
+    /// frozen at write time would go on claiming to describe the frame long
+    /// after someone had changed it. The bytes are worked out when the scenario
+    /// starts, against the definitions it was handed.
+    Frame {
+        frame: String,
+        values: BTreeMap<String, Value>,
     },
 }
 
@@ -268,12 +325,22 @@ struct RawStep {
 /// Spelt out rather than flattening a `PatternSpec`, because serde refuses to
 /// police unknown keys on a struct that flattens another, and a typo here is
 /// exactly what needs catching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWaitFor {
-    hex: String,
+    /// The developer's way: bytes, wildcards and an offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     at: Option<usize>,
+
+    /// The technician's way, as the editor writes it: a frame and the fields
+    /// that have to match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frame: Option<String>,
+    #[serde(default, rename = "match", skip_serializing_if = "BTreeMap::is_empty")]
+    match_values: BTreeMap<String, Value>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
 }
@@ -281,9 +348,9 @@ struct RawWaitFor {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCounter {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     from: u64,
-    #[serde(default = "one")]
+    #[serde(default = "one", skip_serializing_if = "is_one")]
     step: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wrap: Option<u64>,
@@ -291,6 +358,24 @@ struct RawCounter {
 
 fn one() -> u64 {
     1
+}
+
+// Both take a reference because that is the signature serde's
+// `skip_serializing_if` calls them with.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the signature is serde's, not ours"
+)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the signature is serde's, not ours"
+)]
+fn is_one(value: &u64) -> bool {
+    *value == 1
 }
 
 /// Parses every scenario in one file's text.
@@ -313,6 +398,414 @@ pub fn load(path: &Path) -> Result<Vec<Scenario>, ScenarioError> {
         source,
     })?;
     from_toml(&text)
+}
+
+/// Renders scenarios back to TOML, as a whole file.
+///
+/// Used for a file the editor is creating. Changing one that already exists
+/// goes through `writer`, which keeps the comments a hand-written file carries.
+///
+/// # Errors
+///
+/// Returns an error if the scenarios cannot be serialised.
+pub fn to_toml(scenarios: &[Scenario]) -> Result<String, ScenarioError> {
+    let file = RawFile {
+        scenarios: scenarios.iter().map(lower).collect(),
+    };
+    // Two passes on purpose. `toml` decides where the sections go, which is
+    // what puts each step under its own `[[scenario.step]]`; `toml_edit` then
+    // does the cosmetics, which `toml` has no way of expressing.
+    //
+    // Serde gives every nested struct a section of its own, which turns a
+    // three-word override into `[scenario.step.with]` three lines below the
+    // step it belongs to, and leaves the step's own header standing empty. The
+    // small ones read far better folded back onto one line, which is also how
+    // a person writes them.
+    let mut document: toml_edit::DocumentMut = toml::to_string_pretty(&file)?
+        .parse()
+        .map_err(ScenarioError::Reparse)?;
+    if let Some(scenarios) = document["scenario"].as_array_of_tables_mut() {
+        for scenario in scenarios.iter_mut() {
+            fold(scenario, "repeat");
+            let Some(steps) = scenario["step"].as_array_of_tables_mut() else {
+                continue;
+            };
+            for step in steps.iter_mut() {
+                for key in ["with", "counters", "wait_for"] {
+                    fold(step, key);
+                }
+                compact(step, "on");
+            }
+            compact(scenario, "on");
+        }
+    }
+
+    Ok(document.to_string())
+}
+
+/// Replaces one scenario inside a file, leaving everything around it alone.
+///
+/// This is the path the editor takes for a file that already exists. The whole
+/// document is kept and only the entry named `name` is rewritten, key by key,
+/// so the comments a developer wrote survive a technician pressing Save.
+///
+/// `name` is the name the scenario had *in the file*, which is not necessarily
+/// the one it has now: renaming is an edit like any other.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML, holds no `scenario` array,
+/// or holds no scenario of that name.
+pub fn update_in(text: &str, name: &str, scenario: &Scenario) -> Result<String, ScenarioError> {
+    let mut document = parse_document(text)?;
+    let fresh = as_table(scenario)?;
+
+    let entries = array_of_scenarios(&mut document)?;
+    let existing = entries
+        .iter_mut()
+        .find(|entry| entry.get("name").and_then(Item::as_str) == Some(name))
+        .ok_or_else(|| ScenarioError::NotInFile {
+            name: name.to_owned(),
+        })?;
+
+    merge(existing, &fresh);
+    Ok(document.to_string())
+}
+
+/// Adds a scenario at the end of a file, or creates the file's array if it has
+/// none yet.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML or its `scenario` key is
+/// something other than an array of scenarios.
+pub fn append_to(text: &str, scenario: &Scenario) -> Result<String, ScenarioError> {
+    let mut document = parse_document(text)?;
+    let mut fresh = as_table(scenario)?;
+
+    // Without a position of its own, a new section is written wherever
+    // `toml_edit` happens to reach it, which for a scenario means landing
+    // between an earlier one and its own `[[scenario.step]]` sections. Those
+    // steps would then belong to the newcomer, and the scenario above it would
+    // silently lose them.
+    let mut next = last_position(&document);
+    place_after(&mut fresh, &mut next);
+
+    array_of_scenarios(&mut document)?.push(fresh);
+    Ok(document.to_string())
+}
+
+/// The position of the last section in the document.
+fn last_position(document: &toml_edit::DocumentMut) -> isize {
+    fn scan(table: &toml_edit::Table, best: &mut isize) {
+        if let Some(position) = table.position() {
+            *best = (*best).max(position);
+        }
+        for (_, item) in table {
+            match item {
+                Item::Table(inner) => scan(inner, best),
+                Item::ArrayOfTables(entries) => {
+                    for entry in entries {
+                        scan(entry, best);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut best = 0;
+    scan(document.as_table(), &mut best);
+    best
+}
+
+/// Sends a table and everything nested inside it to the end of the document,
+/// in the order they are written.
+fn place_after(table: &mut toml_edit::Table, next: &mut isize) {
+    *next += 1;
+    table.set_position(Some(*next));
+    for (_, item) in table.iter_mut() {
+        match item {
+            Item::Table(inner) => place_after(inner, next),
+            Item::ArrayOfTables(entries) => {
+                for entry in entries.iter_mut() {
+                    place_after(entry, next);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Takes a scenario out of a file.
+///
+/// # Errors
+///
+/// As [`update_in`].
+pub fn remove_from(text: &str, name: &str) -> Result<String, ScenarioError> {
+    let mut document = parse_document(text)?;
+    let entries = array_of_scenarios(&mut document)?;
+
+    let found = entries
+        .iter()
+        .position(|entry| entry.get("name").and_then(Item::as_str) == Some(name))
+        .ok_or_else(|| ScenarioError::NotInFile {
+            name: name.to_owned(),
+        })?;
+    entries.remove(found);
+    Ok(document.to_string())
+}
+
+fn parse_document(text: &str) -> Result<toml_edit::DocumentMut, ScenarioError> {
+    text.parse().map_err(ScenarioError::Reparse)
+}
+
+fn array_of_scenarios(
+    document: &mut toml_edit::DocumentMut,
+) -> Result<&mut toml_edit::ArrayOfTables, ScenarioError> {
+    document
+        .entry("scenario")
+        .or_insert(Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .ok_or(ScenarioError::NotScenarios)
+}
+
+/// One scenario laid out on its own, to be merged into a document.
+fn as_table(scenario: &Scenario) -> Result<toml_edit::Table, ScenarioError> {
+    let rendered = to_toml(std::slice::from_ref(scenario))?;
+    parse_document(&rendered)?
+        .get("scenario")
+        .and_then(Item::as_array_of_tables)
+        .and_then(|entries| entries.get(0).cloned())
+        .ok_or(ScenarioError::NotScenarios)
+}
+
+/// Copies `from` over `into`, key by key rather than wholesale.
+///
+/// Replacing the item under a key leaves the key itself in place, and a comment
+/// written above a setting belongs to the key, which is what makes this
+/// preserve them where a straight assignment would not.
+fn merge(into: &mut toml_edit::Table, from: &toml_edit::Table) {
+    let stale: Vec<String> = into
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .filter(|key| key != "step" && from.get(key).is_none())
+        .collect();
+    for key in stale {
+        into.remove(&key);
+    }
+
+    for (key, item) in from {
+        if key == "step" {
+            continue;
+        }
+        match into.get_mut(key) {
+            Some(slot) => *slot = item.clone(),
+            None => {
+                into.insert(key, item.clone());
+            }
+        }
+    }
+
+    merge_steps(into, from);
+}
+
+/// Steps are matched by position, there being nothing else to match them by.
+///
+/// A step edited in place keeps whatever was written above it. A step inserted
+/// or removed in the middle shifts the comments below it by one, which is the
+/// price of keeping them at all rather than dropping the lot.
+fn merge_steps(into: &mut toml_edit::Table, from: &toml_edit::Table) {
+    let Some(wanted) = from.get("step").and_then(Item::as_array_of_tables) else {
+        into.remove("step");
+        return;
+    };
+
+    if into
+        .get("step")
+        .and_then(Item::as_array_of_tables)
+        .is_none()
+    {
+        into.insert("step", Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    }
+    let Some(existing) = into.get_mut("step").and_then(Item::as_array_of_tables_mut) else {
+        return;
+    };
+
+    while existing.len() > wanted.len() {
+        existing.remove(existing.len() - 1);
+    }
+    // A step appended to a scenario needs a position for the same reason a
+    // scenario does, or it is written above the ones already there.
+    let mut next = existing
+        .iter()
+        .filter_map(toml_edit::Table::position)
+        .max()
+        .unwrap_or(0);
+    for (index, step) in wanted.iter().enumerate() {
+        if let Some(slot) = existing.get_mut(index) {
+            merge_step(slot, step);
+        } else {
+            let mut fresh = step.clone();
+            place_after(&mut fresh, &mut next);
+            existing.push(fresh);
+        }
+    }
+}
+
+fn merge_step(into: &mut toml_edit::Table, from: &toml_edit::Table) {
+    let stale: Vec<String> = into
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .filter(|key| from.get(key).is_none())
+        .collect();
+    for key in stale {
+        into.remove(&key);
+    }
+    for (key, item) in from {
+        match into.get_mut(key) {
+            Some(slot) => *slot = item.clone(),
+            None => {
+                into.insert(key, item.clone());
+            }
+        }
+    }
+}
+
+/// Puts an array back on one line. Two connection names do not need four.
+fn compact(table: &mut toml_edit::Table, key: &str) {
+    if let Some(array) = table.get_mut(key).and_then(toml_edit::Item::as_array_mut) {
+        array.fmt();
+    }
+}
+
+/// Turns `table[key]`, if it is a section, into a value on one line.
+fn fold(table: &mut toml_edit::Table, key: &str) {
+    let Some(section) = table.remove(key) else {
+        return;
+    };
+    let folded = match section {
+        toml_edit::Item::Table(inner) => {
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(inner.into_inline_table()))
+        }
+        other => other,
+    };
+    table.insert(key, folded);
+}
+
+fn lower(scenario: &Scenario) -> RawScenario {
+    // Steps carry their links resolved, so writing each one out would repeat
+    // the same name down the whole file. Hoisting the commonest set into the
+    // scenario's own `on` gives back a file shaped like one a person would
+    // write, and says the same thing.
+    let default = commonest_targets(scenario);
+
+    RawScenario {
+        name: scenario.name.clone(),
+        description: scenario.description.clone(),
+        connection: default.as_ref().map(|targets| lower_targets(targets)),
+        repeat: scenario.repeat.map(|repeat| RawRepeat {
+            every_ms: as_millis(repeat.every),
+            times: repeat.times,
+        }),
+        steps: scenario
+            .steps
+            .iter()
+            .map(|step| lower_step(step, default.as_deref()))
+            .collect(),
+    }
+}
+
+/// The target list most steps share, or `None` when no step has one.
+fn commonest_targets(scenario: &Scenario) -> Option<Vec<ConnectionId>> {
+    let mut tally: Vec<(&[ConnectionId], usize)> = Vec::new();
+    for step in &scenario.steps {
+        if step.targets.is_empty() {
+            continue;
+        }
+        match tally.iter_mut().find(|(seen, _)| *seen == step.targets) {
+            Some((_, count)) => *count += 1,
+            None => tally.push((&step.targets, 1)),
+        }
+    }
+    // First past the post on a tie, so the earliest in the file wins and the
+    // output does not shuffle between runs.
+    tally
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(targets, _)| targets.to_vec())
+}
+
+fn lower_targets(targets: &[ConnectionId]) -> RawTargets {
+    match targets {
+        [only] => RawTargets::One(only.0.clone()),
+        many => RawTargets::Many(many.iter().map(|id| id.0.clone()).collect()),
+    }
+}
+
+fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
+    let mut raw = RawStep {
+        // Written only where it differs from what the scenario already says.
+        connection: (!step.targets.is_empty() && default != Some(step.targets.as_slice()))
+            .then(|| lower_targets(&step.targets)),
+        ..RawStep::default()
+    };
+
+    match &step.action {
+        Action::Send {
+            frame,
+            with,
+            counters,
+        } => {
+            raw.send = Some(frame.clone());
+            raw.with = with.clone();
+            raw.counters = counters
+                .iter()
+                .map(|(field, counter)| {
+                    (
+                        field.clone(),
+                        RawCounter {
+                            from: counter.from,
+                            step: counter.step,
+                            wrap: counter.wrap,
+                        },
+                    )
+                })
+                .collect();
+        }
+        Action::Raw { bytes } => {
+            raw.raw = Some(
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        Action::Wait { delay } => raw.wait_ms = Some(as_millis(*delay)),
+        Action::WaitFor { expect, timeout } => {
+            let mut wait = RawWaitFor {
+                timeout_ms: timeout.map(as_millis),
+                ..RawWaitFor::default()
+            };
+            match expect {
+                Expect::Pattern { pattern, anchor } => {
+                    wait.hex = Some(pattern.to_hex());
+                    wait.at = anchor.offset();
+                }
+                Expect::Frame { frame, values } => {
+                    wait.frame = Some(frame.clone());
+                    wait.match_values.clone_from(values);
+                }
+            }
+            raw.wait_for = Some(wait);
+        }
+    }
+
+    raw
+}
+
+fn as_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
@@ -403,21 +896,52 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
             delay: Duration::from_millis(delay),
         }
     } else if let Some(wait) = raw.wait_for {
-        let spec = PatternSpec {
-            hex: wait.hex,
-            at: wait.at,
+        let expect = match (wait.hex, wait.frame) {
+            (Some(_), Some(_)) => return Err(StepError::AmbiguousWait),
+            (None, None) => return Err(StepError::EmptyWait),
+            (Some(hex), None) => {
+                if !wait.match_values.is_empty() {
+                    return Err(StepError::AmbiguousWait);
+                }
+                let spec = PatternSpec { hex, at: wait.at };
+                let (pattern, anchor) = spec.compile().ok_or_else(|| StepError::BadPattern {
+                    hex: spec.hex.clone(),
+                })?;
+                Expect::Pattern { pattern, anchor }
+            }
+            (None, Some(frame)) => {
+                if wait.at.is_some() {
+                    return Err(StepError::PointlessOffset);
+                }
+                if wait.match_values.is_empty() {
+                    return Err(StepError::NoFieldsToMatch);
+                }
+                Expect::Frame {
+                    frame,
+                    values: wait.match_values,
+                }
+            }
         };
-        let (pattern, anchor) = spec.compile().ok_or_else(|| StepError::BadPattern {
-            hex: spec.hex.clone(),
-        })?;
         Action::WaitFor {
-            pattern,
-            anchor,
+            expect,
             timeout: wait.timeout_ms.map(Duration::from_millis),
         }
     } else {
         return Err(StepError::Empty);
     };
+
+    // A delay touches no link, so it neither needs one nor inherits the
+    // scenario's. Saying so canonically is what lets a scenario be written back
+    // out and read in again unchanged.
+    if matches!(action, Action::Wait { .. }) {
+        if raw.connection.is_some() {
+            return Err(StepError::PointlessConnection);
+        }
+        return Ok(Step {
+            targets: Vec::new(),
+            action,
+        });
+    }
 
     let named = raw.connection.as_ref().map(RawTargets::names);
     let chosen = named.as_deref().unwrap_or(default);
@@ -429,9 +953,7 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
             targets.push(id);
         }
     }
-    // A delay touches no link, so insisting on one would refuse a perfectly
-    // sensible scenario that only paces itself.
-    if targets.is_empty() && !matches!(action, Action::Wait { .. }) {
+    if targets.is_empty() {
         return Err(StepError::NoConnection);
     }
 
@@ -522,8 +1044,9 @@ counters = { seq = { wrap = 255 } }
             scenario.steps[3].action,
             Action::Wait { delay } if delay == Duration::from_millis(100)
         ));
-        // And falls back to the default when it says nothing.
-        assert_eq!(scenario.steps[3].targets, [ConnectionId::from("bus")]);
+        // A delay is the one step the default does not reach, having no link
+        // to act on in the first place.
+        assert!(scenario.steps[3].targets.is_empty());
     }
 
     #[test]
@@ -686,6 +1209,261 @@ wait_ms = 100
         );
     }
 
+    /// What is written has to read back as the very same thing, or the editor
+    /// would quietly reshape a scenario every time it saved one.
+    fn round_trips(text: &str) -> Vec<Scenario> {
+        let first = from_toml(text).expect("should parse");
+        let written = to_toml(&first).expect("should serialise");
+        let second = from_toml(&written)
+            .unwrap_or_else(|error| panic!("what it wrote, it cannot read: {error}\n{written}"));
+        assert_eq!(first, second, "through:\n{written}");
+        second
+    }
+
+    #[test]
+    fn everything_a_scenario_can_hold_survives_being_written_out() {
+        round_trips(BOOT);
+        round_trips(TELEMETRY);
+        round_trips(&format!("{BOOT}\n{TELEMETRY}"));
+
+        round_trips(
+            r#"
+[[scenario]]
+name = "The lot"
+description = "Every shape of step there is"
+on = ["uart", "udp"]
+repeat = { every_ms = 250, times = 7 }
+
+[[scenario.step]]
+send = "Telemetry"
+with = { mode = 1, label = "hello", payload = "DEADBEEF", trim = -8, ratio = 1.5 }
+counters = { seq = { from = 3, step = 5, wrap = 255 }, plain = {} }
+
+[[scenario.step]]
+raw = "AA 55 00 FF"
+on = "uart"
+
+[[scenario.step]]
+wait_ms = 40
+
+[[scenario.step]]
+wait_for = { hex = "C0 ?? FE", at = 2, timeout_ms = 500 }
+
+[[scenario.step]]
+wait_for = { hex = "0102" }
+on = ["udp"]
+"#,
+        );
+    }
+
+    #[test]
+    fn what_it_writes_reads_like_something_a_person_wrote() {
+        let written = to_toml(&from_toml(BOOT).expect("should parse")).expect("should serialise");
+
+        // Each step under its own header, and the small tables on one line
+        // rather than exiled into sections of their own below the step.
+        assert!(written.contains("[[scenario.step]]"), "{written}");
+        assert!(written.contains("with = { session = 1 }"), "{written}");
+        assert!(
+            written.contains(r#"wait_for = { hex = "AA 55 ?? 01", at = 0, timeout_ms = 500 }"#),
+            "{written}"
+        );
+        assert!(
+            !written.contains("[scenario.step.with]"),
+            "no section for three words:\n{written}"
+        );
+
+        // And a couple of link names stay on one line too.
+        let many = to_toml(
+            &from_toml(
+                r#"
+[[scenario]]
+name = "Both"
+on = ["bus", "uart"]
+[[scenario.step]]
+raw = "00"
+"#,
+            )
+            .expect("should parse"),
+        )
+        .expect("should serialise");
+        assert!(many.contains(r#"on = ["bus", "uart"]"#), "{many}");
+    }
+
+    const COMMENTED: &str = r#"# What this file is for, and who wrote it.
+# Second line of that.
+
+[[scenario]]
+# Why this scenario exists at all.
+name = "Boot"
+description = "The one with comments"
+on = "bus"
+
+[[scenario.step]]
+# This step has to come first, and here is the reason.
+raw = "00"
+
+[[scenario.step]]
+wait_ms = 50
+
+[[scenario]]
+# A neighbour that must not be touched.
+name = "Other"
+on = "bus"
+
+[[scenario.step]]
+raw = "FF"
+"#;
+
+    #[test]
+    fn editing_one_scenario_leaves_every_comment_where_it_was() {
+        let mut scenarios = from_toml(COMMENTED).expect("should parse");
+        let boot = &mut scenarios[0];
+        boot.description = Some("Edited by the panel".to_owned());
+        let Action::Raw { bytes } = &mut boot.steps[0].action else {
+            panic!("expected a raw step");
+        };
+        *bytes = vec![0x01];
+        let Action::Wait { delay } = &mut boot.steps[1].action else {
+            panic!("expected a delay");
+        };
+        *delay = Duration::from_millis(75);
+
+        let written = update_in(COMMENTED, "Boot", boot).expect("should update");
+
+        for comment in [
+            "# What this file is for, and who wrote it.",
+            "# Second line of that.",
+            "# Why this scenario exists at all.",
+            "# This step has to come first, and here is the reason.",
+            "# A neighbour that must not be touched.",
+        ] {
+            assert!(written.contains(comment), "lost {comment}:\n{written}");
+        }
+
+        // The edits landed.
+        assert!(
+            written.contains(r#"description = "Edited by the panel""#),
+            "{written}"
+        );
+        assert!(written.contains(r#"raw = "01""#), "{written}");
+        assert!(written.contains("wait_ms = 75"), "{written}");
+        assert!(!written.contains("wait_ms = 50"), "{written}");
+
+        // The neighbour is untouched, and the whole thing still reads back.
+        assert!(written.contains(r#"raw = "FF""#), "{written}");
+        let back = from_toml(&written).expect("what it wrote, it can read");
+        assert_eq!(back[0], *boot);
+        assert_eq!(back[1], scenarios[1]);
+    }
+
+    #[test]
+    fn a_step_added_or_removed_keeps_the_rest_of_the_file() {
+        let mut scenarios = from_toml(COMMENTED).expect("should parse");
+        let boot = &mut scenarios[0];
+        boot.steps.push(Step {
+            targets: vec![ConnectionId::from("bus")],
+            action: Action::Raw { bytes: vec![0xEE] },
+        });
+        let written = update_in(COMMENTED, "Boot", boot).expect("should update");
+        assert!(written.contains("# What this file is for"), "{written}");
+        assert!(written.contains(r#"raw = "EE""#), "{written}");
+        // At the end, not wherever the writer happened to reach it.
+        let grown = from_toml(&written).expect("reads back");
+        assert_eq!(grown[0].steps.len(), 3);
+        assert!(matches!(
+            &grown[0].steps[2].action,
+            Action::Raw { bytes } if bytes == &[0xEE]
+        ));
+        assert_eq!(grown[1].steps.len(), 1, "the neighbour keeps its own");
+
+        boot.steps.truncate(1);
+        let shorter = update_in(COMMENTED, "Boot", boot).expect("should update");
+        assert!(!shorter.contains("wait_ms"), "{shorter}");
+        assert_eq!(from_toml(&shorter).expect("reads back")[0].steps.len(), 1);
+    }
+
+    #[test]
+    fn a_scenario_can_be_added_to_a_file_or_taken_out_of_one() {
+        let extra = one(TELEMETRY);
+        let grown = append_to(COMMENTED, &extra).expect("should append");
+        assert!(grown.contains("# What this file is for"), "{grown}");
+        assert_eq!(from_toml(&grown).expect("reads back").len(), 3);
+
+        let shrunk = remove_from(&grown, "Other").expect("should remove");
+        let left = from_toml(&shrunk).expect("reads back");
+        assert_eq!(
+            left.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Boot", "Telemetry 10 Hz"]
+        );
+        // Taking one out does not disturb what surrounds it.
+        assert!(
+            shrunk.contains("# Why this scenario exists at all."),
+            "{shrunk}"
+        );
+    }
+
+    #[test]
+    fn editing_something_the_file_does_not_hold_is_refused() {
+        let scenario = one(TELEMETRY);
+        assert!(update_in(COMMENTED, "Nowhere", &scenario).is_err());
+        assert!(remove_from(COMMENTED, "Nowhere").is_err());
+    }
+
+    #[test]
+    fn writing_hoists_the_link_most_steps_share() {
+        let scenarios = from_toml(
+            r#"
+[[scenario]]
+name = "Mostly one link"
+on = "bus"
+[[scenario.step]]
+raw = "00"
+[[scenario.step]]
+raw = "01"
+[[scenario.step]]
+raw = "02"
+on = "uart"
+"#,
+        )
+        .expect("should parse");
+        let written = to_toml(&scenarios).expect("should serialise");
+
+        // Said once at the top, and only the odd one out repeats it.
+        assert_eq!(written.matches(r#"on = "bus""#).count(), 1, "{written}");
+        assert!(written.contains("uart"), "{written}");
+    }
+
+    #[test]
+    fn a_delay_neither_takes_a_link_nor_is_given_one() {
+        let scenario = one(r#"
+[[scenario]]
+name = "Paced"
+on = "bus"
+[[scenario.step]]
+wait_ms = 10
+[[scenario.step]]
+raw = "00"
+"#);
+        // The scenario default reaches the send and stops at the delay, so
+        // writing it back cannot invent a link the delay never had.
+        assert!(scenario.steps[0].targets.is_empty());
+        assert_eq!(scenario.steps[1].targets, [ConnectionId::from("bus")]);
+
+        // And saying it outright is refused rather than quietly ignored.
+        let error = from_toml(
+            r#"
+[[scenario]]
+name = "Confused"
+[[scenario.step]]
+wait_ms = 10
+on = "bus"
+"#,
+        )
+        .expect_err("a delay acts on nothing");
+        assert!(error.to_string().contains("means nothing"), "{error}");
+    }
+
     #[test]
     fn a_period_of_zero_is_refused_rather_than_built() {
         let error = from_toml(
@@ -795,6 +1573,76 @@ send = "Telemetry"
         )
         .expect_err("no default and no override");
         assert!(error.to_string().contains("no connection"), "{error}");
+    }
+
+    #[test]
+    fn a_wait_can_name_a_frame_instead_of_spelling_out_bytes() {
+        let scenario = one(r#"
+[[scenario]]
+name = "Answered"
+on = "bus"
+[[scenario.step]]
+wait_for = { frame = "Telemetry", match = { sync = 43605, mode = 3 }, timeout_ms = 500 }
+"#);
+        let Action::WaitFor {
+            expect: Expect::Frame { frame, values },
+            timeout: Some(_),
+        } = &scenario.steps[0].action
+        else {
+            panic!("expected a frame wait");
+        };
+        assert_eq!(frame, "Telemetry");
+        // Values, not just names: waiting for mode = FAULT has to be sayable.
+        assert_eq!(values["mode"], Value::Uint(3));
+        assert_eq!(values["sync"], Value::Uint(43605));
+        // The frame it names is one the engine has to be handed.
+        assert_eq!(scenario.frames_used(), ["Telemetry"]);
+
+        round_trips(
+            r#"
+[[scenario]]
+name = "Answered"
+on = "bus"
+[[scenario.step]]
+wait_for = { frame = "Telemetry", match = { sync = 43605 }, timeout_ms = 500 }
+[[scenario.step]]
+wait_for = { hex = "C0 ?? FE", at = 1 }
+"#,
+        );
+    }
+
+    #[test]
+    fn a_wait_has_to_say_one_thing_or_the_other() {
+        for (label, text, expected) in [
+            (
+                "both",
+                r#"wait_for = { hex = "AA55", frame = "Telemetry", match = { sync = 1 } }"#,
+                "not both",
+            ),
+            ("neither", "wait_for = { timeout_ms = 10 }", "either hex"),
+            (
+                "hex with match",
+                r#"wait_for = { hex = "AA55", match = { sync = 1 } }"#,
+                "not both",
+            ),
+            (
+                "frame with no fields",
+                r#"wait_for = { frame = "Telemetry" }"#,
+                "at least one field",
+            ),
+            (
+                "frame with an offset",
+                r#"wait_for = { frame = "Telemetry", match = { sync = 1 }, at = 0 }"#,
+                "means nothing when matching a frame",
+            ),
+        ] {
+            let text =
+                format!("[[scenario]]\nname = \"W\"\non = \"bus\"\n[[scenario.step]]\n{text}\n");
+            let error = from_toml(&text)
+                .expect_err(&format!("{label} should be refused"))
+                .to_string();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
     }
 
     #[test]

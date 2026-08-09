@@ -1024,3 +1024,140 @@ wait_for = { hex = "C0 FE", timeout_ms = 120 }
     assert!(reason.contains("step 2"), "{reason}");
     assert!(reason.contains("near"), "{reason}");
 }
+
+/// A wait can name a frame and the fields that matter instead of spelling out
+/// bytes, which is what the editor writes for someone who does not think in
+/// hex. The pattern is worked out from the definition at run time.
+#[tokio::test]
+async fn a_wait_can_match_a_frame_by_its_fields() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let near = "127.0.0.1:19861".parse().unwrap();
+    let far = "127.0.0.1:19862".parse().unwrap();
+    for (name, bind, remote) in [("near", near, far), ("far", far, near)] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["near", "far"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "By fields"
+on = "near"
+
+[[scenario.step]]
+wait_for = { frame = "Beacon", match = { sync = 43605, mode = 1 }, timeout_ms = 4000 }
+
+[[scenario.step]]
+raw = "99"
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![scenario_frame()],
+    })
+    .await
+    .unwrap();
+
+    // Beacon is sync = 0xAA55, then seq, then mode. The wait asks for mode = 1,
+    // while the frame's own default for mode is 0, so a frame carrying the
+    // default must not release it: what is compared is the value asked for, not
+    // whatever the definition happens to declare.
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("far"),
+        bytes: vec![0xAA, 0x55, 0x07, 0x00],
+    })
+    .await
+    .unwrap();
+    wait_for(&mut rx, |event| {
+        matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == "near" && bytes == &[0xAA, 0x55, 0x07, 0x00])
+    })
+    .await;
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            wait_for(&mut rx, |event| matches!(
+                event,
+                Event::FrameReceived { bytes, .. } if bytes == &[0x99]
+            ))
+        )
+        .await
+        .is_err(),
+        "a frame differing on a matched field must not release the wait"
+    );
+
+    // The mode that was asked for, with a different seq: seq was not named, so
+    // it is free to be anything.
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("far"),
+        bytes: vec![0xAA, 0x55, 0x2A, 0x01],
+    })
+    .await
+    .unwrap();
+    gather_until(&mut rx, |events| {
+        events.iter().any(|event| {
+            matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == "far" && bytes == &[0x99])
+        }) && finished_with(events, "By fields", &sim_core::Outcome::Completed)
+    })
+    .await;
+}
+
+/// Naming a field the frame does not have fails the scenario rather than
+/// quietly matching on less than was asked for.
+#[tokio::test]
+async fn a_wait_naming_an_unknown_field_says_so() {
+    let (tx, mut rx) = Engine::spawn();
+
+    tx.send(Command::Connect {
+        id: ConnectionId::from("link"),
+        config: TransportConfig::Udp {
+            bind: "127.0.0.1:19863".parse().unwrap(),
+            remote: "127.0.0.1:19864".parse().unwrap(),
+        },
+        retry: None,
+    })
+    .await
+    .unwrap();
+    wait_all_connected(&mut rx, &["link"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Typo"
+on = "link"
+[[scenario.step]]
+wait_for = { frame = "Beacon", match = { synk = 1 }, timeout_ms = 2000 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![scenario_frame()],
+    })
+    .await
+    .unwrap();
+
+    let event = wait_for(
+        &mut rx,
+        |event| matches!(event, Event::ScenarioFinished { name, .. } if name == "Typo"),
+    )
+    .await;
+    let Event::ScenarioFinished { outcome, .. } = event else {
+        panic!("expected the scenario to finish");
+    };
+    let sim_core::Outcome::Failed(reason) = outcome else {
+        panic!("an unknown field is a failure, got {outcome:?}");
+    };
+    assert!(reason.contains("synk"), "{reason}");
+}

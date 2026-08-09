@@ -1,12 +1,13 @@
 use std::fmt::Write as _;
+use std::time::Duration;
 
-use sim_core::scenario::{Action, Scenario, Step};
+use sim_core::scenario::{Action, Expect, Scenario, Step};
 
 use egui::{Color32, Grid, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
 
 use crate::engine_handle::EngineHandle;
-use crate::panels::widest;
+use crate::panels::{scenario_edit, widest};
 use crate::state::AppState;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
@@ -19,7 +20,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         ui.colored_label(ERROR, format!("{file}: {reason}"));
     }
 
-    if state.scenarios.scenarios.is_empty() {
+    if state.scenarios.entries.is_empty() {
         if state.scenarios.directory.is_some() && state.scenarios.failures.is_empty() {
             ui.label("No .toml scenario in that folder.");
         }
@@ -28,21 +29,99 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
     ui.separator();
     scenario_list(ui, state, engine);
+    ui.separator();
+
+    // Editing a copy, so what the list and the disk hold is untouched until
+    // Save says otherwise.
+    if state.scenarios.draft.is_some() {
+        let dirty = state.scenarios.draft_is_dirty();
+        let problem = state
+            .scenarios
+            .draft
+            .as_ref()
+            .and_then(crate::scenarios::Draft::problem);
+        scenario_edit::header(ui, state);
+        ui.separator();
+        ScrollArea::vertical()
+            .id_salt("scenario_editor")
+            .show(ui, |ui| scenario_edit::steps(ui, state));
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    dirty && problem.is_none(),
+                    egui::Button::new(format!("{} Save", icons::FLOPPY_DISK)),
+                )
+                .clicked()
+            {
+                save(state);
+            }
+            if ui.button("Cancel").clicked() {
+                state.scenarios.cancel_edit();
+            }
+            // Said here rather than after the click: a half-made scenario is a
+            // normal state to be in while building one.
+            if let Some(reason) = &problem {
+                ui.colored_label(ERROR, reason);
+            }
+        });
+        return;
+    }
 
     let Some(scenario) = state.scenarios.selected_scenario().cloned() else {
         return;
     };
-    ui.separator();
     steps(ui, state, &scenario);
+}
+
+/// Writes the draft out, choosing a file for one that has never had a home.
+fn save(state: &mut AppState) {
+    let Some(directory) = state.scenarios.directory.clone() else {
+        state.last_error = Some("No scenarios folder to save into.".to_owned());
+        return;
+    };
+    let name = state
+        .scenarios
+        .draft
+        .as_ref()
+        .map(|draft| draft.scenario.name.clone())
+        .unwrap_or_default();
+
+    let into = crate::scenarios::suggested_file(&directory, &name);
+    if let Err(error) = state.scenarios.save_draft(&into) {
+        state.last_error = Some(format!("{error:#}"));
+    }
+}
+
+/// What New starts from: one delay, which is the only step that needs nothing
+/// else to exist yet, since there may be no connection configured at all.
+fn blank() -> Scenario {
+    Scenario {
+        name: "New scenario".to_owned(),
+        description: None,
+        steps: vec![Step {
+            targets: Vec::new(),
+            action: Action::Wait {
+                delay: Duration::from_millis(100),
+            },
+        }],
+        repeat: None,
+    }
 }
 
 fn library_bar(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
+        // Both throw the draft away, so neither is offered while one is open:
+        // losing unsaved work to a stray click is not a trade worth making.
+        let idle = state.scenarios.draft.is_none();
         if ui
-            .button(RichText::new(format!(
-                "{} Scenarios folder",
-                icons::FOLDER_OPEN
-            )))
+            .add_enabled(
+                idle,
+                egui::Button::new(RichText::new(format!(
+                    "{} Scenarios folder",
+                    icons::FOLDER_OPEN
+                ))),
+            )
             .clicked()
         {
             if let Some(directory) = rfd::FileDialog::new().pick_folder() {
@@ -51,11 +130,63 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         }
         if state.scenarios.directory.is_some()
             && ui
-                .button(RichText::new(format!("{} Reload", icons::ARROWS_CLOCKWISE)))
+                .add_enabled(
+                    idle,
+                    egui::Button::new(RichText::new(format!("{} Reload", icons::ARROWS_CLOCKWISE))),
+                )
                 .on_hover_text("Re-read the .toml files from disk")
                 .clicked()
         {
             state.scenarios.reload();
+        }
+
+        ui.separator();
+
+        let editing = state.scenarios.draft.is_some();
+        // A running scenario is keyed by name in the engine, so renaming or
+        // deleting it would leave something running with no row to stop it
+        // from, and a rename would even let a second copy start.
+        let running = state
+            .scenarios
+            .selected_scenario()
+            .is_some_and(|scenario| state.running.contains_key(&scenario.name));
+        if ui
+            .add_enabled(
+                state.scenarios.directory.is_some() && !editing,
+                egui::Button::new(format!("{} New", icons::FILE_PLUS)),
+            )
+            .on_hover_text("Start a scenario from scratch")
+            .clicked()
+        {
+            state.scenarios.begin_new(blank());
+        }
+        let editable = state.scenarios.selected_entry().is_some() && !editing && !running;
+        if ui
+            .add_enabled(
+                editable,
+                egui::Button::new(format!("{} Edit", icons::PENCIL_SIMPLE)),
+            )
+            .on_hover_text(if running {
+                "Stop it before editing it"
+            } else {
+                "Edit this scenario"
+            })
+            .clicked()
+        {
+            state.scenarios.begin_edit();
+        }
+        if ui
+            .add_enabled(editable, egui::Button::new(icons::TRASH))
+            .on_hover_text(if running {
+                "Stop it before deleting it"
+            } else {
+                "Delete this scenario from its file"
+            })
+            .clicked()
+        {
+            if let Err(error) = state.scenarios.delete_selected() {
+                state.last_error = Some(format!("{error:#}"));
+            }
         }
     });
 
@@ -74,9 +205,9 @@ fn scenario_list(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     // and the borrow checker is right that those cannot overlap.
     let listed: Vec<(usize, Scenario)> = state
         .scenarios
-        .scenarios
+        .entries
         .iter()
-        .cloned()
+        .map(|entry| entry.scenario.clone())
         .enumerate()
         .collect();
 
@@ -274,20 +405,24 @@ fn describe(step: &Step) -> String {
             format!("send raw {}", hex.join(" "))
         }
         Action::Wait { delay } => format!("wait {} ms", delay.as_millis()),
-        Action::WaitFor {
-            timeout, anchor, ..
-        } => {
-            let where_ = match anchor.offset() {
-                Some(offset) => format!(" at offset {offset}"),
-                None => String::new(),
+        Action::WaitFor { expect, timeout } => {
+            let mut text = match expect {
+                Expect::Frame { frame, values } => {
+                    let named: Vec<&str> = values.keys().map(String::as_str).collect();
+                    format!("wait for {frame} matching {}", named.join(", "))
+                }
+                Expect::Pattern { pattern, anchor } => {
+                    let mut text = format!("wait for {}", pattern.to_hex());
+                    if let Some(offset) = anchor.offset() {
+                        let _ = write!(text, " at offset {offset}");
+                    }
+                    text
+                }
             };
-            match timeout {
-                Some(limit) => format!(
-                    "wait for a frame{where_}, giving up after {} ms",
-                    limit.as_millis()
-                ),
-                None => format!("wait for a frame{where_}"),
+            if let Some(limit) = timeout {
+                let _ = write!(text, ", giving up after {} ms", limit.as_millis());
             }
+            text
         }
     }
 }
@@ -414,6 +549,8 @@ raw = "AA 55"
 wait_ms = 40
 [[scenario.step]]
 wait_for = { hex = "C0 FE", at = 2, timeout_ms = 500 }
+[[scenario.step]]
+wait_for = { frame = "Telemetry", match = { sync = 1, mode = 2 } }
 "#,
         );
 
@@ -423,7 +560,8 @@ wait_for = { hex = "C0 FE", at = 2, timeout_ms = 500 }
         assert_eq!(lines[2], "wait 40 ms");
         assert_eq!(
             lines[3],
-            "wait for a frame at offset 2, giving up after 500 ms"
+            "wait for C0 FE at offset 2, giving up after 500 ms"
         );
+        assert_eq!(lines[4], "wait for Telemetry matching mode, sync");
     }
 }

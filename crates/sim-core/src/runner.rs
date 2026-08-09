@@ -19,7 +19,8 @@ use crate::connection::ConnectionId;
 use crate::engine::{Command, Event};
 use crate::frame::value::{seed_values, Value};
 use crate::frame::{codec, FrameDef};
-use crate::scenario::{Action, Counter, Scenario, Step};
+use crate::pattern::{Anchor, HexPattern};
+use crate::scenario::{Action, Counter, Expect, Scenario, Step};
 
 /// A frame as it arrived, republished for whoever is waiting for one.
 ///
@@ -141,11 +142,15 @@ async fn execute(
             Ok(bytes) => send_to_all(commands, &step.targets, &bytes).await,
             Err(reason) => StepResult::Failed(reason),
         },
-        Action::WaitFor {
-            pattern,
-            anchor,
-            timeout,
-        } => {
+        Action::WaitFor { expect, timeout } => {
+            // Resolved here rather than at load, because turning a frame into
+            // bytes needs the definitions, and only a running scenario has
+            // them.
+            let (pattern, anchor) = match resolve(expect, frames) {
+                Ok(resolved) => resolved,
+                Err(reason) => return StepResult::Failed(reason),
+            };
+            let (pattern, anchor) = (&pattern, &anchor);
             // Started from where the stream is now, not from where the scenario
             // subscribed. Held across steps, the buffer would let a frame from
             // an earlier pass, or from before this wait was ever reached,
@@ -241,6 +246,46 @@ async fn send(
     }
 }
 
+/// The bytes a wait is watching for.
+///
+/// A frame becomes a pattern by being encoded with its own defaults and then
+/// masked down to the fields that were named: everything else is free to be
+/// anything. Anchored at the start, a received frame beginning where the
+/// definition says it does.
+fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor), String> {
+    match expect {
+        Expect::Pattern { pattern, anchor } => Ok((pattern.clone(), *anchor)),
+        Expect::Frame { frame, values } => {
+            let definition = frames
+                .iter()
+                .find(|known| &known.name == frame)
+                .ok_or_else(|| format!("no frame named {frame}"))?;
+
+            // The frame as it would look carrying the values asked for, then
+            // masked down to the fields that were asked about. Everything else
+            // is free, so a reply matches on what was specified and nothing
+            // more.
+            let wanted = overlaid(definition, values)?;
+            let bytes = codec::encode(definition, &wanted)
+                .map_err(|error| format!("{frame} cannot be encoded: {error}"))?;
+
+            let mut keep = vec![false; definition.size()];
+            let mut offset = 0;
+            for declared in &definition.fields {
+                let width = declared.kind.size();
+                if values.contains_key(&declared.name) {
+                    for slot in keep.iter_mut().skip(offset).take(width) {
+                        *slot = true;
+                    }
+                }
+                offset += width;
+            }
+
+            Ok((HexPattern::masked(&bytes, &keep), Anchor::At(0)))
+        }
+    }
+}
+
 /// The frame's own defaults, overlaid with what the step overrides and what its
 /// counters have reached.
 fn encode(
@@ -255,17 +300,7 @@ fn encode(
         .find(|frame| frame.name == name)
         .ok_or_else(|| format!("no frame named {name}"))?;
 
-    let mut values = seed_values(frame);
-    for (field, value) in with {
-        // Overrides come from a file, so they arrive in whatever shape TOML
-        // suggested rather than the one the field declares.
-        let kind = field_kind(frame, field)?;
-        let coerced = value
-            .clone()
-            .coerced_to(kind)
-            .ok_or_else(|| format!("{name}.{field} cannot hold {}", value.type_name()))?;
-        values.insert(field.clone(), coerced);
-    }
+    let mut values = overlaid(frame, with)?;
     for (field, counter) in counters {
         let kind = field_kind(frame, field)?;
         let value = Value::Uint(counter.at(u64::from(pass)))
@@ -275,6 +310,28 @@ fn encode(
     }
 
     codec::encode(frame, &values).map_err(|error| error.to_string())
+}
+
+/// The frame's own defaults with `given` laid over them.
+///
+/// Values arrive from a file in whatever shape TOML suggested rather than the
+/// one the field declares, so each is put through the field's own reading of it
+/// before it is used. Naming a field the frame does not have is reported rather
+/// than ignored, since ignoring it would match on less than was asked for.
+fn overlaid(
+    frame: &FrameDef,
+    given: &BTreeMap<String, Value>,
+) -> Result<crate::frame::value::FieldValues, String> {
+    let mut values = seed_values(frame);
+    for (field, value) in given {
+        let kind = field_kind(frame, field)?;
+        let coerced = value
+            .clone()
+            .coerced_to(kind)
+            .ok_or_else(|| format!("{}.{field} cannot hold {}", frame.name, value.type_name()))?;
+        values.insert(field.clone(), coerced);
+    }
+    Ok(values)
 }
 
 fn field_kind<'a>(frame: &'a FrameDef, field: &str) -> Result<&'a crate::frame::FieldKind, String> {

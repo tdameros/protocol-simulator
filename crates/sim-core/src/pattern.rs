@@ -86,6 +86,36 @@ impl HexPattern {
             .all(|(expected, actual)| expected.is_none_or(|byte| byte == *actual))
     }
 
+    /// A pattern over `bytes`, keeping only the ones `keep` marks and letting
+    /// every other byte be anything.
+    ///
+    /// How a frame becomes something to wait for: encode it with its defaults,
+    /// mark the bytes belonging to the fields that have to match, and the rest
+    /// falls away as wildcards.
+    #[must_use]
+    pub fn masked(bytes: &[u8], keep: &[bool]) -> Self {
+        Self(
+            bytes
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| keep.get(index).copied().unwrap_or(false).then_some(*byte))
+                .collect(),
+        )
+    }
+
+    /// The pattern as it is written down, `??` for a byte that may be anything.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        self.0
+            .iter()
+            .map(|byte| match byte {
+                Some(value) => format!("{value:02X}"),
+                None => "??".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[must_use]
     pub fn found_in(&self, bytes: &[u8], anchor: Anchor) -> bool {
         match anchor {
@@ -143,6 +173,23 @@ mod tests {
         let pattern = HexPattern::parse("AA 55 01 02 03").expect("should parse");
         assert!(!pattern.found_in(&[0xAA, 0x55, 0x01, 0x02], Anchor::Anywhere));
         assert!(!pattern.found_in(&[], Anchor::Anywhere));
+    }
+
+    #[test]
+    fn a_masked_pattern_keeps_only_what_was_marked() {
+        let pattern = HexPattern::masked(&[0xAA, 0x55, 0x07, 0x01], &[true, true, false, true]);
+        assert_eq!(pattern.to_hex(), "AA 55 ?? 01");
+
+        // What it keeps still has to be there, and what it dropped is free.
+        assert!(pattern.found_in(&[0xAA, 0x55, 0xFF, 0x01], Anchor::At(0)));
+        assert!(!pattern.found_in(&[0xAA, 0x55, 0xFF, 0x02], Anchor::At(0)));
+
+        // Marking nothing matches any frame of that length, which is why the
+        // loader refuses an empty list of fields rather than writing this.
+        assert_eq!(
+            HexPattern::masked(&[1, 2], &[false, false]).to_hex(),
+            "?? ??"
+        );
     }
 
     #[test]
