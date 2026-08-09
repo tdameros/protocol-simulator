@@ -56,6 +56,9 @@ pub enum StepError {
     #[error("no connection to act on, and the scenario names no default")]
     NoConnection,
 
+    #[error("unknown setting, expected one of {known}")]
+    UnknownSetting { known: String },
+
     #[error("{hex} is not a usable byte pattern")]
     BadPattern { hex: String },
 
@@ -110,9 +113,10 @@ pub struct Repeat {
 pub struct Step {
     /// The links this acts on, already resolved from the scenario's default.
     ///
-    /// Never empty, and never holding the same link twice: a step aimed at
+    /// Empty only for a plain delay, which touches no link at all. Everything
+    /// else has at least one, and never the same one twice: a step aimed at
     /// `["uart", "uart"]` would otherwise send everything in duplicate, and a
-    /// wait would be counting one answer as two.
+    /// wait would count one answer as two.
     pub targets: Vec<ConnectionId>,
     pub action: Action,
 }
@@ -181,13 +185,18 @@ impl Counter {
 // The file
 // ---------------------------------------------------------------------------
 
+// `deny_unknown_fields` throughout: a misspelt key used to be dropped in
+// silence, so `repeatt = { every_ms = 100 }` gave a scenario that ran once and
+// said nothing about why. Being refused by name is worth the strictness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFile {
     #[serde(default, rename = "scenario")]
     scenarios: Vec<RawScenario>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawScenario {
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +211,7 @@ struct RawScenario {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawRepeat {
     every_ms: u64,
     /// Absent repeats until stopped.
@@ -231,6 +241,7 @@ impl RawTargets {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawStep {
     #[serde(default, rename = "on", skip_serializing_if = "Option::is_none")]
     connection: Option<RawTargets>,
@@ -252,15 +263,21 @@ struct RawStep {
     wait_for: Option<RawWaitFor>,
 }
 
+/// Spelt out rather than flattening a `PatternSpec`, because serde refuses to
+/// police unknown keys on a struct that flattens another, and a typo here is
+/// exactly what needs catching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawWaitFor {
-    #[serde(flatten)]
-    pattern: PatternSpec,
+    hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCounter {
     #[serde(default)]
     from: u64,
@@ -375,12 +392,13 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
             delay: Duration::from_millis(delay),
         }
     } else if let Some(wait) = raw.wait_for {
-        let (pattern, anchor) = wait
-            .pattern
-            .compile()
-            .ok_or_else(|| StepError::BadPattern {
-                hex: wait.pattern.hex.clone(),
-            })?;
+        let spec = PatternSpec {
+            hex: wait.hex,
+            at: wait.at,
+        };
+        let (pattern, anchor) = spec.compile().ok_or_else(|| StepError::BadPattern {
+            hex: spec.hex.clone(),
+        })?;
         Action::WaitFor {
             pattern,
             anchor,
@@ -400,7 +418,9 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
             targets.push(id);
         }
     }
-    if targets.is_empty() {
+    // A delay touches no link, so insisting on one would refuse a perfectly
+    // sensible scenario that only paces itself.
+    if targets.is_empty() && !matches!(action, Action::Wait { .. }) {
         return Err(StepError::NoConnection);
     }
 
@@ -639,6 +659,78 @@ wait_ms = 10
         )
         .expect_err("one step does one thing");
         assert!(error.to_string().contains("several things"), "{error}");
+    }
+
+    #[test]
+    fn a_scenario_that_only_paces_itself_needs_no_link() {
+        let scenario = one(r#"
+[[scenario]]
+name = "Just waiting"
+[[scenario.step]]
+wait_ms = 100
+"#);
+        assert!(
+            scenario.steps[0].targets.is_empty(),
+            "a delay touches nothing"
+        );
+    }
+
+    #[test]
+    fn a_misspelt_setting_is_refused_by_name() {
+        // The trap this exists for: silently ignored, this ran once instead of
+        // repeating, and said nothing about why.
+        let error = from_toml(
+            r#"
+[[scenario]]
+name = "Typo"
+on = "bus"
+repeatt = { every_ms = 100 }
+[[scenario.step]]
+raw = "00"
+"#,
+        )
+        .expect_err("repeatt is not repeat");
+        assert!(error.to_string().contains("repeatt"), "{error}");
+
+        for (label, text) in [
+            (
+                "step",
+                r#"
+[[scenario]]
+name = "Typo"
+on = "bus"
+[[scenario.step]]
+raw = "00"
+delay_ms = 5
+"#,
+            ),
+            (
+                "wait_for",
+                r#"
+[[scenario]]
+name = "Typo"
+on = "bus"
+[[scenario.step]]
+wait_for = { hex = "AA55", timeout = 500 }
+"#,
+            ),
+            (
+                "counter",
+                r#"
+[[scenario]]
+name = "Typo"
+on = "bus"
+[[scenario.step]]
+send = "Thing"
+counters = { seq = { wraps = 255 } }
+"#,
+            ),
+        ] {
+            assert!(
+                from_toml(text).is_err(),
+                "a stray key in a {label} should be refused"
+            );
+        }
     }
 
     #[test]

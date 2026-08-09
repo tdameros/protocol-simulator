@@ -157,7 +157,34 @@ fn start(state: &mut AppState, engine: &EngineHandle, scenario: &Scenario) {
         return;
     }
 
+    // Connections get the same treatment. A scenario file is loaded on its own,
+    // knowing nothing of the project's links, so a misspelt `on` used to sail
+    // through and only show up as an error per send, once a second or once
+    // every 10 ms, without stopping anything.
+    let unknown = unknown_connections(state, scenario);
+    if !unknown.is_empty() {
+        state.last_error = Some(format!(
+            "[{}] no connection named {}",
+            scenario.name,
+            unknown.join(", ")
+        ));
+        return;
+    }
+
     engine.start_scenario(scenario.clone(), frames);
+}
+
+/// Names the scenario aims at that the project does not define, in the order
+/// they first appear so the message points at the first line to fix.
+fn unknown_connections(state: &AppState, scenario: &Scenario) -> Vec<String> {
+    let mut unknown: Vec<String> = Vec::new();
+    for target in scenario.steps.iter().flat_map(|step| &step.targets) {
+        let known = state.connections.iter().any(|(id, _)| id == target);
+        if !known && !unknown.contains(&target.0) {
+            unknown.push(target.0.clone());
+        }
+    }
+    unknown
 }
 
 /// What the scenario does, in one line, so the list is readable without opening
@@ -273,6 +300,61 @@ mod tests {
         sim_core::scenario::from_toml(text)
             .expect("should parse")
             .remove(0)
+    }
+
+    #[test]
+    fn a_misspelt_connection_is_caught_before_anything_is_sent() {
+        let mut state = AppState::default();
+        state.connections = vec![(
+            sim_core::ConnectionId::from("bus"),
+            crate::state::ConnectionEntry {
+                config: sim_core::TransportConfig::Udp {
+                    bind: "127.0.0.1:9000".parse().expect("address"),
+                    remote: "127.0.0.1:9001".parse().expect("address"),
+                },
+                status: sim_core::ConnectionStatus::Connected,
+                retry: None,
+                autoconnect: false,
+            },
+        )];
+
+        let good = parse(
+            r#"
+[[scenario]]
+name = "Fine"
+on = "bus"
+[[scenario.step]]
+raw = "00"
+"#,
+        );
+        assert!(unknown_connections(&state, &good).is_empty());
+
+        let typo = parse(
+            r#"
+[[scenario]]
+name = "Typo"
+on = ["bus", "buss"]
+[[scenario.step]]
+raw = "00"
+[[scenario.step]]
+raw = "01"
+on = "uart"
+"#,
+        );
+        // Reported once each, in the order they appear, so the message points
+        // at the first line to go and fix.
+        assert_eq!(unknown_connections(&state, &typo), ["buss", "uart"]);
+
+        // A delay names no link, so it can never be the reason for a refusal.
+        let waiting = parse(
+            r#"
+[[scenario]]
+name = "Waiting"
+[[scenario.step]]
+wait_ms = 10
+"#,
+        );
+        assert!(unknown_connections(&state, &waiting).is_empty());
     }
 
     #[test]
