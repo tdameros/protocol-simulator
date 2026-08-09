@@ -255,17 +255,25 @@ async fn send(
 fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor), String> {
     match expect {
         Expect::Pattern { pattern, anchor } => Ok((pattern.clone(), *anchor)),
-        Expect::Frame { frame, fields } => {
+        Expect::Frame { frame, values } => {
             let definition = frames
                 .iter()
                 .find(|known| &known.name == frame)
                 .ok_or_else(|| format!("no frame named {frame}"))?;
 
+            // The frame as it would look carrying the values asked for, then
+            // masked down to the fields that were asked about. Everything else
+            // is free, so a reply matches on what was specified and nothing
+            // more.
+            let wanted = overlaid(definition, values)?;
+            let bytes = codec::encode(definition, &wanted)
+                .map_err(|error| format!("{frame} cannot be encoded: {error}"))?;
+
             let mut keep = vec![false; definition.size()];
             let mut offset = 0;
             for declared in &definition.fields {
                 let width = declared.kind.size();
-                if fields.iter().any(|wanted| wanted == &declared.name) {
+                if values.contains_key(&declared.name) {
                     for slot in keep.iter_mut().skip(offset).take(width) {
                         *slot = true;
                     }
@@ -273,20 +281,6 @@ fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor),
                 offset += width;
             }
 
-            // Named a field the frame does not have, which is worth saying
-            // rather than quietly matching on less than was asked for.
-            for wanted in fields {
-                if !definition
-                    .fields
-                    .iter()
-                    .any(|declared| &declared.name == wanted)
-                {
-                    return Err(format!("{frame} has no field named {wanted}"));
-                }
-            }
-
-            let bytes = codec::encode(definition, &seed_values(definition))
-                .map_err(|error| format!("{frame} cannot be encoded: {error}"))?;
             Ok((HexPattern::masked(&bytes, &keep), Anchor::At(0)))
         }
     }
@@ -306,17 +300,7 @@ fn encode(
         .find(|frame| frame.name == name)
         .ok_or_else(|| format!("no frame named {name}"))?;
 
-    let mut values = seed_values(frame);
-    for (field, value) in with {
-        // Overrides come from a file, so they arrive in whatever shape TOML
-        // suggested rather than the one the field declares.
-        let kind = field_kind(frame, field)?;
-        let coerced = value
-            .clone()
-            .coerced_to(kind)
-            .ok_or_else(|| format!("{name}.{field} cannot hold {}", value.type_name()))?;
-        values.insert(field.clone(), coerced);
-    }
+    let mut values = overlaid(frame, with)?;
     for (field, counter) in counters {
         let kind = field_kind(frame, field)?;
         let value = Value::Uint(counter.at(u64::from(pass)))
@@ -326,6 +310,28 @@ fn encode(
     }
 
     codec::encode(frame, &values).map_err(|error| error.to_string())
+}
+
+/// The frame's own defaults with `given` laid over them.
+///
+/// Values arrive from a file in whatever shape TOML suggested rather than the
+/// one the field declares, so each is put through the field's own reading of it
+/// before it is used. Naming a field the frame does not have is reported rather
+/// than ignored, since ignoring it would match on less than was asked for.
+fn overlaid(
+    frame: &FrameDef,
+    given: &BTreeMap<String, Value>,
+) -> Result<crate::frame::value::FieldValues, String> {
+    let mut values = seed_values(frame);
+    for (field, value) in given {
+        let kind = field_kind(frame, field)?;
+        let coerced = value
+            .clone()
+            .coerced_to(kind)
+            .ok_or_else(|| format!("{}.{field} cannot hold {}", frame.name, value.type_name()))?;
+        values.insert(field.clone(), coerced);
+    }
+    Ok(values)
 }
 
 fn field_kind<'a>(frame: &'a FrameDef, field: &str) -> Result<&'a crate::frame::FieldKind, String> {

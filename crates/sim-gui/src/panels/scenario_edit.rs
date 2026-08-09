@@ -347,7 +347,7 @@ fn pattern_body(ui: &mut Ui, expect: &mut Expect) {
 
 fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
     let Action::WaitFor {
-        expect: Expect::Frame { frame, fields },
+        expect: Expect::Frame { frame, values },
         ..
     } = &mut step.action
     else {
@@ -370,7 +370,7 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
                                 .clicked()
                             {
                                 frame.clone_from(&known.name);
-                                fields.clear();
+                                values.clear();
                             }
                         }
                     });
@@ -385,26 +385,51 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef]) {
                 return;
             };
             // Checksums are left out for the same reason the send editor leaves
-            // them out: computed rather than chosen, and matching one would pin
-            // the wait to a frame carrying nothing but defaults.
-            let names: Vec<String> = definition
-                .fields
-                .iter()
-                .filter(|field| !matches!(field.kind, sim_core::frame::FieldKind::Checksum { .. }))
-                .map(|field| field.name.clone())
-                .collect();
+            // them out: computed rather than chosen, so there is no value here
+            // for anyone to ask for.
+            let definition = FrameDef {
+                fields: definition
+                    .fields
+                    .iter()
+                    .filter(|field| {
+                        !matches!(field.kind, sim_core::frame::FieldKind::Checksum { .. })
+                    })
+                    .cloned()
+                    .collect(),
+                ..definition.clone()
+            };
 
+            // A ticked field carries the value it has to arrive with, edited
+            // with the very widgets a `send` step uses. Ticking seeds the
+            // frame's own default, so a sync word is still one click, and
+            // anything else can be asked for outright.
             let mut toggled: Option<(String, bool)> = None;
-            ui.horizontal_wrapped(|ui| {
-                for name in names {
-                    let mut on = fields.iter().any(|held| held == &name);
-                    if ui.checkbox(&mut on, &name).changed() {
-                        toggled = Some((name, on));
+            Grid::new("matching")
+                .num_columns(2)
+                .min_col_width(0.0)
+                .show(ui, |ui| {
+                    for field in &definition.fields {
+                        let Action::WaitFor {
+                            expect: Expect::Frame { values, .. },
+                            ..
+                        } = &mut step.action
+                        else {
+                            return;
+                        };
+                        let mut on = values.contains_key(&field.name);
+                        if ui.checkbox(&mut on, &field.name).changed() {
+                            toggled = Some((field.name.clone(), on));
+                        }
+                        if values.contains_key(&field.name) {
+                            value_widget(ui, field, &field.kind, values);
+                        } else {
+                            ui.label(RichText::new("any value").weak());
+                        }
+                        ui.end_row();
                     }
-                }
-            });
+                });
             if let Some((name, on)) = toggled {
-                scenarios::set_match(step, &name, on);
+                scenarios::set_match(step, &definition, &name, on);
             }
         }
     }

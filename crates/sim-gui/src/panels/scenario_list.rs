@@ -407,8 +407,9 @@ fn describe(step: &Step) -> String {
         Action::Wait { delay } => format!("wait {} ms", delay.as_millis()),
         Action::WaitFor { expect, timeout } => {
             let mut text = match expect {
-                Expect::Frame { frame, fields } => {
-                    format!("wait for {frame} matching {}", fields.join(", "))
+                Expect::Frame { frame, values } => {
+                    let named: Vec<&str> = values.keys().map(String::as_str).collect();
+                    format!("wait for {frame} matching {}", named.join(", "))
                 }
                 Expect::Pattern { pattern, anchor } => {
                     let mut text = format!("wait for {}", pattern.to_hex());
@@ -549,7 +550,7 @@ wait_ms = 40
 [[scenario.step]]
 wait_for = { hex = "C0 FE", at = 2, timeout_ms = 500 }
 [[scenario.step]]
-wait_for = { frame = "Telemetry", match = ["sync", "mode"] }
+wait_for = { frame = "Telemetry", match = { sync = 1, mode = 2 } }
 "#,
         );
 
@@ -561,6 +562,6 @@ wait_for = { frame = "Telemetry", match = ["sync", "mode"] }
             lines[3],
             "wait for C0 FE at offset 2, giving up after 500 ms"
         );
-        assert_eq!(lines[4], "wait for Telemetry matching sync, mode");
+        assert_eq!(lines[4], "wait for Telemetry matching mode, sync");
     }
 }

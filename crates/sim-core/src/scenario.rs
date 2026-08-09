@@ -184,20 +184,29 @@ pub enum Action {
 }
 
 /// What a wait is watching for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expect {
     /// Bytes spelled out, wildcards and all. What a developer writes.
     Pattern {
         pattern: crate::pattern::HexPattern,
         anchor: crate::pattern::Anchor,
     },
-    /// A frame from the library, matched on the fields that were named.
+    /// A frame from the library, matched on the fields named here and the
+    /// values they must carry.
+    ///
+    /// Values rather than bare names, so that waiting for `mode = FAULT` is
+    /// sayable at all. Naming a field alone would mean whatever the frame
+    /// happens to declare as its default, which for a sync word is exactly
+    /// right and for anything else is almost never what was meant.
     ///
     /// Kept as the intent rather than as the bytes it stands for: a pattern
     /// frozen at write time would go on claiming to describe the frame long
     /// after someone had changed it. The bytes are worked out when the scenario
     /// starts, against the definitions it was handed.
-    Frame { frame: String, fields: Vec<String> },
+    Frame {
+        frame: String,
+        values: BTreeMap<String, Value>,
+    },
 }
 
 /// A field that carries a different number on every pass.
@@ -329,8 +338,8 @@ struct RawWaitFor {
     /// that have to match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     frame: Option<String>,
-    #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
-    match_fields: Vec<String>,
+    #[serde(default, rename = "match", skip_serializing_if = "BTreeMap::is_empty")]
+    match_values: BTreeMap<String, Value>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
@@ -783,9 +792,9 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
                     wait.hex = Some(pattern.to_hex());
                     wait.at = anchor.offset();
                 }
-                Expect::Frame { frame, fields } => {
+                Expect::Frame { frame, values } => {
                     wait.frame = Some(frame.clone());
-                    wait.match_fields.clone_from(fields);
+                    wait.match_values.clone_from(values);
                 }
             }
             raw.wait_for = Some(wait);
@@ -891,7 +900,7 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
             (Some(_), Some(_)) => return Err(StepError::AmbiguousWait),
             (None, None) => return Err(StepError::EmptyWait),
             (Some(hex), None) => {
-                if !wait.match_fields.is_empty() {
+                if !wait.match_values.is_empty() {
                     return Err(StepError::AmbiguousWait);
                 }
                 let spec = PatternSpec { hex, at: wait.at };
@@ -904,12 +913,12 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
                 if wait.at.is_some() {
                     return Err(StepError::PointlessOffset);
                 }
-                if wait.match_fields.is_empty() {
+                if wait.match_values.is_empty() {
                     return Err(StepError::NoFieldsToMatch);
                 }
                 Expect::Frame {
                     frame,
-                    fields: wait.match_fields,
+                    values: wait.match_values,
                 }
             }
         };
@@ -1573,15 +1582,19 @@ send = "Telemetry"
 name = "Answered"
 on = "bus"
 [[scenario.step]]
-wait_for = { frame = "Telemetry", match = ["sync", "mode"], timeout_ms = 500 }
+wait_for = { frame = "Telemetry", match = { sync = 43605, mode = 3 }, timeout_ms = 500 }
 "#);
-        assert!(matches!(
-            &scenario.steps[0].action,
-            Action::WaitFor {
-                expect: Expect::Frame { frame, fields },
-                timeout: Some(_),
-            } if frame == "Telemetry" && fields == &["sync".to_owned(), "mode".to_owned()]
-        ));
+        let Action::WaitFor {
+            expect: Expect::Frame { frame, values },
+            timeout: Some(_),
+        } = &scenario.steps[0].action
+        else {
+            panic!("expected a frame wait");
+        };
+        assert_eq!(frame, "Telemetry");
+        // Values, not just names: waiting for mode = FAULT has to be sayable.
+        assert_eq!(values["mode"], Value::Uint(3));
+        assert_eq!(values["sync"], Value::Uint(43605));
         // The frame it names is one the engine has to be handed.
         assert_eq!(scenario.frames_used(), ["Telemetry"]);
 
@@ -1591,7 +1604,7 @@ wait_for = { frame = "Telemetry", match = ["sync", "mode"], timeout_ms = 500 }
 name = "Answered"
 on = "bus"
 [[scenario.step]]
-wait_for = { frame = "Telemetry", match = ["sync"], timeout_ms = 500 }
+wait_for = { frame = "Telemetry", match = { sync = 43605 }, timeout_ms = 500 }
 [[scenario.step]]
 wait_for = { hex = "C0 ?? FE", at = 1 }
 "#,
@@ -1603,13 +1616,13 @@ wait_for = { hex = "C0 ?? FE", at = 1 }
         for (label, text, expected) in [
             (
                 "both",
-                r#"wait_for = { hex = "AA55", frame = "Telemetry", match = ["sync"] }"#,
+                r#"wait_for = { hex = "AA55", frame = "Telemetry", match = { sync = 1 } }"#,
                 "not both",
             ),
             ("neither", "wait_for = { timeout_ms = 10 }", "either hex"),
             (
                 "hex with match",
-                r#"wait_for = { hex = "AA55", match = ["sync"] }"#,
+                r#"wait_for = { hex = "AA55", match = { sync = 1 } }"#,
                 "not both",
             ),
             (
@@ -1619,7 +1632,7 @@ wait_for = { hex = "C0 ?? FE", at = 1 }
             ),
             (
                 "frame with an offset",
-                r#"wait_for = { frame = "Telemetry", match = ["sync"], at = 0 }"#,
+                r#"wait_for = { frame = "Telemetry", match = { sync = 1 }, at = 0 }"#,
                 "means nothing when matching a frame",
             ),
         ] {

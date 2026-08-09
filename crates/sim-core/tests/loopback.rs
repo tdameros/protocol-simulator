@@ -1052,7 +1052,7 @@ name = "By fields"
 on = "near"
 
 [[scenario.step]]
-wait_for = { frame = "Beacon", match = ["sync", "mode"], timeout_ms = 4000 }
+wait_for = { frame = "Beacon", match = { sync = 43605, mode = 1 }, timeout_ms = 4000 }
 
 [[scenario.step]]
 raw = "99"
@@ -1068,17 +1068,18 @@ raw = "99"
     .await
     .unwrap();
 
-    // Beacon is sync = 0xAA55, then seq, then mode, and mode defaults to 0.
-    // Matching sync and mode leaves seq free, so this one must not release the
-    // wait: its mode is wrong.
+    // Beacon is sync = 0xAA55, then seq, then mode. The wait asks for mode = 1,
+    // while the frame's own default for mode is 0, so a frame carrying the
+    // default must not release it: what is compared is the value asked for, not
+    // whatever the definition happens to declare.
     tx.send(Command::SendRaw {
         id: ConnectionId::from("far"),
-        bytes: vec![0xAA, 0x55, 0x07, 0x01],
+        bytes: vec![0xAA, 0x55, 0x07, 0x00],
     })
     .await
     .unwrap();
     wait_for(&mut rx, |event| {
-        matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == "near" && bytes == &[0xAA, 0x55, 0x07, 0x01])
+        matches!(event, Event::FrameReceived { id, bytes, .. } if id.0 == "near" && bytes == &[0xAA, 0x55, 0x07, 0x00])
     })
     .await;
     assert!(
@@ -1094,11 +1095,11 @@ raw = "99"
         "a frame differing on a matched field must not release the wait"
     );
 
-    // Same frame with the right mode and a different seq: seq was not named,
-    // so it is free to be anything.
+    // The mode that was asked for, with a different seq: seq was not named, so
+    // it is free to be anything.
     tx.send(Command::SendRaw {
         id: ConnectionId::from("far"),
-        bytes: vec![0xAA, 0x55, 0x2A, 0x00],
+        bytes: vec![0xAA, 0x55, 0x2A, 0x01],
     })
     .await
     .unwrap();
@@ -1134,7 +1135,7 @@ async fn a_wait_naming_an_unknown_field_says_so() {
 name = "Typo"
 on = "link"
 [[scenario.step]]
-wait_for = { frame = "Beacon", match = ["synk"], timeout_ms = 2000 }
+wait_for = { frame = "Beacon", match = { synk = 1 }, timeout_ms = 2000 }
 "#,
     )
     .expect("scenario should parse")

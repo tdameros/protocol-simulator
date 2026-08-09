@@ -340,7 +340,7 @@ impl ActionKind {
             Self::WaitFor => Action::WaitFor {
                 expect: Expect::Frame {
                     frame: frame.unwrap_or_default().to_owned(),
-                    fields: Vec::new(),
+                    values: BTreeMap::new(),
                 },
                 timeout: Some(Duration::from_millis(500)),
             },
@@ -509,21 +509,23 @@ pub fn set_counter(step: &mut Step, field: &str, on: bool) {
     }
 }
 
-/// Turns the ticked fields of a frame into what a wait watches for.
-pub fn set_match(step: &mut Step, field: &str, on: bool) {
+/// Starts or stops watching one field of a frame, seeded from the frame's own
+/// default so that ticking a sync word is still a single click.
+pub fn set_match(step: &mut Step, frame: &FrameDef, field: &str, on: bool) {
     let Action::WaitFor {
-        expect: Expect::Frame { fields, .. },
+        expect: Expect::Frame { values, .. },
         ..
     } = &mut step.action
     else {
         return;
     };
     if on {
-        if !fields.iter().any(|held| held == field) {
-            fields.push(field.to_owned());
+        let seeded = seed_values(frame);
+        if let Some(value) = seeded.get(field) {
+            values.insert(field.to_owned(), value.clone());
         }
     } else {
-        fields.retain(|held| held != field);
+        values.remove(field);
     }
 }
 
@@ -536,7 +538,7 @@ pub fn set_wait_by_frame(step: &mut Step, by_frame: bool, frame: Option<&str>) {
     *expect = if by_frame {
         Expect::Frame {
             frame: frame.unwrap_or_default().to_owned(),
-            fields: Vec::new(),
+            values: BTreeMap::new(),
         }
     } else {
         Expect::Pattern {
@@ -829,7 +831,7 @@ raw = "01"
                     draft.scenario.steps[0].action = Action::WaitFor {
                         expect: Expect::Frame {
                             frame: "Telemetry".to_owned(),
-                            fields: Vec::new(),
+                            values: BTreeMap::new(),
                         },
                         timeout: None,
                     };
@@ -1111,22 +1113,47 @@ counters = { seq = { wrap = 255 } }
 name = "S"
 on = "bus"
 [[scenario.step]]
-wait_for = { frame = "Telemetry", match = ["sync"] }
+wait_for = { frame = "Telemetry", match = { sync = 1 } }
 "#,
         );
+        let frame = sim_core::frame::schema::from_toml(
+            r#"
+name = "Telemetry"
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+[[field]]
+name = "mode"
+type = "u8"
+"#,
+        )
+        .expect("should parse");
         let step = &mut draft.scenario.steps[0];
 
-        set_match(step, "mode", true);
-        set_match(step, "sync", false);
-        set_match(step, "mode", true);
+        set_match(step, &frame, "mode", true);
+        set_match(step, &frame, "sync", false);
+        set_match(step, &frame, "mode", true);
         let Action::WaitFor {
-            expect: Expect::Frame { fields, .. },
+            expect: Expect::Frame { values, .. },
             ..
         } = &step.action
         else {
             panic!("expected a frame wait");
         };
-        assert_eq!(fields, &["mode".to_owned()], "ticked once, listed once");
+        assert_eq!(values.len(), 1, "ticked once, listed once");
+
+        // Ticking seeds the frame's own value, so a sync word is right without
+        // anyone typing it, and anything else can be changed from there.
+        set_match(step, &frame, "sync", true);
+        let Action::WaitFor {
+            expect: Expect::Frame { values, .. },
+            ..
+        } = &step.action
+        else {
+            panic!("expected a frame wait");
+        };
+        assert_eq!(values["sync"], Value::Uint(0xAA55));
 
         set_wait_by_frame(step, false, None);
         assert!(matches!(
@@ -1138,7 +1165,7 @@ wait_for = { frame = "Telemetry", match = ["sync"] }
         ));
         set_wait_by_frame(step, true, Some("Status"));
         let Action::WaitFor {
-            expect: Expect::Frame { frame, fields },
+            expect: Expect::Frame { frame, values },
             ..
         } = &step.action
         else {
@@ -1146,7 +1173,7 @@ wait_for = { frame = "Telemetry", match = ["sync"] }
         };
         assert_eq!(frame, "Status");
         assert!(
-            fields.is_empty(),
+            values.is_empty(),
             "a different frame keeps none of the old fields"
         );
     }
