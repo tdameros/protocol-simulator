@@ -128,9 +128,9 @@ fn every_example_scenario_loads_and_names_frames_that_exist() {
     let paths = schema::toml_files(&dir).expect("scenarios folder should be readable");
     assert!(!paths.is_empty(), "no scenario found in {}", dir.display());
 
-    let known: Vec<String> = load_examples()
+    let frames: Vec<FrameDef> = load_examples()
         .into_iter()
-        .map(|(_, frame)| frame.name)
+        .map(|(_, frame)| frame)
         .collect();
 
     for path in paths {
@@ -139,12 +139,41 @@ fn every_example_scenario_loads_and_names_frames_that_exist() {
             sim_core::scenario::load(&path).unwrap_or_else(|error| panic!("{label}: {error}"));
 
         for scenario in scenarios {
-            for frame in scenario.frames_used() {
-                assert!(
-                    known.iter().any(|name| name == frame),
-                    "{label}: scenario {} sends {frame}, which no example frame defines",
-                    scenario.name
-                );
+            for step in &scenario.steps {
+                let sim_core::scenario::Action::Send { frame, with, .. } = &step.action else {
+                    continue;
+                };
+                let Some(definition) = frames.iter().find(|known| &known.name == frame) else {
+                    panic!(
+                        "{label}: scenario {} sends {frame}, which no example frame defines",
+                        scenario.name
+                    );
+                };
+
+                // Names resolving is not enough: an override has to fit the
+                // field it names, or the step fails on its first pass. A float
+                // written for an integer field is the way that happens.
+                let mut values = sim_core::frame::value::seed_values(definition);
+                for (field, value) in with {
+                    let declared = definition
+                        .fields
+                        .iter()
+                        .find(|declared| &declared.name == field)
+                        .unwrap_or_else(|| panic!("{label}: {frame} has no field named {field}"));
+                    let coerced = value.clone().coerced_to(&declared.kind).unwrap_or_else(|| {
+                        panic!(
+                            "{label}: {frame}.{field} is {}, which cannot hold {value:?}",
+                            declared.kind.type_name()
+                        )
+                    });
+                    values.insert(field.clone(), coerced);
+                }
+                codec::encode(definition, &values).unwrap_or_else(|error| {
+                    panic!(
+                        "{label}: scenario {} cannot encode {frame}: {error}",
+                        scenario.name
+                    )
+                });
             }
         }
     }

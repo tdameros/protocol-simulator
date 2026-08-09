@@ -146,6 +146,18 @@ async fn execute(
             anchor,
             timeout,
         } => {
+            // Started from where the stream is now, not from where the scenario
+            // subscribed. Held across steps, the buffer would let a frame from
+            // an earlier pass, or from before this wait was ever reached,
+            // release it: a repeating handshake would then report success
+            // without the far side having answered once.
+            //
+            // Nothing is lost by starting here. A send is posted to the engine
+            // and travels on from there, so the step that precedes a wait has
+            // not even reached the socket by the time this runs; a reply cannot
+            // already be in the buffer.
+            let mut received = received.resubscribe();
+
             // Every target has to answer, so each one is struck off as it does
             // and the wait ends when none is left.
             let mut pending: HashSet<&ConnectionId> = step.targets.iter().collect();

@@ -37,6 +37,9 @@ pub enum ScenarioError {
     #[error("scenario {name} has no steps")]
     Empty { name: String },
 
+    #[error("scenario {name} repeats every 0 ms, which is no period at all")]
+    ZeroPeriod { name: String },
+
     #[error("scenario {name}, step {step}: {reason}")]
     Step {
         name: String,
@@ -55,9 +58,6 @@ pub enum StepError {
 
     #[error("no connection to act on, and the scenario names no default")]
     NoConnection,
-
-    #[error("unknown setting, expected one of {known}")]
-    UnknownSetting { known: String },
 
     #[error("{hex} is not a usable byte pattern")]
     BadPattern { hex: String },
@@ -172,10 +172,12 @@ impl Counter {
         let advanced = self.step.saturating_mul(pass);
         match self.wrap {
             // The span includes both ends, so `from = 0, wrap = 255` is a byte.
-            Some(wrap) if wrap >= self.from => {
-                let span = wrap - self.from + 1;
-                self.from + advanced % span
-            }
+            Some(wrap) if wrap >= self.from => match (wrap - self.from).checked_add(1) {
+                Some(span) => self.from + advanced % span,
+                // The span is the whole of u64, so there is nothing to fold
+                // back into: counting up is already staying inside it.
+                None => self.from.wrapping_add(advanced),
+            },
             _ => self.from.saturating_add(advanced),
         }
     }
@@ -342,14 +344,23 @@ fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let repeat = match raw.repeat {
+        // A zero period is not a fast scenario, it is a scenario with no clock:
+        // the timer it would build refuses to exist, and the task driving it
+        // would die on the spot, taking its name with it.
+        Some(repeat) if repeat.every_ms == 0 => return Err(ScenarioError::ZeroPeriod { name }),
+        Some(repeat) => Some(Repeat {
+            every: Duration::from_millis(repeat.every_ms),
+            times: repeat.times,
+        }),
+        None => None,
+    };
+
     Ok(Scenario {
         name,
         description: raw.description,
         steps,
-        repeat: raw.repeat.map(|repeat| Repeat {
-            every: Duration::from_millis(repeat.every_ms),
-            times: repeat.times,
-        }),
+        repeat,
     })
 }
 
@@ -673,6 +684,45 @@ wait_ms = 100
             scenario.steps[0].targets.is_empty(),
             "a delay touches nothing"
         );
+    }
+
+    #[test]
+    fn a_period_of_zero_is_refused_rather_than_built() {
+        let error = from_toml(
+            r#"
+[[scenario]]
+name = "Impossible"
+on = "bus"
+repeat = { every_ms = 0 }
+[[scenario.step]]
+raw = "00"
+"#,
+        )
+        .expect_err("a zero period is no period");
+        assert!(error.to_string().contains("Impossible"), "{error}");
+    }
+
+    #[test]
+    fn a_counter_spanning_the_whole_width_just_counts() {
+        // `wrap = u64::MAX` is how a full-width sequence number is written, and
+        // its span is one larger than a u64 can hold.
+        let full = Counter {
+            from: 0,
+            step: 1,
+            wrap: Some(u64::MAX),
+        };
+        assert_eq!(full.at(0), 0);
+        assert_eq!(full.at(3), 3);
+        assert_eq!(full.at(u64::MAX), u64::MAX);
+
+        // One short of it still folds, at the pass after its last value.
+        let almost = Counter {
+            from: 0,
+            step: 1,
+            wrap: Some(u64::MAX - 1),
+        };
+        assert_eq!(almost.at(u64::MAX - 1), u64::MAX - 1);
+        assert_eq!(almost.at(u64::MAX), 0);
     }
 
     #[test]

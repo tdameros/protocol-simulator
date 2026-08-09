@@ -42,6 +42,24 @@ impl ScenarioLibrary {
         }
 
         self.scenarios.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // The engine keys a running scenario by name, and so does the panel, so
+        // two of them called the same thing cannot be told apart: starting one
+        // lights up both rows, and the other can never be started at all.
+        let mut seen: Vec<String> = Vec::new();
+        self.scenarios.retain(|scenario| {
+            if seen.contains(&scenario.name) {
+                self.failures.push((
+                    scenario.name.clone(),
+                    "a second scenario of this name was ignored, names have to be unique"
+                        .to_owned(),
+                ));
+                return false;
+            }
+            seen.push(scenario.name.clone());
+            true
+        });
+
         self.selected = (!self.scenarios.is_empty()).then_some(0);
         self.directory = Some(directory);
     }
@@ -115,6 +133,26 @@ wait_ms = 10
         assert_eq!(library.failures[0].0, "broken.toml");
         assert!(library.failures[0].1.contains("several things"));
         assert_eq!(library.selected, Some(0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_name_used_twice_keeps_the_first_and_says_so() {
+        let dir = scratch("dupes");
+        std::fs::write(dir.join("a.toml"), GOOD).unwrap();
+        std::fs::write(dir.join("b.toml"), GOOD).unwrap();
+
+        let mut library = ScenarioLibrary::default();
+        library.load_from(dir.clone());
+
+        assert_eq!(
+            library.scenarios.len(),
+            1,
+            "one row, not two identical ones"
+        );
+        assert_eq!(library.failures.len(), 1);
+        assert!(library.failures[0].1.contains("unique"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

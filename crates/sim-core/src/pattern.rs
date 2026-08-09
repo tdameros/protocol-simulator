@@ -71,7 +71,13 @@ impl HexPattern {
     }
 
     fn matches_at(&self, bytes: &[u8], offset: usize) -> bool {
-        let Some(window) = bytes.get(offset..offset + self.0.len()) else {
+        // Checked, because the offset now comes from a scenario file as well as
+        // from a text box, and `at = 18446744073709551615` parses perfectly
+        // well. Overflowing here would panic a debug build.
+        let Some(end) = offset.checked_add(self.0.len()) else {
+            return false;
+        };
+        let Some(window) = bytes.get(offset..end) else {
             return false;
         };
         self.0
@@ -137,6 +143,13 @@ mod tests {
         let pattern = HexPattern::parse("AA 55 01 02 03").expect("should parse");
         assert!(!pattern.found_in(&[0xAA, 0x55, 0x01, 0x02], Anchor::Anywhere));
         assert!(!pattern.found_in(&[], Anchor::Anywhere));
+    }
+
+    #[test]
+    fn an_absurd_offset_matches_nothing_instead_of_overflowing() {
+        let pattern = HexPattern::parse("AA55").expect("should parse");
+        assert!(!pattern.found_in(&[0xAA, 0x55], Anchor::At(usize::MAX)));
+        assert!(!pattern.found_in(&[0xAA, 0x55], Anchor::At(1)));
     }
 
     #[test]

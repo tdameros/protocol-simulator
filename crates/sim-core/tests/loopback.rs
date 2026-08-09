@@ -952,3 +952,75 @@ wait_for = { hex = "C0 FE", timeout_ms = 300 }
     assert!(reason.contains("right"), "{reason}");
     assert!(!reason.contains("left"), "{reason}");
 }
+
+/// A wait must not be released by a frame that arrived before it was reached,
+/// which on a repeating scenario means a pass answering with the previous
+/// pass's reply and reporting success nobody earned.
+#[tokio::test]
+async fn a_wait_is_not_satisfied_by_an_earlier_passs_answer() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let near = "127.0.0.1:19851".parse().unwrap();
+    let far = "127.0.0.1:19852".parse().unwrap();
+    for (name, bind, remote) in [("near", near, far), ("far", far, near)] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["near", "far"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Twice"
+on = "near"
+repeat = { every_ms = 400, times = 2 }
+
+[[scenario.step]]
+wait_ms = 150
+
+[[scenario.step]]
+wait_for = { hex = "C0 FE", timeout_ms = 120 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    // Two answers during the first pass's delay, then silence. The first pass
+    // is satisfied by one of them; the second must not be satisfied by the
+    // leftover.
+    for _ in 0..2 {
+        tx.send(Command::SendRaw {
+            id: ConnectionId::from("far"),
+            bytes: vec![0xC0, 0xFE],
+        })
+        .await
+        .unwrap();
+    }
+
+    let event = wait_for(
+        &mut rx,
+        |event| matches!(event, Event::ScenarioFinished { name, .. } if name == "Twice"),
+    )
+    .await;
+
+    let Event::ScenarioFinished { outcome, .. } = event else {
+        panic!("expected the scenario to finish");
+    };
+    let sim_core::Outcome::Failed(reason) = outcome else {
+        panic!("the second pass was never answered, got {outcome:?}");
+    };
+    assert!(reason.contains("step 2"), "{reason}");
+    assert!(reason.contains("near"), "{reason}");
+}
