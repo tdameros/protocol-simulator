@@ -86,6 +86,19 @@ impl HexPattern {
             .all(|(expected, actual)| expected.is_none_or(|byte| byte == *actual))
     }
 
+    /// The pattern as it is written down, `??` for a byte that may be anything.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        self.0
+            .iter()
+            .map(|byte| match byte {
+                Some(value) => format!("{value:02X}"),
+                None => "??".to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[must_use]
     pub fn found_in(&self, bytes: &[u8], anchor: Anchor) -> bool {
         match anchor {
