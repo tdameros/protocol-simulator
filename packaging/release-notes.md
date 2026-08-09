@@ -83,6 +83,12 @@ under load. The cadence is pinned to a fixed grid rather than chained delay to
 delay, so a stream does not drift, and a pass that overruns loses its slot
 instead of firing a catch-up burst.
 
+## Numbers
+
+Every number box takes hexadecimal, binary and octal as readily as decimal, so
+`0xBA` copied off a datasheet can be typed in as it stands. `_` is allowed as a
+separator, so `0xFF_FF` works too. What is shown back is decimal.
+
 ## Frame definitions
 
 The `examples/frames` folder in the source tree holds documented examples, from

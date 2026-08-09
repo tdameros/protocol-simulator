@@ -1,10 +1,10 @@
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
-use egui::{Color32, DragValue, Label, RichText, ScrollArea, TextStyle, Ui};
+use egui::{Color32, Label, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::panels::{column, field_label, widest};
+use crate::panels::{column, field_label, number, widest};
 use crate::state::{
     AppState, Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState,
     TrafficFilter,
@@ -269,7 +269,7 @@ fn filter_bar(ui: &mut Ui, monitor: &mut MonitorState, names: &[String]) {
                 };
             }
             if let HexAnchor::At(offset) = &mut filter.anchor {
-                ui.add(DragValue::new(offset).range(0..=u16::MAX));
+                ui.add(number(offset).range(0..=u16::MAX));
             }
         });
 
@@ -298,7 +298,7 @@ fn filter_bar(ui: &mut Ui, monitor: &mut MonitorState, names: &[String]) {
 fn length_bound(ui: &mut Ui, bound: &mut Option<usize>, hint: &str) {
     let mut value = bound.unwrap_or(0);
     if ui
-        .add(DragValue::new(&mut value).range(0..=u16::MAX).prefix(""))
+        .add(number(&mut value).range(0..=u16::MAX).prefix(""))
         .on_hover_text(format!("{hint} bytes, 0 for no limit"))
         .changed()
     {

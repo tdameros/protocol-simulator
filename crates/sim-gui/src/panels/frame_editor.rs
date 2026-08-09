@@ -3,10 +3,11 @@ use sim_core::frame::value::Value;
 use sim_core::frame::{BitDef, EnumVariant, FieldDef, FieldKind, FrameDef, ScalarType, ValueRange};
 use sim_core::ConnectionStatus;
 
-use egui::{Color32, ComboBox, DragValue, RichText, ScrollArea, TextStyle, Ui};
+use egui::{Color32, ComboBox, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
 use crate::engine_handle::EngineHandle;
+use crate::panels::number;
 use crate::state::AppState;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
@@ -319,7 +320,7 @@ pub fn value_widget(
     match kind {
         FieldKind::Scalar(ScalarType::F32 | ScalarType::F64) => {
             let mut current = entry.as_float().unwrap_or(0.0);
-            let mut widget = DragValue::new(&mut current).speed(0.1);
+            let mut widget = number(&mut current).speed(0.1);
             // The declared subtype, not the representation, is what the editor
             // lets you reach: a 0..99 field simply will not go to 100.
             if let Some(ValueRange::Float { min, max }) = field.range {
@@ -338,10 +339,7 @@ pub fn value_widget(
             // Decimal rather than hex: egui's hex mode shows no 0x prefix, so
             // typing "10" would silently mean 16. The byte preview below already
             // gives the hexadecimal view.
-            if ui
-                .add(DragValue::new(&mut current).range(min..=max))
-                .changed()
-            {
+            if ui.add(number(&mut current).range(min..=max)).changed() {
                 *entry = Value::Uint(current);
             }
         }
@@ -352,10 +350,7 @@ pub fn value_widget(
                 Some(ValueRange::Int { min, max }) => (min, max),
                 _ => (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1),
             };
-            if ui
-                .add(DragValue::new(&mut current).range(min..=max))
-                .changed()
-            {
+            if ui.add(number(&mut current).range(min..=max)).changed() {
                 *entry = Value::Int(current);
             }
         }
@@ -474,7 +469,7 @@ fn bits_widget(ui: &mut Ui, id: &str, repr: ScalarType, bits: &[BitDef], entry: 
 
                 if wide {
                     let max = (1u64 << bit.width) - 1;
-                    changed |= ui.add(DragValue::new(slot).range(0..=max)).changed();
+                    changed |= ui.add(number(slot).range(0..=max)).changed();
                 } else {
                     ui.label("");
                 }
