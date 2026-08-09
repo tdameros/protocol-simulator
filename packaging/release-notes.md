@@ -71,6 +71,13 @@ single name, so one step can drive a serial port and a UDP socket together. A
 They live in their own folder beside the frames, one or more per file, and the
 project remembers where. `examples/scenarios` holds documented examples.
 
+The **Scenarios** tab builds them without opening a file: pick the action, tick
+the connections, pick the frame, tick the fields you want to set and leave the
+rest to the frame's own defaults. A wait can name a frame and the fields that
+have to match rather than a run of hex. Saving writes back into the file it came
+from and leaves the comments a developer wrote where they were, so the same
+scenario can be edited from either side.
+
 Delays are desktop timers: expect millisecond resolution at best, and jitter
 under load. The cadence is pinned to a fixed grid rather than chained delay to
 delay, so a stream does not drift, and a pass that overruns loses its slot

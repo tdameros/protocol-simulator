@@ -1,13 +1,13 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use sim_core::scenario::{Action, Expect, Repeat, Scenario, Step};
+use sim_core::scenario::{Action, Expect, Scenario, Step};
 
-use egui::{Color32, DragValue, Grid, RichText, ScrollArea, Ui};
+use egui::{Color32, Grid, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
 
 use crate::engine_handle::EngineHandle;
-use crate::panels::{field_label, widest};
+use crate::panels::{scenario_edit, widest};
 use crate::state::AppState;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
@@ -34,7 +34,27 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     // Editing a copy, so what the list and the disk hold is untouched until
     // Save says otherwise.
     if state.scenarios.draft.is_some() {
-        editor(ui, state);
+        let dirty = state.scenarios.draft_is_dirty();
+        scenario_edit::header(ui, state);
+        ui.separator();
+        ScrollArea::vertical()
+            .id_salt("scenario_editor")
+            .show(ui, |ui| scenario_edit::steps(ui, state));
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    dirty,
+                    egui::Button::new(format!("{} Save", icons::FLOPPY_DISK)),
+                )
+                .clicked()
+            {
+                save(state);
+            }
+            if ui.button("Cancel").clicked() {
+                state.scenarios.cancel_edit();
+            }
+        });
         return;
     }
 
@@ -42,92 +62,6 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         return;
     };
     steps(ui, state, &scenario);
-}
-
-/// The settings a scenario has beyond its steps. The steps themselves are still
-/// shown read-only below, until the editor for them lands.
-fn editor(ui: &mut Ui, state: &mut AppState) {
-    let dirty = state.scenarios.draft_is_dirty();
-    let labels = widest(
-        ui,
-        &egui::TextStyle::Body,
-        &["Name:", "Description:", "Repeat:"],
-    );
-
-    let Some(draft) = state.scenarios.draft.as_mut() else {
-        return;
-    };
-    let scenario = &mut draft.scenario;
-
-    ui.horizontal(|ui| {
-        field_label(ui, "Name:", labels);
-        ui.text_edit_singleline(&mut scenario.name);
-        if dirty {
-            ui.label(RichText::new("edited").weak());
-        }
-    });
-
-    ui.horizontal(|ui| {
-        field_label(ui, "Description:", labels);
-        let mut text = scenario.description.clone().unwrap_or_default();
-        if ui.text_edit_singleline(&mut text).changed() {
-            scenario.description = (!text.trim().is_empty()).then_some(text);
-        }
-    });
-
-    ui.horizontal(|ui| {
-        field_label(ui, "Repeat:", labels);
-        let mut repeats = scenario.repeat.is_some();
-        if ui.checkbox(&mut repeats, "every").changed() {
-            scenario.repeat = repeats.then(|| Repeat {
-                every: Duration::from_millis(100),
-                times: None,
-            });
-        }
-        if let Some(repeat) = &mut scenario.repeat {
-            // Floored at one: a period of zero is no period, and the engine
-            // cannot build a timer from it.
-            let mut period = u64::try_from(repeat.every.as_millis()).unwrap_or(u64::MAX);
-            if ui
-                .add(
-                    DragValue::new(&mut period)
-                        .range(1..=3_600_000)
-                        .suffix(" ms"),
-                )
-                .changed()
-            {
-                repeat.every = Duration::from_millis(period.max(1));
-            }
-
-            let mut counted = repeat.times.is_some();
-            if ui.checkbox(&mut counted, "stop after").changed() {
-                repeat.times = counted.then_some(10);
-            }
-            if let Some(times) = &mut repeat.times {
-                ui.add(DragValue::new(times).range(1..=u32::MAX).suffix(" passes"));
-            }
-        }
-    });
-
-    ui.separator();
-    let steps_of = scenario.clone();
-    steps(ui, state, &steps_of);
-
-    ui.separator();
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(
-                dirty,
-                egui::Button::new(format!("{} Save", icons::FLOPPY_DISK)),
-            )
-            .clicked()
-        {
-            save(state);
-        }
-        if ui.button("Cancel").clicked() {
-            state.scenarios.cancel_edit();
-        }
-    });
 }
 
 /// Writes the draft out, choosing a file for one that has never had a home.

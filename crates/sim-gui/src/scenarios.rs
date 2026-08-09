@@ -5,12 +5,16 @@
 //! back through [`sim_core::scenario::update_in`], which leaves the comments a
 //! developer wrote where they were.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 
-use sim_core::frame::schema;
-use sim_core::scenario::{self, Scenario};
+use sim_core::frame::value::seed_values;
+use sim_core::frame::{schema, FrameDef};
+use sim_core::scenario::{self, Action, Counter, Expect, Scenario, Step};
+use sim_core::{ConnectionId, HexPattern};
 
 /// A scenario and the file it came from.
 ///
@@ -273,6 +277,223 @@ impl ScenarioLibrary {
     }
 }
 
+/// The four things a step can be, as a picker offers them.
+///
+/// Named apart from `Action` because a picker needs a choice with no contents:
+/// you pick "send" before you have said what to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Send,
+    Raw,
+    Wait,
+    WaitFor,
+}
+
+impl ActionKind {
+    pub const ALL: [Self; 4] = [Self::Send, Self::Raw, Self::Wait, Self::WaitFor];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Send => "send a frame",
+            Self::Raw => "send raw bytes",
+            Self::Wait => "wait",
+            Self::WaitFor => "wait for a frame",
+        }
+    }
+
+    #[must_use]
+    pub fn of(action: &Action) -> Self {
+        match action {
+            Action::Send { .. } => Self::Send,
+            Action::Raw { .. } => Self::Raw,
+            Action::Wait { .. } => Self::Wait,
+            Action::WaitFor { .. } => Self::WaitFor,
+        }
+    }
+
+    /// Whether it acts on a link, and so needs one to exist.
+    #[must_use]
+    pub fn needs_a_connection(self) -> bool {
+        self != Self::Wait
+    }
+
+    fn blank(self, frame: Option<&str>) -> Action {
+        match self {
+            Self::Send => Action::Send {
+                frame: frame.unwrap_or_default().to_owned(),
+                with: BTreeMap::new(),
+                counters: BTreeMap::new(),
+            },
+            Self::Raw => Action::Raw { bytes: Vec::new() },
+            Self::Wait => Action::Wait {
+                delay: Duration::from_millis(100),
+            },
+            Self::WaitFor => Action::WaitFor {
+                expect: Expect::Frame {
+                    frame: frame.unwrap_or_default().to_owned(),
+                    fields: Vec::new(),
+                },
+                timeout: Some(Duration::from_millis(500)),
+            },
+        }
+    }
+}
+
+impl Draft {
+    /// Adds a step at the end, of the simplest kind that can exist here.
+    ///
+    /// A delay when there is nowhere to send, since a step with no link would
+    /// make the scenario unsavable.
+    pub fn add_step(&mut self, links: &[ConnectionId], frame: Option<&str>) {
+        let kind = if links.is_empty() {
+            ActionKind::Wait
+        } else {
+            ActionKind::Raw
+        };
+        self.scenario.steps.push(Step {
+            targets: targets_for(kind, links),
+            action: kind.blank(frame),
+        });
+    }
+
+    pub fn remove_step(&mut self, index: usize) {
+        if index < self.scenario.steps.len() {
+            self.scenario.steps.remove(index);
+        }
+    }
+
+    /// Moves a step one place up or down, doing nothing at either end.
+    pub fn move_step(&mut self, index: usize, down: bool) {
+        let steps = &mut self.scenario.steps;
+        let Some(other) = (if down {
+            index.checked_add(1)
+        } else {
+            index.checked_sub(1)
+        }) else {
+            return;
+        };
+        if index < steps.len() && other < steps.len() {
+            steps.swap(index, other);
+        }
+    }
+
+    /// Turns a step into a different kind of step.
+    ///
+    /// Refused where it would produce something that cannot be saved: an action
+    /// that acts on a link, in a project that has none.
+    pub fn set_action(&mut self, index: usize, kind: ActionKind, links: &[ConnectionId]) {
+        if kind.needs_a_connection() && links.is_empty() {
+            return;
+        }
+        let Some(step) = self.scenario.steps.get_mut(index) else {
+            return;
+        };
+        if ActionKind::of(&step.action) == kind {
+            return;
+        }
+
+        // Whatever it was aimed at is worth keeping, a delay excepted, which
+        // canonically aims at nothing.
+        let kept: Vec<ConnectionId> = step.targets.clone();
+        step.action = kind.blank(None);
+        step.targets = if kind.needs_a_connection() {
+            if kept.is_empty() {
+                targets_for(kind, links)
+            } else {
+                kept
+            }
+        } else {
+            Vec::new()
+        };
+    }
+}
+
+fn targets_for(kind: ActionKind, links: &[ConnectionId]) -> Vec<ConnectionId> {
+    if kind.needs_a_connection() {
+        links.first().cloned().into_iter().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Starts or stops overriding one field of a `send` step.
+///
+/// Switching it on seeds the frame's own default, so the value shown is the one
+/// that would go out anyway and the technician changes it from there rather
+/// than from zero.
+pub fn set_override(step: &mut Step, frame: &FrameDef, field: &str, on: bool) {
+    let Action::Send { with, .. } = &mut step.action else {
+        return;
+    };
+    if on {
+        let seeded = seed_values(frame);
+        if let Some(value) = seeded.get(field) {
+            with.insert(field.to_owned(), value.clone());
+        }
+    } else {
+        with.remove(field);
+    }
+}
+
+/// Starts or stops counting one field of a `send` step up on every pass.
+pub fn set_counter(step: &mut Step, field: &str, on: bool) {
+    let Action::Send { counters, with, .. } = &mut step.action else {
+        return;
+    };
+    if on {
+        counters.insert(
+            field.to_owned(),
+            Counter {
+                from: 0,
+                step: 1,
+                wrap: None,
+            },
+        );
+        // A field cannot be both held at a value and counted up from it.
+        with.remove(field);
+    } else {
+        counters.remove(field);
+    }
+}
+
+/// Turns the ticked fields of a frame into what a wait watches for.
+pub fn set_match(step: &mut Step, field: &str, on: bool) {
+    let Action::WaitFor {
+        expect: Expect::Frame { fields, .. },
+        ..
+    } = &mut step.action
+    else {
+        return;
+    };
+    if on {
+        if !fields.iter().any(|held| held == field) {
+            fields.push(field.to_owned());
+        }
+    } else {
+        fields.retain(|held| held != field);
+    }
+}
+
+/// Swaps a wait between naming a frame and spelling out bytes, keeping nothing
+/// from the other form since the two have nothing in common.
+pub fn set_wait_by_frame(step: &mut Step, by_frame: bool, frame: Option<&str>) {
+    let Action::WaitFor { expect, .. } = &mut step.action else {
+        return;
+    };
+    *expect = if by_frame {
+        Expect::Frame {
+            frame: frame.unwrap_or_default().to_owned(),
+            fields: Vec::new(),
+        }
+    } else {
+        Expect::Pattern {
+            pattern: HexPattern::parse("00").unwrap_or_else(|| HexPattern::masked(&[0], &[true])),
+            anchor: sim_core::Anchor::Anywhere,
+        }
+    };
+}
+
 /// Where a scenario that has never been saved goes by default: a file of its
 /// own, named after it, in the folder the library was loaded from.
 ///
@@ -316,6 +537,7 @@ fn file_label(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sim_core::frame::value::Value;
 
     const GOOD: &str = r#"
 [[scenario]]
@@ -546,6 +768,215 @@ raw = "01"
         assert_eq!(loaded(&dir).entries.len(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn draft_of(text: &str) -> Draft {
+        Draft {
+            scenario: scenario::from_toml(text).expect("should parse").remove(0),
+            origin: None,
+        }
+    }
+
+    fn links(names: &[&str]) -> Vec<ConnectionId> {
+        names.iter().map(|name| ConnectionId::from(*name)).collect()
+    }
+
+    const THREE: &str = r#"
+[[scenario]]
+name = "Three"
+on = "bus"
+[[scenario.step]]
+raw = "01"
+[[scenario.step]]
+raw = "02"
+[[scenario.step]]
+raw = "03"
+"#;
+
+    fn order(draft: &Draft) -> Vec<String> {
+        draft
+            .scenario
+            .steps
+            .iter()
+            .map(|step| match &step.action {
+                Action::Raw { bytes } => format!("{:02X}", bytes[0]),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn steps_move_up_and_down_and_stop_at_the_ends() {
+        let mut draft = draft_of(THREE);
+
+        draft.move_step(0, true);
+        assert_eq!(order(&draft), ["02", "01", "03"]);
+        draft.move_step(2, false);
+        assert_eq!(order(&draft), ["02", "03", "01"]);
+
+        // Neither end wraps around, and neither panics.
+        draft.move_step(0, false);
+        draft.move_step(2, true);
+        assert_eq!(order(&draft), ["02", "03", "01"]);
+        draft.move_step(99, true);
+        assert_eq!(order(&draft), ["02", "03", "01"]);
+    }
+
+    #[test]
+    fn steps_are_added_and_removed() {
+        let mut draft = draft_of(THREE);
+
+        draft.remove_step(1);
+        assert_eq!(order(&draft), ["01", "03"]);
+        draft.remove_step(99);
+        assert_eq!(order(&draft), ["01", "03"]);
+
+        draft.add_step(&links(&["bus"]), None);
+        assert_eq!(draft.scenario.steps.len(), 3);
+        assert_eq!(
+            draft.scenario.steps[2].targets,
+            [ConnectionId::from("bus")],
+            "a new step aims somewhere, or the scenario could not be saved"
+        );
+
+        // With nowhere to send, the only step that can be made is a delay.
+        draft.add_step(&[], None);
+        let last = draft.scenario.steps.last().expect("just added");
+        assert_eq!(ActionKind::of(&last.action), ActionKind::Wait);
+        assert!(last.targets.is_empty());
+    }
+
+    #[test]
+    fn changing_what_a_step_does_keeps_where_it_points() {
+        let mut draft = draft_of(THREE);
+        draft.scenario.steps[0].targets = links(&["bus", "uart"]);
+
+        draft.set_action(0, ActionKind::Send, &links(&["bus"]));
+        assert_eq!(
+            ActionKind::of(&draft.scenario.steps[0].action),
+            ActionKind::Send
+        );
+        assert_eq!(draft.scenario.steps[0].targets, links(&["bus", "uart"]));
+
+        // A delay aims at nothing, canonically, so it drops what it had.
+        draft.set_action(0, ActionKind::Wait, &links(&["bus"]));
+        assert!(draft.scenario.steps[0].targets.is_empty());
+
+        // And coming back out of a delay it is given somewhere to go.
+        draft.set_action(0, ActionKind::Raw, &links(&["bus"]));
+        assert_eq!(draft.scenario.steps[0].targets, links(&["bus"]));
+    }
+
+    #[test]
+    fn a_step_that_would_need_a_link_is_refused_when_there_are_none() {
+        let mut draft = draft_of(THREE);
+        draft.set_action(0, ActionKind::Wait, &[]);
+
+        for kind in [ActionKind::Send, ActionKind::Raw, ActionKind::WaitFor] {
+            draft.set_action(0, kind, &[]);
+            assert_eq!(
+                ActionKind::of(&draft.scenario.steps[0].action),
+                ActionKind::Wait,
+                "{kind:?} cannot be made without a connection to aim it at"
+            );
+        }
+    }
+
+    #[test]
+    fn ticking_a_field_seeds_it_from_the_frame_rather_than_from_zero() {
+        let frame = sim_core::frame::schema::from_toml(
+            r#"
+name = "Telemetry"
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+[[field]]
+name = "seq"
+type = "u8"
+"#,
+        )
+        .expect("should parse");
+
+        let mut draft = draft_of(
+            r#"
+[[scenario]]
+name = "S"
+on = "bus"
+[[scenario.step]]
+send = "Telemetry"
+"#,
+        );
+        let step = &mut draft.scenario.steps[0];
+
+        set_override(step, &frame, "sync", true);
+        let Action::Send { with, .. } = &step.action else {
+            panic!("expected a send");
+        };
+        assert_eq!(with["sync"], Value::Uint(0xAA55), "the frame's own default");
+
+        set_override(step, &frame, "sync", false);
+        let Action::Send { with, .. } = &step.action else {
+            panic!("expected a send");
+        };
+        assert!(with.is_empty(), "unticked means the frame decides again");
+
+        // Counting a field and holding it at a value are exclusive.
+        set_override(step, &frame, "seq", true);
+        set_counter(step, "seq", true);
+        let Action::Send { with, counters, .. } = &step.action else {
+            panic!("expected a send");
+        };
+        assert!(!with.contains_key("seq"));
+        assert!(counters.contains_key("seq"));
+    }
+
+    #[test]
+    fn a_wait_swaps_between_naming_a_frame_and_spelling_out_bytes() {
+        let mut draft = draft_of(
+            r#"
+[[scenario]]
+name = "S"
+on = "bus"
+[[scenario.step]]
+wait_for = { frame = "Telemetry", match = ["sync"] }
+"#,
+        );
+        let step = &mut draft.scenario.steps[0];
+
+        set_match(step, "mode", true);
+        set_match(step, "sync", false);
+        set_match(step, "mode", true);
+        let Action::WaitFor {
+            expect: Expect::Frame { fields, .. },
+            ..
+        } = &step.action
+        else {
+            panic!("expected a frame wait");
+        };
+        assert_eq!(fields, &["mode".to_owned()], "ticked once, listed once");
+
+        set_wait_by_frame(step, false, None);
+        assert!(matches!(
+            &step.action,
+            Action::WaitFor {
+                expect: Expect::Pattern { .. },
+                ..
+            }
+        ));
+        set_wait_by_frame(step, true, Some("Status"));
+        let Action::WaitFor {
+            expect: Expect::Frame { frame, fields },
+            ..
+        } = &step.action
+        else {
+            panic!("expected a frame wait");
+        };
+        assert_eq!(frame, "Status");
+        assert!(
+            fields.is_empty(),
+            "a different frame keeps none of the old fields"
+        );
     }
 
     #[test]

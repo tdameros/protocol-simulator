@@ -2,6 +2,7 @@ pub mod connections;
 pub mod frame_editor;
 pub mod hex_inject;
 pub mod live_monitor;
+pub mod scenario_edit;
 pub mod scenario_list;
 
 use egui::{Color32, Layout, Response, TextStyle, Ui, WidgetText};
