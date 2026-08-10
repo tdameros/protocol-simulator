@@ -1,37 +1,73 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use sim_core::frame::schema;
+use anyhow::{bail, Context, Result};
+use sim_core::frame::schema::{self, TypeLibrary};
 use sim_core::frame::value::{seed_values, FieldValues};
 use sim_core::frame::FrameDef;
 
 /// Subdirectory holding the type definitions every frame in the folder can use.
 const TYPES_DIR: &str = "types";
 
+/// A frame and the file it came from.
+///
+/// One frame per file, so the path is its whole identity: unlike a scenario, it
+/// never has to be told apart from a neighbour sharing the file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub file: PathBuf,
+    pub frame: FrameDef,
+}
+
 /// Frame definitions loaded from a directory, plus the values being edited.
 ///
-/// The TOML files stay the source of truth: the library only reads them, so the
-/// definitions can be edited in a real text editor and picked up with Reload.
+/// The TOML files stay the source of truth. The editor writes back into them
+/// rather than owning them, so a definition can still be edited in a real text
+/// editor and picked up with Reload.
 #[derive(Default)]
 pub struct FrameLibrary {
     pub directory: Option<PathBuf>,
-    pub frames: Vec<FrameDef>,
+    pub entries: Vec<Entry>,
     /// Files that failed to load, as (file name, reason).
     pub failures: Vec<(String, String)>,
     /// Names of the shared types available to every frame in the folder.
     pub shared_types: Vec<String>,
     pub selected: Option<usize>,
+    /// The frame being edited, if any.
+    pub draft: Option<Draft>,
+    /// Kept so a draft can be read back against the same types it was written
+    /// against, which is the only way the guard means anything.
+    types: TypeLibrary,
     /// Edited values, keyed by frame name so switching frames keeps your input.
     values: BTreeMap<String, FieldValues>,
 }
 
+/// A frame as the panel has it, which is not yet what the disk has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Draft {
+    pub frame: FrameDef,
+    /// The file it came from, with the text it held when editing started.
+    ///
+    /// The text is carried rather than re-read so that the guard checks the
+    /// exact bytes the save will produce, and so that asking whether a draft is
+    /// savable does not touch the disk on every repaint.
+    pub origin: Option<Origin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    pub file: PathBuf,
+    pub text: String,
+}
+
 impl FrameLibrary {
     pub fn load_from(&mut self, directory: PathBuf) {
-        self.frames.clear();
+        self.entries.clear();
         self.failures.clear();
         self.shared_types.clear();
+        self.draft = None;
 
-        let types = self.load_shared_types(&directory);
+        self.types = self.load_shared_types(&directory);
 
         let paths = match schema::toml_files(&directory) {
             Ok(paths) => paths,
@@ -44,14 +80,14 @@ impl FrameLibrary {
         };
 
         for path in paths {
-            match schema::load_with(&path, &types) {
-                Ok(frame) => self.frames.push(frame),
+            match schema::load_with(&path, &self.types) {
+                Ok(frame) => self.entries.push(Entry { file: path, frame }),
                 Err(error) => self.failures.push((file_label(&path), error.to_string())),
             }
         }
 
-        self.frames.sort_by(|a, b| a.name.cmp(&b.name));
-        self.selected = (!self.frames.is_empty()).then_some(0);
+        self.entries.sort_by(|a, b| a.frame.name.cmp(&b.frame.name));
+        self.selected = (!self.entries.is_empty()).then_some(0);
         self.directory = Some(directory);
         // Also on a plain reload: a definition edited on disk can have changed
         // the shape of a field someone already typed a value into.
@@ -82,9 +118,9 @@ impl FrameLibrary {
     /// Rebuilds each loaded frame's values from its defaults, overlaid with
     /// whatever was supplied that still fits.
     fn conform_values(&mut self) {
-        let frames = &self.frames;
+        let entries = &self.entries;
         let stored = &mut self.values;
-        for frame in frames {
+        for Entry { frame, .. } in entries {
             let Some(supplied) = stored.remove(&frame.name) else {
                 continue;
             };
@@ -138,8 +174,23 @@ impl FrameLibrary {
     }
 
     #[must_use]
+    pub fn selected_entry(&self) -> Option<&Entry> {
+        self.selected.and_then(|index| self.entries.get(index))
+    }
+
+    #[must_use]
     pub fn selected_frame(&self) -> Option<&FrameDef> {
-        self.selected.and_then(|index| self.frames.get(index))
+        self.selected_entry().map(|entry| &entry.frame)
+    }
+
+    /// Every frame loaded, in the order the list shows them.
+    pub fn frames(&self) -> impl Iterator<Item = &FrameDef> {
+        self.entries.iter().map(|entry| &entry.frame)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Values for `frame`, seeded from its defaults the first time it is opened.
@@ -152,6 +203,249 @@ impl FrameLibrary {
     pub fn reset_values(&mut self, frame: &FrameDef) {
         self.values.insert(frame.name.clone(), seed_values(frame));
     }
+
+    /// Starts editing the selected frame, as a copy.
+    ///
+    /// A copy so that cancelling is free: nothing on disk or in the list has
+    /// moved until a save says so.
+    pub fn begin_edit(&mut self) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        let origin = std::fs::read_to_string(&entry.file)
+            .ok()
+            .map(|text| Origin {
+                file: entry.file.clone(),
+                text,
+            });
+        self.draft = Some(Draft {
+            frame: entry.frame.clone(),
+            origin,
+        });
+    }
+
+    /// Starts a frame that does not exist yet.
+    pub fn begin_new(&mut self, frame: FrameDef) {
+        self.draft = Some(Draft {
+            frame,
+            origin: None,
+        });
+    }
+
+    pub fn cancel_edit(&mut self) {
+        self.draft = None;
+    }
+
+    /// Whether the draft says something the disk does not.
+    ///
+    /// One that has never been saved always does, having nothing to be compared
+    /// against.
+    #[must_use]
+    pub fn draft_is_dirty(&self) -> bool {
+        let Some(draft) = &self.draft else {
+            return false;
+        };
+        let Some(origin) = &draft.origin else {
+            return true;
+        };
+        self.entries
+            .iter()
+            .find(|entry| entry.file == origin.file)
+            .is_none_or(|entry| entry.frame != draft.frame)
+    }
+
+    /// Why the draft cannot be saved, if it cannot.
+    #[must_use]
+    pub fn draft_problem(&self) -> Option<String> {
+        let draft = self.draft.as_ref()?;
+        draft.problem(&self.types).or_else(|| {
+            self.name_taken(draft).map(|file| {
+                format!(
+                    "a frame named \"{}\" already lives in {}",
+                    draft.frame.name,
+                    file_label(&file)
+                )
+            })
+        })
+    }
+
+    /// The file already holding a frame of that name, if it is not this one.
+    ///
+    /// Names have to be unique across the folder, not merely across a file:
+    /// scenarios name the frame they send, and the values panel remembers what
+    /// you typed by name. Two frames answering to one name would make both
+    /// ambiguous.
+    fn name_taken(&self, draft: &Draft) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.frame.name == draft.frame.name
+                    && draft
+                        .origin
+                        .as_ref()
+                        .is_none_or(|origin| origin.file != entry.file)
+            })
+            .map(|entry| entry.file.clone())
+    }
+
+    /// Writes the draft to disk and takes it into the list.
+    ///
+    /// `into` says which file a frame that has never been saved belongs in. It
+    /// is ignored for one that already has a home, which is written back where
+    /// it came from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the draft cannot be written back faithfully, if the
+    /// name is already taken, or if the file cannot be written.
+    pub fn save_draft(&mut self, into: &Path) -> Result<()> {
+        let Some(draft) = self.draft.clone() else {
+            return Ok(());
+        };
+        if let Some(reason) = self.draft_problem() {
+            bail!("{reason}");
+        }
+
+        let file = draft
+            .origin
+            .as_ref()
+            .map_or_else(|| into.to_path_buf(), |origin| origin.file.clone());
+        let written = draft
+            .written()
+            .with_context(|| format!("cannot describe {}", draft.frame.name))?;
+        std::fs::write(&file, &written)
+            .with_context(|| format!("cannot write {}", file.display()))?;
+
+        self.take_in(&file, written, draft);
+        Ok(())
+    }
+
+    /// Deletes the selected frame, file and all.
+    ///
+    /// One frame per file, so there is nothing left in it to keep.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be removed.
+    pub fn delete_selected(&mut self) -> Result<()> {
+        let Some(entry) = self.selected_entry().cloned() else {
+            return Ok(());
+        };
+        match std::fs::remove_file(&entry.file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot remove {}", entry.file.display()))
+            }
+        }
+
+        self.values.remove(&entry.frame.name);
+        self.entries.retain(|held| held.file != entry.file);
+        self.selected = (!self.entries.is_empty())
+            .then(|| self.selected.unwrap_or(0).min(self.entries.len() - 1));
+        self.draft = None;
+        Ok(())
+    }
+
+    /// Folds a saved draft into the list, replacing what it came from.
+    fn take_in(&mut self, file: &Path, written: String, draft: Draft) {
+        self.entries.retain(|entry| entry.file != file);
+        self.entries.push(Entry {
+            file: file.to_path_buf(),
+            frame: draft.frame.clone(),
+        });
+        self.entries.sort_by(|a, b| a.frame.name.cmp(&b.frame.name));
+        self.selected = self.entries.iter().position(|entry| entry.file == file);
+        // The values kept under the old shape may no longer fit the new one.
+        self.conform_values();
+
+        // The draft now stands on what was just written, so saving twice in a
+        // row edits that rather than reverting to how the file used to read.
+        self.draft = Some(Draft {
+            origin: Some(Origin {
+                file: file.to_path_buf(),
+                text: written,
+            }),
+            ..draft
+        });
+    }
+}
+
+impl Draft {
+    /// The exact text a save would write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame cannot be serialised.
+    pub fn written(&self) -> Result<String, schema::SchemaError> {
+        match &self.origin {
+            Some(origin) => schema::update_in(&origin.text, &self.frame),
+            // No file to preserve, so there is nothing to preserve it with.
+            None => schema::to_toml(&self.frame),
+        }
+    }
+
+    /// Why the draft could not be saved as it stands, if it could not.
+    ///
+    /// Checked by writing it out and reading it back, rather than by listing
+    /// the rules here: the loader is the authority on what a frame may be, and
+    /// a second copy of its rules would drift from it.
+    ///
+    /// The read-back is held to equality, not merely to loading. A frame that
+    /// comes back different is worse than one that does not come back at all,
+    /// because it would go on the wire as bytes nobody asked for. This is what
+    /// catches an edit the file's own wording cannot express, such as widening
+    /// a field the file states as a named subtype.
+    #[must_use]
+    pub fn problem(&self, types: &TypeLibrary) -> Option<String> {
+        let text = match self.written() {
+            Ok(text) => text,
+            Err(error) => return Some(error.to_string()),
+        };
+        match schema::from_toml_with(&text, types) {
+            Err(error) => Some(error.to_string()),
+            Ok(reread) if reread != self.frame => Some(disagreement(&self.frame, &reread)),
+            Ok(_) => None,
+        }
+    }
+}
+
+/// What the file would say back, put in terms of the field it concerns.
+fn disagreement(wanted: &FrameDef, got: &FrameDef) -> String {
+    if wanted.name != got.name {
+        return format!("the file would read back as \"{}\"", got.name);
+    }
+    let differing = wanted
+        .fields
+        .iter()
+        .zip(&got.fields)
+        .find(|(wanted, got)| wanted != got)
+        .map(|(wanted, _)| wanted.name.clone());
+    match differing {
+        Some(field) => format!("{field} cannot be written the way this file states it"),
+        None => "this frame cannot be written back the way the file states it".to_owned(),
+    }
+}
+
+/// The file a frame of this name would go in, had it none yet.
+#[must_use]
+pub fn suggested_file(directory: &Path, name: &str) -> PathBuf {
+    let stem: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let stem = stem.trim_matches('-').to_owned();
+    directory.join(format!(
+        "{}.toml",
+        if stem.is_empty() { "frame" } else { &stem }
+    ))
 }
 
 fn file_label(path: &Path) -> String {
@@ -165,6 +459,7 @@ fn file_label(path: &Path) -> String {
 mod tests {
     use super::*;
     use sim_core::frame::value::Value;
+    use sim_core::frame::{Endianness, FieldDef, FieldKind, ScalarType, ValueRange};
 
     const GOOD: &str = r#"
 name = "Telemetry"
@@ -214,8 +509,8 @@ bits = [{ name = "only", width = 3 }]
         library.load_from(dir.clone());
 
         // One bad file must not cost you the others.
-        assert_eq!(library.frames.len(), 1);
-        assert_eq!(library.frames[0].name, "Telemetry");
+        assert_eq!(library.entries.len(), 1);
+        assert_eq!(library.entries[0].frame.name, "Telemetry");
         assert_eq!(library.failures.len(), 1);
         assert_eq!(library.failures[0].0, "broken.toml");
         assert!(library.failures[0].1.contains("bit widths"));
@@ -293,9 +588,9 @@ repeat = 3
         assert!(library.failures.is_empty(), "{:?}", library.failures);
         assert_eq!(library.shared_types, ["LedConfig"]);
         // The subfolder itself must not be mistaken for a frame file.
-        assert_eq!(library.frames.len(), 1);
-        assert_eq!(library.frames[0].fields.len(), 6);
-        assert_eq!(library.frames[0].size(), 9);
+        assert_eq!(library.entries.len(), 1);
+        assert_eq!(library.entries[0].frame.fields.len(), 6);
+        assert_eq!(library.entries[0].frame.size(), 9);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -353,5 +648,190 @@ range = { min = -50, max = -10 }
         assert_eq!(encoded.unwrap().len(), frame.size());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A frame stating a field through a shared subtype, which the writer is
+    /// deliberately unable to unpick.
+    const SUBTYPED: &str = r#"
+name = "Setpoints"
+
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 100 }
+
+# Kept in percent on purpose.
+[[field]]
+name = "target"
+type = "Percent"
+default = 50
+"#;
+
+    fn library_of(tag: &str, files: &[(&str, &str)]) -> (PathBuf, FrameLibrary) {
+        let dir = scratch(tag);
+        // Counting the files in the folder is how several of these tests check
+        // that nothing was written behind their back, so a leftover from the
+        // last run would be read as this run's fault.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let mut library = FrameLibrary::default();
+        library.load_from(dir.clone());
+        (dir, library)
+    }
+
+    #[test]
+    fn a_frame_remembers_the_file_it_came_from() {
+        let (dir, library) = library_of("origin", &[("telemetry.toml", GOOD)]);
+        assert_eq!(library.entries[0].file, dir.join("telemetry.toml"));
+    }
+
+    #[test]
+    fn a_draft_nobody_touched_is_not_dirty() {
+        let (_, mut library) = library_of("clean", &[("telemetry.toml", GOOD)]);
+        library.begin_edit();
+
+        assert!(!library.draft_is_dirty());
+        assert_eq!(library.draft_problem(), None);
+    }
+
+    #[test]
+    fn changing_a_default_is_dirty_and_saves_back_into_the_same_file() {
+        let (dir, mut library) = library_of("edit", &[("telemetry.toml", GOOD)]);
+        library.begin_edit();
+        let draft = library.draft.as_mut().unwrap();
+        let mode = draft.frame.field_index("mode").unwrap();
+        draft.frame.fields[mode].default = Some(Value::Uint(1));
+
+        assert!(library.draft_is_dirty());
+        library.save_draft(&dir.join("unused.toml")).unwrap();
+
+        assert!(!dir.join("unused.toml").exists());
+        assert_eq!(library.entries.len(), 1);
+        assert!(!library.draft_is_dirty());
+
+        let mut reloaded = FrameLibrary::default();
+        reloaded.load_from(dir);
+        let mode = reloaded.entries[0].frame.field_index("mode").unwrap();
+        assert_eq!(
+            reloaded.entries[0].frame.fields[mode].default,
+            Some(Value::Uint(1))
+        );
+    }
+
+    #[test]
+    fn saving_twice_in_a_row_edits_the_same_file_rather_than_reverting() {
+        let (dir, mut library) = library_of("twice", &[("telemetry.toml", GOOD)]);
+        library.begin_edit();
+
+        for value in [1u64, 0] {
+            let draft = library.draft.as_mut().unwrap();
+            let mode = draft.frame.field_index("mode").unwrap();
+            draft.frame.fields[mode].default = Some(Value::Uint(value));
+            library.save_draft(&dir).unwrap();
+        }
+
+        let text = std::fs::read_to_string(dir.join("telemetry.toml")).unwrap();
+        assert_eq!(text.matches("default = 0\n").count(), 1);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_edit_the_file_cannot_state_is_refused_rather_than_written_wrong() {
+        let (dir, mut library) = library_of("draft-subtype", &[("setpoints.toml", SUBTYPED)]);
+        library.begin_edit();
+        let draft = library.draft.as_mut().unwrap();
+        let target = draft.frame.field_index("target").unwrap();
+        // Widening past what `Percent` allows. The file says `Percent`, and the
+        // writer will not replace that with the bounds it stands for.
+        draft.frame.fields[target].range = Some(ValueRange::Uint { min: 0, max: 200 });
+
+        let problem = library.draft_problem().expect("refused");
+        assert!(problem.contains("target"), "{problem}");
+        assert!(library.save_draft(&dir).is_err());
+
+        let text = std::fs::read_to_string(dir.join("setpoints.toml")).unwrap();
+        assert!(text.contains(r#"type = "Percent""#));
+        assert!(text.contains("# Kept in percent on purpose."));
+    }
+
+    #[test]
+    fn a_new_frame_lands_in_a_file_named_after_it() {
+        let (dir, mut library) = library_of("new", &[("telemetry.toml", GOOD)]);
+        library.begin_new(FrameDef::flat(
+            "Heartbeat",
+            vec![FieldDef {
+                name: "tick".to_owned(),
+                description: None,
+                kind: FieldKind::Scalar(ScalarType::U8),
+                endian: Endianness::Big,
+                default: None,
+                range: None,
+            }],
+        ));
+
+        let into = suggested_file(&dir, "Heartbeat");
+        library.save_draft(&into).unwrap();
+
+        assert!(into.ends_with("heartbeat.toml"));
+        assert_eq!(library.entries.len(), 2);
+        let mut reloaded = FrameLibrary::default();
+        reloaded.load_from(dir);
+        assert_eq!(
+            reloaded
+                .frames()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Heartbeat", "Telemetry"]
+        );
+    }
+
+    #[test]
+    fn a_name_another_file_already_answers_to_is_refused() {
+        let (dir, mut library) = library_of("clash", &[("telemetry.toml", GOOD)]);
+        library.begin_new(FrameDef::flat(
+            "Telemetry",
+            vec![FieldDef {
+                name: "tick".to_owned(),
+                description: None,
+                kind: FieldKind::Scalar(ScalarType::U8),
+                endian: Endianness::Big,
+                default: None,
+                range: None,
+            }],
+        ));
+
+        let problem = library.draft_problem().expect("refused");
+        assert!(problem.contains("telemetry.toml"), "{problem}");
+        assert!(library
+            .save_draft(&suggested_file(&dir, "Telemetry"))
+            .is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn renaming_a_frame_keeps_it_in_its_own_file() {
+        let (dir, mut library) = library_of("rename", &[("telemetry.toml", GOOD)]);
+        library.begin_edit();
+        library.draft.as_mut().unwrap().frame.name = "Beacon".to_owned();
+
+        assert_eq!(library.draft_problem(), None);
+        library.save_draft(&dir).unwrap();
+
+        assert_eq!(library.entries.len(), 1);
+        assert_eq!(library.entries[0].file, dir.join("telemetry.toml"));
+        assert_eq!(library.entries[0].frame.name, "Beacon");
+    }
+
+    #[test]
+    fn deleting_a_frame_takes_its_file_with_it() {
+        let (dir, mut library) = library_of("delete", &[("telemetry.toml", GOOD)]);
+        library.delete_selected().unwrap();
+
+        assert!(library.entries.is_empty());
+        assert_eq!(library.selected, None);
+        assert!(!dir.join("telemetry.toml").exists());
     }
 }

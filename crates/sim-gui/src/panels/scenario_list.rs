@@ -267,8 +267,7 @@ fn start(state: &mut AppState, engine: &EngineHandle, scenario: &Scenario) {
     let wanted = scenario.frames_used();
     let frames: Vec<_> = state
         .frames
-        .frames
-        .iter()
+        .frames()
         .filter(|frame| wanted.contains(&frame.name.as_str()))
         .cloned()
         .collect();
