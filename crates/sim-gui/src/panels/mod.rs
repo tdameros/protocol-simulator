@@ -65,6 +65,74 @@ pub fn column<R>(ui: &mut Ui, width: f32, contents: impl FnOnce(&mut Ui) -> R) -
     .inner
 }
 
+/// A number box that reads the notations a protocol is actually written in.
+///
+/// egui parses decimal and nothing else, so `0xBA` copied off a datasheet has
+/// to be converted by hand before it can be typed anywhere. Every number box in
+/// the app goes through here so that the answer is the same wherever you are.
+/// `hex` asks for the value to be shown in hexadecimal, padded to that many
+/// digits. What the box *accepts* never changes: decimal stays typeable
+/// whatever it is showing.
+pub fn number<Num: egui::emath::Numeric>(
+    value: &mut Num,
+    hex: Option<usize>,
+) -> egui::DragValue<'_> {
+    let widget = egui::DragValue::new(value).custom_parser(read_number);
+    match hex {
+        Some(digits) => widget.custom_formatter(move |value, _| hex_text(value, digits)),
+        None => widget,
+    }
+}
+
+/// A number as hexadecimal, prefixed so it cannot be mistaken for decimal and
+/// padded to the width of whatever holds it.
+///
+/// The prefix is not decoration: `10` shown bare would read as ten, and the
+/// same box takes decimal input, so the two have to be told apart on sight.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value comes from an integer field and is shown, not computed"
+)]
+fn hex_text(value: f64, digits: usize) -> String {
+    let sign = if value < 0.0 { "-" } else { "" };
+    let magnitude = value.abs() as u64;
+    format!("{sign}0x{magnitude:0digits$X}")
+}
+
+/// Decimal, hexadecimal, binary or octal, signed, with `_` allowed anywhere as
+/// a separator.
+///
+/// `None` for anything else, which leaves the box holding its previous value
+/// rather than jumping to zero.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a drag value is an f64 whatever is typed into it"
+)]
+fn read_number(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let (negative, rest) = match text.strip_prefix(['-', '+']) {
+        Some(rest) => (text.starts_with('-'), rest.trim_start()),
+        None => (false, text),
+    };
+
+    let digits = rest.replace('_', "");
+    let radix = ["0x", "0b", "0o"]
+        .into_iter()
+        .zip([16, 2, 8])
+        .find(|(prefix, _)| {
+            digits.len() > prefix.len() && digits[..2].eq_ignore_ascii_case(prefix)
+        });
+
+    let value = match radix {
+        Some((_, radix)) => u64::from_str_radix(&digits[2..], radix).ok()? as f64,
+        // Plain decimal, and whatever else Rust reads as a float, so `1e3`
+        // still works for anyone who types it.
+        None => digits.parse::<f64>().ok()?,
+    };
+    Some(if negative { -value } else { value })
+}
+
 /// A label filling a fixed column, for the left edge of a form.
 pub fn field_label(ui: &mut Ui, text: &str, width: f32) -> Response {
     column(ui, width, |ui| ui.label(text))
@@ -123,6 +191,52 @@ impl TabViewer for AppTabViewer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_number_can_be_written_the_way_the_protocol_writes_it() {
+        for (typed, expected) in [
+            ("0xBA", 186.0),
+            ("0XbA", 186.0),
+            (" 0x10 ", 16.0),
+            ("0xFF_FF", 65535.0),
+            ("0b1011", 11.0),
+            ("0o17", 15.0),
+            ("255", 255.0),
+            ("-0x10", -16.0),
+            ("+42", 42.0),
+            // Still whatever it always read, so nobody loses what they had.
+            ("1.5", 1.5),
+            ("1e3", 1000.0),
+            ("-7", -7.0),
+        ] {
+            assert_eq!(read_number(typed), Some(expected), "reading {typed}");
+        }
+    }
+
+    #[test]
+    fn a_number_shown_as_hexadecimal_can_be_read_back() {
+        for (value, digits, shown) in [
+            (186.0, 2, "0xBA"),
+            (43605.0, 4, "0xAA55"),
+            (5.0, 4, "0x0005"),
+            (-16.0, 2, "-0x10"),
+            (0.0, 2, "0x00"),
+        ] {
+            assert_eq!(hex_text(value, digits), shown);
+            // What it shows has to be something it would take back, or a box
+            // could not be edited from the value it is displaying.
+            assert_eq!(read_number(shown), Some(value), "reading back {shown}");
+        }
+    }
+
+    #[test]
+    fn something_that_is_not_a_number_leaves_the_box_alone() {
+        // `None` keeps the previous value, where a zero would silently replace
+        // whatever was in the field.
+        for typed in ["", "   ", "0x", "0b", "nope", "0xZZ", "12ab", "0x1.5"] {
+            assert_eq!(read_number(typed), None, "reading {typed}");
+        }
+    }
 
     #[test]
     fn renaming_a_traffic_tab_leaves_its_identity_alone() {

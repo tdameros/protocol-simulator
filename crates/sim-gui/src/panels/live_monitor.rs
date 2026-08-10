@@ -1,10 +1,10 @@
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
-use egui::{Color32, DragValue, Label, RichText, ScrollArea, TextStyle, Ui};
+use egui::{Color32, Label, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::panels::{column, field_label, widest};
+use crate::panels::{column, field_label, number, widest};
 use crate::state::{
     AppState, Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState,
     TrafficFilter,
@@ -89,10 +89,9 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
 
     // show_rows draws only the visible slice. Painting every entry would make
     // the panel crawl once a periodic frame has filled the buffer.
-    let row_height = ui.text_style_height(&TextStyle::Monospace);
     ScrollArea::vertical()
         .stick_to_bottom(monitor.follow)
-        .show_rows(ui, row_height, rows.len(), |ui, range| {
+        .show_rows(ui, columns.row, rows.len(), |ui, range| {
             for index in range {
                 let entry = rows[index];
                 let delta = index.checked_sub(1).and_then(|previous| {
@@ -114,6 +113,17 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
 /// vertically, is the one everything else is pinned for.
 #[derive(Clone, Copy)]
 struct RowColumns {
+    /// How tall a row really is.
+    ///
+    /// `show_rows` takes this as gospel: it works out which rows are on screen
+    /// by dividing the offset by it, so being wrong is not a cosmetic matter.
+    /// Every row carries a menu button, which makes it as tall as a button
+    /// rather than as tall as the line of text inside it. Declaring the text
+    /// height left `show_rows` believing the buffer much shorter than it was,
+    /// pointing its offset at the wrong rows, and `stick_to_bottom` spent every
+    /// frame chasing a bottom that kept moving. From the outside, the view
+    /// scrolled on its own.
+    row: f32,
     timestamp: f32,
     delta: f32,
     arrow: f32,
@@ -124,6 +134,9 @@ struct RowColumns {
 impl RowColumns {
     fn measure(ui: &Ui, any_source: bool) -> Self {
         Self {
+            row: ui
+                .text_style_height(&TextStyle::Monospace)
+                .max(ui.spacing().interact_size.y),
             timestamp: widest(ui, &TextStyle::Body, &["00:00:00.000"]),
             delta: widest(ui, &TextStyle::Monospace, &["+000.00s"]),
             arrow: widest(
@@ -256,7 +269,7 @@ fn filter_bar(ui: &mut Ui, monitor: &mut MonitorState, names: &[String]) {
                 };
             }
             if let HexAnchor::At(offset) = &mut filter.anchor {
-                ui.add(DragValue::new(offset).range(0..=u16::MAX));
+                ui.add(number(offset, None).range(0..=u16::MAX));
             }
         });
 
@@ -285,7 +298,7 @@ fn filter_bar(ui: &mut Ui, monitor: &mut MonitorState, names: &[String]) {
 fn length_bound(ui: &mut Ui, bound: &mut Option<usize>, hint: &str) {
     let mut value = bound.unwrap_or(0);
     if ui
-        .add(DragValue::new(&mut value).range(0..=u16::MAX).prefix(""))
+        .add(number(&mut value, None).range(0..=u16::MAX).prefix(""))
         .on_hover_text(format!("{hint} bytes, 0 for no limit"))
         .changed()
     {
@@ -301,7 +314,7 @@ fn frame_row(
     hex_input: &mut String,
     pending_frame_hex: &mut Option<Vec<u8>>,
 ) {
-    ui.horizontal(|ui| {
+    let drawn = ui.horizontal(|ui| {
         ui.menu_button(icons::DOTS_THREE, |ui| {
             if ui.button("Copy hex").clicked() {
                 ui.ctx().copy_text(format_hex(&entry.bytes));
@@ -353,6 +366,18 @@ fn frame_row(
                 .weak(),
         );
     });
+
+    // The one invariant `show_rows` cannot check for itself, and the one this
+    // panel got wrong. A row that outgrows what was declared, because someone
+    // put a taller widget in it, breaks the scrolling again; this says so on the
+    // first debug run rather than after the drift is noticed by eye.
+    //
+    // Rounded on both sides, since egui lays out on whole pixels and a fraction
+    // either way is the renderer's business, not a mistake anyone made.
+    debug_assert!(
+        drawn.response.rect.height().round() <= columns.row.round(),
+        "a traffic row outgrew the height declared to show_rows"
+    );
 }
 
 /// How much is on screen, and how fast it is arriving.

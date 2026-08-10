@@ -21,6 +21,12 @@ pub struct AppState {
     pub new_connection: NewConnectionForm,
     pub hex_input: String,
     pub hex_target: Option<ConnectionId>,
+    /// Whether whole-number fields are shown in hexadecimal.
+    ///
+    /// One answer for the whole editor rather than one per field: a protocol is
+    /// usually read one way or the other, and a switch per row would cost more
+    /// attention than it saves.
+    pub hex_values: bool,
     pub frames: crate::frames::FrameLibrary,
     pub scenarios: crate::scenarios::ScenarioLibrary,
     /// Text of the frame editor's hex preview while it is being typed into.
