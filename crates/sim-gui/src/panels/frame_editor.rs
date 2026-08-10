@@ -174,18 +174,10 @@ fn draft_editor(ui: &mut Ui, state: &mut AppState) {
     });
 
     ui.separator();
-    let fields: Vec<String> = draft.frame.declared.iter().map(ToOwned::to_owned).collect();
-    let size = draft.frame.size();
     ScrollArea::vertical()
         .id_salt("draft_fields")
-        .max_height(ui.available_height() * 0.5)
-        .show(ui, |ui| {
-            for name in &fields {
-                ui.label(name);
-            }
-        });
-    ui.label(RichText::new(format!("{size} bytes")).weak());
-    ui.label(RichText::new("Fields are edited in the .toml file.").weak());
+        .max_height(ui.available_height() * 0.6)
+        .show(ui, |ui| super::frame_edit::fields(ui, state));
 
     ui.separator();
     ui.horizontal(|ui| {

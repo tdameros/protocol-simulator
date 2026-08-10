@@ -438,49 +438,87 @@ fn merge_fields(document: &mut toml_edit::DocumentMut, frame: &FrameDef, fresh: 
         })
         .collect();
 
-    if document.get("field").is_none() {
-        document.insert(
-            "field",
-            Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
-        );
-    }
-    let mut next = document::last_position(document);
-    let Some(entries) = document
-        .get_mut("field")
-        .and_then(Item::as_array_of_tables_mut)
-    else {
-        return;
-    };
+    let existing = sections(document.as_table(), "field");
+    let source = pair_up(&existing, &frame.declared, &written);
 
-    entries.retain(|entry| {
-        entry
-            .get("name")
-            .and_then(Item::as_str)
-            .is_some_and(|name| frame.declared.iter().any(|declared| declared == name))
-    });
-
-    let mut present: Vec<String> = Vec::new();
-    for entry in entries.iter_mut() {
-        let Some(name) = entry.get("name").and_then(Item::as_str).map(str::to_owned) else {
-            continue;
-        };
-        if let Some(replacement) = written.get(&name) {
-            document::merge(entry, replacement, kept_from_the_file(entry));
+    let mut rebuilt = toml_edit::ArrayOfTables::new();
+    for (name, from) in frame.declared.iter().zip(&source) {
+        match from.and_then(|at| existing.get(at)) {
+            Some(entry) => {
+                let mut entry = entry.clone();
+                let keep = kept_from_the_file(&entry);
+                if let Some(replacement) = written.get(name) {
+                    document::merge(&mut entry, replacement, keep);
+                }
+                rebuilt.push(entry);
+            }
+            // Nothing in the file to keep, so this is either a field just added
+            // or one the model cannot describe, and only the first is writable.
+            None => {
+                if let Some(fresh) = written.get(name) {
+                    rebuilt.push(fresh.clone());
+                }
+            }
         }
-        present.push(name);
     }
 
-    for name in &frame.declared {
-        if present.iter().any(|seen| seen == name) {
-            continue;
+    // Rewriting the positions moves the whole run of fields below everything
+    // else in the file, so it is done only when the order actually changed.
+    // Reusing a table keeps the position it was parsed at, and two entries that
+    // swapped places would otherwise be rendered in their old order.
+    let reordered = source
+        .iter()
+        .flatten()
+        .try_fold(None::<usize>, |last, &at| {
+            (last.is_none_or(|last| last < at)).then_some(Some(at))
+        })
+        .is_none()
+        || source.iter().any(Option::is_none);
+    if reordered {
+        let mut next = document::last_position(document);
+        for entry in rebuilt.iter_mut() {
+            document::place_after(entry, &mut next);
         }
-        let Some(fresh) = written.get(name) else {
-            continue;
-        };
-        let mut appended = fresh.clone();
-        document::place_after(&mut appended, &mut next);
-        entries.push(appended);
     }
+    document.insert("field", Item::ArrayOfTables(rebuilt));
+}
+
+/// Which entry in the file each declared field should be written over.
+///
+/// Matched by name first, so an edit anywhere leaves every other field sitting
+/// exactly where it was written. What is left over is then matched in order,
+/// which is what turns a rename from "one field deleted and another appended at
+/// the end" into an edit that keeps the field's place and the comment above it.
+///
+/// The leftovers are only matched among fields of the same nature. A plain
+/// field taking over an entry that names a type would be written as that type,
+/// which is never what renaming a field means.
+fn pair_up(
+    existing: &[toml_edit::Table],
+    declared: &[String],
+    written: &BTreeMap<String, toml_edit::Table>,
+) -> Vec<Option<usize>> {
+    let mut taken = vec![false; existing.len()];
+    let mut source: Vec<Option<usize>> = declared
+        .iter()
+        .map(|wanted| {
+            let at = existing.iter().enumerate().position(|(at, entry)| {
+                !taken[at] && entry.get("name").and_then(Item::as_str) == Some(wanted.as_str())
+            })?;
+            taken[at] = true;
+            Some(at)
+        })
+        .collect();
+
+    let mut spare = (0..existing.len())
+        .filter(|at| !taken[*at])
+        .filter(|at| kept_from_the_file(&existing[*at]).len() == 1);
+    for (slot, name) in source.iter_mut().zip(declared) {
+        if slot.is_none() && written.contains_key(name) {
+            *slot = spare.next();
+        }
+    }
+    source
 }
 
 /// What the model is not allowed to overwrite on a field the file already
@@ -2354,5 +2392,45 @@ default = 1
         assert!(!written.contains(r#"name = "sync""#));
         assert!(written.contains("# picked by the operator"));
         assert_eq!(from_toml(&written).expect("still valid").fields.len(), 1);
+    }
+
+    #[test]
+    fn renaming_a_field_keeps_its_place_and_the_comment_above_it() {
+        let mut frame = from_toml(COMMENTED).expect("valid frame");
+        frame.fields[0].name = "preamble".to_owned();
+        frame.declared[0] = "preamble".to_owned();
+
+        let written = update_in(COMMENTED, &frame).expect("rewritten");
+
+        // Still the first field, still under the comment written about it.
+        assert!(written.contains("# The sync word never changes.\n[[field]]\nname = \"preamble\""));
+        assert_eq!(
+            from_toml(&written).expect("still valid").declared,
+            ["preamble", "mode"]
+        );
+    }
+
+    #[test]
+    fn a_field_inserted_in_the_middle_is_written_in_the_middle() {
+        let mut frame = from_toml(COMMENTED).expect("valid frame");
+        frame.fields.insert(
+            1,
+            FieldDef {
+                name: "length".to_owned(),
+                description: None,
+                kind: FieldKind::Scalar(ScalarType::U8),
+                endian: Endianness::Big,
+                default: None,
+                range: None,
+            },
+        );
+        frame.declared.insert(1, "length".to_owned());
+
+        let written = update_in(COMMENTED, &frame).expect("rewritten");
+
+        let reread = from_toml(&written).expect("still valid");
+        assert_eq!(reread.declared, ["sync", "length", "mode"]);
+        assert!(written.contains("# The sync word never changes."));
+        assert!(written.contains("# picked by the operator"));
     }
 }

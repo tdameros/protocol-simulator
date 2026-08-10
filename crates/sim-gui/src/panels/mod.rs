@@ -1,5 +1,6 @@
 pub mod connections;
-pub mod frame_editor;
+pub mod frame_edit;
+mod frame_editor;
 pub mod hex_inject;
 pub mod live_monitor;
 pub mod scenario_edit;
