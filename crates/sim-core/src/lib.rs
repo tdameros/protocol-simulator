@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod connection;
+pub mod document;
 pub mod engine;
 pub mod error;
 pub mod frame;

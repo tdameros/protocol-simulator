@@ -240,3 +240,35 @@ fn every_example_scenario_loads_and_names_frames_that_exist() {
         }
     }
 }
+
+#[test]
+fn rewriting_an_example_frame_unchanged_leaves_the_file_alone() {
+    let dir = examples_dir();
+    let types = TypeLibrary::load_dir(&dir.join("types")).expect("shared types should load");
+    for path in schema::toml_files(&dir).expect("examples folder should be readable") {
+        let text = std::fs::read_to_string(&path).expect("readable");
+        let frame = schema::from_toml_with(&text, &types).expect("valid");
+        let written = schema::update_in(&text, &frame).expect("rewritten");
+        assert_eq!(written, text, "{} was disturbed", path.display());
+    }
+}
+
+#[test]
+fn editing_a_subtyped_field_changes_the_value_and_not_the_type() {
+    let dir = examples_dir();
+    let types = TypeLibrary::load_dir(&dir.join("types")).expect("shared types should load");
+    let path = dir.join("07-subtypes.toml");
+    let text = std::fs::read_to_string(&path).expect("readable");
+
+    let mut frame = schema::from_toml_with(&text, &types).expect("valid");
+    let target = frame.field_index("target").expect("target field");
+    frame.fields[target].default = Some(Value::Uint(75));
+
+    let written = schema::update_in(&text, &frame).expect("rewritten");
+
+    assert!(written.contains(r#"type = "Percent""#));
+    assert!(written.contains("default = 75"));
+    let reread = schema::from_toml_with(&written, &types).expect("still valid");
+    assert_eq!(reread.fields[target].default, Some(Value::Uint(75)));
+    assert_eq!(reread.fields[target].range, frame.fields[target].range);
+}
