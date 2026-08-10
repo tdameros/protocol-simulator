@@ -20,7 +20,14 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
     library_bar(ui, state);
 
-    if state.frames.frames.is_empty() {
+    // Editing a copy, so what the list and the disk hold is untouched until
+    // Save says otherwise.
+    if state.frames.draft.is_some() {
+        draft_editor(ui, state);
+        return;
+    }
+
+    if state.frames.is_empty() {
         if state.frames.directory.is_some() && state.frames.failures.is_empty() {
             ui.label("No .toml frame definition in that folder.");
         }
@@ -60,11 +67,17 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
 fn library_bar(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
+        // Both throw the draft away, so neither is offered while one is open:
+        // losing unsaved work to a stray click is not a trade worth making.
+        let idle = state.frames.draft.is_none();
         if ui
-            .button(RichText::new(format!(
-                "{} Frames folder",
-                icons::FOLDER_OPEN
-            )))
+            .add_enabled(
+                idle,
+                egui::Button::new(RichText::new(format!(
+                    "{} Frames folder",
+                    icons::FOLDER_OPEN
+                ))),
+            )
             .clicked()
         {
             if let Some(directory) = rfd::FileDialog::new().pick_folder() {
@@ -73,11 +86,47 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         }
         if state.frames.directory.is_some()
             && ui
-                .button(RichText::new(format!("{} Reload", icons::ARROWS_CLOCKWISE)))
+                .add_enabled(
+                    idle,
+                    egui::Button::new(RichText::new(format!("{} Reload", icons::ARROWS_CLOCKWISE))),
+                )
                 .on_hover_text("Re-read the .toml files from disk")
                 .clicked()
         {
             state.frames.reload();
+        }
+
+        ui.separator();
+
+        if ui
+            .add_enabled(
+                state.frames.directory.is_some() && idle,
+                egui::Button::new(format!("{} New", icons::FILE_PLUS)),
+            )
+            .on_hover_text("Start a frame from scratch")
+            .clicked()
+        {
+            state.frames.begin_new(blank());
+        }
+        let editable = state.frames.selected_entry().is_some() && idle;
+        if ui
+            .add_enabled(
+                editable,
+                egui::Button::new(format!("{} Edit", icons::PENCIL_SIMPLE)),
+            )
+            .on_hover_text("Edit this frame definition")
+            .clicked()
+        {
+            state.frames.begin_edit();
+        }
+        if ui
+            .add_enabled(editable, egui::Button::new(icons::TRASH))
+            .on_hover_text("Delete this frame, and the file holding it")
+            .clicked()
+        {
+            if let Err(error) = state.frames.delete_selected() {
+                state.last_error = Some(format!("{error:#}"));
+            }
         }
     });
     if let Some(directory) = &state.frames.directory {
@@ -90,11 +139,99 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
     }
 }
 
+/// What New starts from: one byte, the smallest thing that is still a frame.
+fn blank() -> FrameDef {
+    FrameDef::flat(
+        "New frame",
+        vec![FieldDef {
+            name: "id".to_owned(),
+            description: None,
+            kind: FieldKind::Scalar(ScalarType::U8),
+            endian: sim_core::frame::Endianness::Big,
+            default: None,
+            range: None,
+        }],
+    )
+}
+
+fn draft_editor(ui: &mut Ui, state: &mut AppState) {
+    let dirty = state.frames.draft_is_dirty();
+    let problem = state.frames.draft_problem();
+    let Some(draft) = &mut state.frames.draft else {
+        return;
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("Name:");
+        ui.text_edit_singleline(&mut draft.frame.name);
+    });
+    let mut description = draft.frame.description.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Description:");
+        if ui.text_edit_singleline(&mut description).changed() {
+            draft.frame.description = (!description.trim().is_empty()).then_some(description);
+        }
+    });
+
+    ui.separator();
+    let fields: Vec<String> = draft.frame.declared.iter().map(ToOwned::to_owned).collect();
+    let size = draft.frame.size();
+    ScrollArea::vertical()
+        .id_salt("draft_fields")
+        .max_height(ui.available_height() * 0.5)
+        .show(ui, |ui| {
+            for name in &fields {
+                ui.label(name);
+            }
+        });
+    ui.label(RichText::new(format!("{size} bytes")).weak());
+    ui.label(RichText::new("Fields are edited in the .toml file.").weak());
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                dirty && problem.is_none(),
+                egui::Button::new(format!("{} Save", icons::FLOPPY_DISK)),
+            )
+            .clicked()
+        {
+            save_draft(state);
+        }
+        if ui.button("Cancel").clicked() {
+            state.frames.cancel_edit();
+        }
+        // Said here rather than after the click: a half-made frame is a normal
+        // state to be in while building one.
+        if let Some(reason) = &problem {
+            ui.colored_label(ERROR, reason);
+        }
+    });
+}
+
+/// Writes the draft out, choosing a file for one that has never had a home.
+fn save_draft(state: &mut AppState) {
+    let Some(directory) = state.frames.directory.clone() else {
+        state.last_error = Some("No frames folder to save into.".to_owned());
+        return;
+    };
+    let name = state
+        .frames
+        .draft
+        .as_ref()
+        .map(|draft| draft.frame.name.clone())
+        .unwrap_or_default();
+
+    let into = crate::frames::suggested_file(&directory, &name);
+    if let Err(error) = state.frames.save_draft(&into) {
+        state.last_error = Some(format!("{error:#}"));
+    }
+}
+
 fn frame_picker(ui: &mut Ui, state: &mut AppState) {
     let names: Vec<String> = state
         .frames
-        .frames
-        .iter()
+        .frames()
         .map(|frame| frame.name.clone())
         .collect();
     let selected_label = state

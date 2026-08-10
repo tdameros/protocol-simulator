@@ -34,7 +34,7 @@ enum Edit {
 
 pub fn steps(ui: &mut Ui, state: &mut AppState) {
     let links: Vec<ConnectionId> = state.connections.iter().map(|(id, _)| id.clone()).collect();
-    let frames: Vec<FrameDef> = state.frames.frames.clone();
+    let frames: Vec<FrameDef> = state.frames.frames().cloned().collect();
     // The same answer as the frame editor gives: a value written into a step is
     // the same kind of thing as a value typed into a frame, so it is read in
     // the same base.
