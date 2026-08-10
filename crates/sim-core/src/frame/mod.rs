@@ -320,6 +320,25 @@ impl FrameDef {
             .map(String::as_str)
     }
 
+    /// The wire fields a declared field stands for, as a contiguous range.
+    ///
+    /// A plain field stands for itself and the range holds one. A type instance
+    /// or a repeat stands for everything it expanded into, which is what makes
+    /// it movable and removable as one thing rather than as twenty.
+    ///
+    /// Empty for a name nothing declared.
+    #[must_use]
+    pub fn expansion_of(&self, declared: &str) -> std::ops::Range<usize> {
+        let mut covered = self.fields.iter().enumerate().filter(|(_, field)| {
+            field.name == declared || self.generated_by(&field.name) == Some(declared)
+        });
+        let Some((first, _)) = covered.next() else {
+            return 0..0;
+        };
+        let last = covered.next_back().map_or(first, |(at, _)| at);
+        first..last + 1
+    }
+
     #[must_use]
     pub fn field_index(&self, name: &str) -> Option<usize> {
         self.fields.iter().position(|field| field.name == name)

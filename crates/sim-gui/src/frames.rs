@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use sim_core::frame::schema::{self, TypeLibrary};
 use sim_core::frame::value::{seed_values, FieldValues};
-use sim_core::frame::FrameDef;
+use sim_core::frame::{FieldDef, FieldKind, FieldSpan, FrameDef};
 
 /// Subdirectory holding the type definitions every frame in the folder can use.
 const TYPES_DIR: &str = "types";
@@ -373,6 +373,206 @@ impl FrameLibrary {
 }
 
 impl Draft {
+    /// Whether the file states this declared field in a way the editor cannot
+    /// unpick.
+    ///
+    /// True for a type instance and for a repeat: both stand for wire fields
+    /// that carry no record of the type or the count that produced them, so the
+    /// editor can move or remove the whole thing but not reword it.
+    #[must_use]
+    pub fn is_expanded(&self, declared: &str) -> bool {
+        self.frame.field_index(declared).is_none()
+    }
+
+    /// The declared field at `index`, if the editor may reword it.
+    #[must_use]
+    pub fn plain_field(&self, index: usize) -> Option<&FieldDef> {
+        let name = self.frame.declared.get(index)?;
+        self.frame.field(name)
+    }
+
+    pub fn plain_field_mut(&mut self, index: usize) -> Option<&mut FieldDef> {
+        let name = self.frame.declared.get(index)?.clone();
+        let at = self.frame.field_index(&name)?;
+        self.frame.fields.get_mut(at)
+    }
+
+    /// Renames a declared field.
+    ///
+    /// Refused for an expanded one. Its wire fields carry the instance name as
+    /// a prefix, and the writer states it as `type = "Point"` with no room to
+    /// say the new name, so a rename here could be shown but never saved.
+    pub fn rename_field(&mut self, index: usize, name: &str) {
+        let Some(old) = self.frame.declared.get(index).cloned() else {
+            return;
+        };
+        if name == old || self.is_expanded(&old) {
+            return;
+        }
+        let Some(at) = self.frame.field_index(&old) else {
+            return;
+        };
+        // Nothing moves, so the ranges stored as indices still hold.
+        name.clone_into(&mut self.frame.fields[at].name);
+        name.clone_into(&mut self.frame.declared[index]);
+    }
+
+    /// Adds a field after the declared one at `index`, or at the end.
+    pub fn add_field(&mut self, index: Option<usize>, field: FieldDef) {
+        let name = self.unused_name(&field.name);
+        let at = match index.and_then(|index| self.frame.declared.get(index)) {
+            Some(after) => self.frame.expansion_of(after).end,
+            None => self.frame.fields.len(),
+        };
+        let declared_at = index.map_or(self.frame.declared.len(), |index| index + 1);
+
+        self.with_spans_kept(|frame| {
+            frame.fields.insert(at, FieldDef { name, ..field });
+            frame
+                .declared
+                .insert(declared_at, frame.fields[at].name.clone());
+        });
+    }
+
+    /// Removes a declared field, and everything it expanded into.
+    pub fn remove_field(&mut self, index: usize) {
+        let Some(name) = self.frame.declared.get(index).cloned() else {
+            return;
+        };
+        self.with_spans_kept(|frame| {
+            frame.fields.drain(frame.expansion_of(&name));
+            frame.declared.remove(index);
+        });
+    }
+
+    /// Moves a declared field one place up or down, expansion and all.
+    pub fn move_field(&mut self, index: usize, down: bool) {
+        let Some(other) = (if down {
+            index.checked_add(1)
+        } else {
+            index.checked_sub(1)
+        }) else {
+            return;
+        };
+        if index >= self.frame.declared.len() || other >= self.frame.declared.len() {
+            return;
+        }
+        let (first, second) = if down { (index, other) } else { (other, index) };
+        let (Some(above), Some(below)) = (
+            self.frame.declared.get(first).cloned(),
+            self.frame.declared.get(second).cloned(),
+        ) else {
+            return;
+        };
+
+        self.with_spans_kept(|frame| {
+            let above = frame.expansion_of(&above);
+            let below = frame.expansion_of(&below);
+            // Rotating rather than swapping: the two runs need not be the same
+            // length, one being a type instance and the other a single byte.
+            frame.fields[above.start..below.end].rotate_left(above.len());
+            frame.declared.swap(first, second);
+        });
+    }
+
+    /// A name no field is using yet, `sample` becoming `sample2` if it is.
+    fn unused_name(&self, wanted: &str) -> String {
+        if self.frame.field_index(wanted).is_none()
+            && !self.frame.declared.iter().any(|name| name == wanted)
+        {
+            return wanted.to_owned();
+        }
+        // Bounded by the field count: one of that many suffixes is free, since
+        // that is how many names there are to collide with.
+        (2..=self.frame.fields.len() + 2)
+            .map(|suffix| format!("{wanted}{suffix}"))
+            .find(|name| {
+                self.frame.field_index(name).is_none()
+                    && !self.frame.declared.iter().any(|held| held == name)
+            })
+            .unwrap_or_else(|| wanted.to_owned())
+    }
+
+    /// Runs a structural change with every checksum still covering the fields
+    /// it was covering, wherever they have gone.
+    ///
+    /// Ranges are stored as indices, which is what the encoder needs and what
+    /// the editor must not let it mean. Inserting a field above a checksum
+    /// would otherwise quietly shift its range by one and protect the wrong
+    /// bytes, with nothing on screen to say so.
+    ///
+    /// What is remembered is the set of covered fields, not the two ends.
+    /// Reordering can put the field that was last in front of the one that was
+    /// first, and a range rebuilt from the old ends would come back inside out.
+    fn with_spans_kept(&mut self, change: impl FnOnce(&mut FrameDef)) {
+        let covered: Vec<(String, Vec<String>)> = self
+            .frame
+            .fields
+            .iter()
+            .filter_map(|field| match &field.kind {
+                FieldKind::Checksum { covers, .. } => Some((
+                    field.name.clone(),
+                    self.frame.fields[covers.from..=covers.to]
+                        .iter()
+                        .map(|held| held.name.clone())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+
+        change(&mut self.frame);
+
+        for (owner, was) in covered {
+            let Some(at) = self.frame.field_index(&owner) else {
+                continue;
+            };
+            let survivors: Vec<usize> = was
+                .iter()
+                .filter_map(|name| self.frame.field_index(name))
+                .collect();
+            // A range whose every field went with the deletion falls back to
+            // the field in front of the checksum: something has to be covered,
+            // and an index past the end would take the encoder with it.
+            let span = match (survivors.iter().min(), survivors.iter().max()) {
+                (Some(&from), Some(&to)) => FieldSpan { from, to },
+                _ => FieldSpan {
+                    from: at.saturating_sub(1),
+                    to: at.saturating_sub(1),
+                },
+            };
+            if let FieldKind::Checksum { covers, .. } = &mut self.frame.fields[at].kind {
+                *covers = span;
+            }
+        }
+    }
+
+    /// Sets what the checksum declared at `index` covers, by naming both ends.
+    pub fn set_coverage(&mut self, index: usize, from: &str, to: &str) {
+        let (Some(from), Some(to)) = (self.frame.field_index(from), self.frame.field_index(to))
+        else {
+            return;
+        };
+        let Some(at) = self
+            .frame
+            .declared
+            .get(index)
+            .and_then(|name| self.frame.field_index(name))
+        else {
+            return;
+        };
+        let Some(field) = self.frame.fields.get_mut(at) else {
+            return;
+        };
+        if let FieldKind::Checksum { covers, .. } = &mut field.kind {
+            // Backwards is not a range, and the picker offers both ends freely.
+            *covers = FieldSpan {
+                from: from.min(to),
+                to: from.max(to),
+            };
+        }
+    }
+
     /// The exact text a save would write.
     ///
     /// # Errors
@@ -833,5 +1033,239 @@ default = 50
         assert!(library.entries.is_empty());
         assert_eq!(library.selected, None);
         assert!(!dir.join("telemetry.toml").exists());
+    }
+
+    /// A frame with a checksum at the end and a type instance in the middle,
+    /// which is where every structural edit can go wrong at once.
+    const LAYERED: &str = r#"
+name = "Layered"
+
+[[type]]
+name = "Point"
+[[type.field]]
+name = "x"
+type = "u8"
+[[type.field]]
+name = "y"
+type = "u8"
+
+[[field]]
+name = "header"
+type = "u8"
+
+[[field]]
+name = "here"
+type = "Point"
+
+[[field]]
+name = "crc"
+type = "crc16"
+algo = "crc16-ccitt"
+covers = { from = "header", to = "here" }
+"#;
+
+    fn draft_of(text: &str) -> Draft {
+        Draft {
+            frame: schema::from_toml(text).expect("valid frame"),
+            origin: None,
+        }
+    }
+
+    fn plain(name: &str) -> FieldDef {
+        FieldDef {
+            name: name.to_owned(),
+            description: None,
+            kind: FieldKind::Scalar(ScalarType::U8),
+            endian: Endianness::Big,
+            default: None,
+            range: None,
+        }
+    }
+
+    fn covered(draft: &Draft) -> (String, String) {
+        let field = draft.frame.field("crc").expect("checksum");
+        let FieldKind::Checksum { covers, .. } = &field.kind else {
+            panic!("not a checksum");
+        };
+        (
+            draft.frame.fields[covers.from].name.clone(),
+            draft.frame.fields[covers.to].name.clone(),
+        )
+    }
+
+    #[test]
+    fn a_type_instance_stands_for_every_field_it_expanded_into() {
+        let draft = draft_of(LAYERED);
+        assert_eq!(draft.frame.declared, ["header", "here", "crc"]);
+        assert_eq!(draft.frame.expansion_of("here"), 1..3);
+        assert_eq!(draft.frame.expansion_of("header"), 0..1);
+        assert!(draft.is_expanded("here"));
+        assert!(!draft.is_expanded("header"));
+    }
+
+    #[test]
+    fn inserting_a_field_does_not_shift_what_a_checksum_covers() {
+        let mut draft = draft_of(LAYERED);
+        assert_eq!(covered(&draft), ("header".to_owned(), "here.y".to_owned()));
+
+        draft.add_field(Some(0), plain("inserted"));
+
+        assert_eq!(draft.frame.declared, ["header", "inserted", "here", "crc"]);
+        assert_eq!(covered(&draft), ("header".to_owned(), "here.y".to_owned()));
+    }
+
+    #[test]
+    fn moving_a_type_instance_moves_all_of_it_at_once() {
+        let mut draft = draft_of(LAYERED);
+        draft.move_field(1, false);
+
+        assert_eq!(draft.frame.declared, ["here", "header", "crc"]);
+        assert_eq!(
+            draft
+                .frame
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["here.x", "here.y", "header", "crc"]
+        );
+        // The same three fields as before, which are now in another order.
+        assert_eq!(covered(&draft), ("here.x".to_owned(), "header".to_owned()));
+    }
+
+    #[test]
+    fn renaming_a_plain_field_leaves_what_a_checksum_covers_alone() {
+        let mut draft = draft_of(LAYERED);
+        draft.rename_field(0, "start");
+
+        assert_eq!(draft.frame.declared, ["start", "here", "crc"]);
+        assert_eq!(covered(&draft), ("start".to_owned(), "here.y".to_owned()));
+    }
+
+    #[test]
+    fn renaming_a_type_instance_is_refused_rather_than_shown_and_lost() {
+        let mut draft = draft_of(LAYERED);
+        draft.rename_field(1, "corner");
+
+        assert_eq!(draft.frame.declared, ["header", "here", "crc"]);
+    }
+
+    #[test]
+    fn removing_a_type_instance_removes_all_of_it() {
+        let mut draft = draft_of(LAYERED);
+        draft.remove_field(1);
+
+        assert_eq!(draft.frame.declared, ["header", "crc"]);
+        assert_eq!(
+            draft
+                .frame
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["header", "crc"]
+        );
+    }
+
+    #[test]
+    fn a_checksum_losing_the_end_of_its_range_falls_back_rather_than_dangling() {
+        let mut draft = draft_of(LAYERED);
+        draft.remove_field(1);
+
+        // Was covering up to `here.y`, which is gone. Anything is better than
+        // an index past the end, which the encoder would follow.
+        let (from, to) = covered(&draft);
+        assert_eq!((from.as_str(), to.as_str()), ("header", "header"));
+        assert!(draft.problem(&TypeLibrary::default()).is_none());
+    }
+
+    #[test]
+    fn a_new_field_does_not_take_a_name_already_in_use() {
+        let mut draft = draft_of(LAYERED);
+        draft.add_field(None, plain("header"));
+        draft.add_field(None, plain("header"));
+
+        assert_eq!(
+            draft.frame.declared,
+            ["header", "here", "crc", "header2", "header3"]
+        );
+    }
+
+    #[test]
+    fn coverage_is_set_by_naming_both_ends_either_way_round() {
+        let mut draft = draft_of(LAYERED);
+        let crc = draft.frame.field_index("crc").expect("checksum");
+        draft.set_coverage(crc, "here.y", "header");
+
+        assert_eq!(covered(&draft), ("header".to_owned(), "here.y".to_owned()));
+    }
+
+    #[test]
+    fn every_structural_edit_leaves_a_file_that_still_reads_back() {
+        let mut draft = Draft {
+            origin: Some(Origin {
+                file: PathBuf::from("layered.toml"),
+                text: LAYERED.to_owned(),
+            }),
+            ..draft_of(LAYERED)
+        };
+        draft.add_field(Some(0), plain("inserted"));
+        draft.move_field(1, true);
+        draft.rename_field(0, "start");
+
+        assert_eq!(draft.problem(&TypeLibrary::default()), None);
+        let written = draft.written().expect("written");
+        assert!(written.contains(r#"type = "Point""#), "{written}");
+    }
+
+    #[test]
+    fn coverage_is_set_against_the_declared_field_not_the_wire_position() {
+        let mut draft = draft_of(LAYERED);
+        // `crc` is declared third and sits fourth on the wire, the type in
+        // front of it having expanded into two. Told the wrong one, this would
+        // set the coverage of `here.y`, which is not a checksum at all.
+        let declared = draft
+            .frame
+            .declared
+            .iter()
+            .position(|name| name == "crc")
+            .expect("declared");
+        assert_ne!(
+            declared,
+            draft.frame.field_index("crc").expect("on the wire")
+        );
+
+        draft.set_coverage(declared, "header", "here.x");
+
+        assert_eq!(covered(&draft), ("header".to_owned(), "here.x".to_owned()));
+    }
+
+    #[test]
+    fn a_frame_built_from_nothing_but_edits_still_encodes() {
+        let mut draft = Draft {
+            frame: FrameDef::flat("Built", vec![plain("id")]),
+            origin: None,
+        };
+        draft.add_field(Some(0), plain("count"));
+        draft.add_field(Some(1), plain("crc"));
+
+        let crc = draft
+            .frame
+            .declared
+            .iter()
+            .position(|n| n == "crc")
+            .unwrap();
+        if let Some(field) = draft.plain_field_mut(crc) {
+            field.kind = FieldKind::Checksum {
+                spec: sim_core::frame::checksum::ChecksumSpec::Xor8,
+                covers: FieldSpan { from: 0, to: 1 },
+            };
+        }
+
+        assert_eq!(draft.problem(&TypeLibrary::default()), None);
+        let written = draft.written().expect("written");
+        let reread = schema::from_toml(&written).expect("valid");
+        assert_eq!(reread.declared, ["id", "count", "crc"]);
+        assert_eq!(reread.size(), 3);
     }
 }
