@@ -205,7 +205,7 @@ struct RawCovers {
     to: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawField {
     name: String,
     #[serde(rename = "type")]
@@ -259,7 +259,7 @@ impl RawType {
 }
 
 /// A file holding nothing but shared type definitions.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct RawTypeFile {
     #[serde(default, rename = "type")]
     types: Vec<RawType>,
@@ -285,6 +285,60 @@ struct RawFrame {
 #[derive(Debug, Default, Clone)]
 pub struct TypeLibrary {
     types: BTreeMap<String, RawType>,
+}
+
+/// A type shared by every frame in a folder, as something editable.
+///
+/// A type is one of two things, and never both: a group of fields that expands
+/// wherever the type is named, or a scalar narrowed to the values the protocol
+/// actually allows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    /// What naming this type contributes, under the name it is given. Its own
+    /// name is the type's, and a subtype's is empty.
+    pub layout: FrameDef,
+    /// Set when the type narrows a scalar rather than grouping fields.
+    pub narrows: Option<Subtype>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Subtype {
+    /// A scalar, or another subtype to narrow further.
+    pub base: String,
+    pub range: Option<ValueRange>,
+}
+
+impl TypeDef {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.layout.name
+    }
+
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.layout.description.as_deref()
+    }
+}
+
+/// A range as it is to be shown, against the scalar the base resolves to.
+fn declared_range(
+    raw: Option<&RawRange>,
+    scalar: ScalarType,
+    name: &str,
+) -> Result<Option<ValueRange>, SchemaError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    // Read through a field, the one place that already knows how to turn the
+    // two written values into bounds of the right sort.
+    build_range(
+        &RawField {
+            name: name.to_owned(),
+            range: Some(raw.clone()),
+            ..RawField::default()
+        },
+        &FieldKind::Scalar(scalar),
+    )
 }
 
 impl TypeLibrary {
@@ -340,6 +394,61 @@ impl TypeLibrary {
     #[must_use]
     pub fn names(&self) -> Vec<&str> {
         self.types.keys().map(String::as_str).collect()
+    }
+
+    /// One type as something that can be shown and edited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the type is not valid on its own, which is the same
+    /// thing as a frame naming it failing to load.
+    pub fn definition(&self, name: &str) -> Result<Option<TypeDef>, SchemaError> {
+        let Some(raw) = self.types.get(name) else {
+            return Ok(None);
+        };
+        self.define(raw).map(Some)
+    }
+
+    /// Every type the library holds, in name order.
+    ///
+    /// # Errors
+    ///
+    /// As [`TypeLibrary::definition`].
+    pub fn definitions(&self) -> Result<Vec<TypeDef>, SchemaError> {
+        self.types.values().map(|raw| self.define(raw)).collect()
+    }
+
+    fn define(&self, raw: &RawType) -> Result<TypeDef, SchemaError> {
+        let narrows = if raw.is_subtype() {
+            let mut stack = Vec::new();
+            let (base, range) = resolve_subtype(raw, &self.types, &mut stack)?;
+            // Shown against the scalar it ends up being, since that is what
+            // decides whether the bounds are signed, unsigned or fractional.
+            let scalar = ScalarType::parse(&base).ok_or_else(|| SchemaError::BadSubtypeBase {
+                name: raw.name.clone(),
+                base: base.clone(),
+            })?;
+            Some(Subtype {
+                base: raw.base.clone().unwrap_or(base),
+                range: declared_range(range.as_ref(), scalar, &raw.name)?,
+            })
+        } else {
+            None
+        };
+
+        // Built as a frame of its own, which is what naming it does anyway: the
+        // fields it expands to are the fields it contributes.
+        let layout = build(
+            RawFrame {
+                name: raw.name.clone(),
+                description: raw.description.clone(),
+                endian: None,
+                types: Vec::new(),
+                fields: raw.fields.clone(),
+            },
+            self,
+        )?;
+        Ok(TypeDef { layout, narrows })
     }
 
     #[must_use]
@@ -430,6 +539,20 @@ pub fn update_in(text: &str, frame: &FrameDef) -> Result<String, SchemaError> {
 }
 
 fn merge_fields(document: &mut toml_edit::DocumentMut, frame: &FrameDef, fresh: &toml_edit::Table) {
+    let mut next = document::last_position(document);
+    reconcile(document.as_table_mut(), fresh, &frame.declared, &mut next);
+}
+
+/// Writes a run of `[[field]]` sections over the ones already in `holder`.
+///
+/// Shared by a frame and by a type that groups fields, the two being the same
+/// run of sections under two different parents.
+fn reconcile(
+    holder: &mut toml_edit::Table,
+    fresh: &toml_edit::Table,
+    declared: &[String],
+    next: &mut isize,
+) {
     let written: BTreeMap<String, toml_edit::Table> = sections(fresh, "field")
         .into_iter()
         .filter_map(|entry| {
@@ -437,12 +560,11 @@ fn merge_fields(document: &mut toml_edit::DocumentMut, frame: &FrameDef, fresh: 
             Some((name, entry))
         })
         .collect();
-
-    let existing = sections(document.as_table(), "field");
-    let source = pair_up(&existing, &frame.declared, &written);
+    let existing = sections(holder, "field");
+    let source = pair_up(&existing, declared, &written);
 
     let mut rebuilt = toml_edit::ArrayOfTables::new();
-    for (name, from) in frame.declared.iter().zip(&source) {
+    for (name, from) in declared.iter().zip(&source) {
         match from.and_then(|at| existing.get(at)) {
             Some(entry) => {
                 let mut entry = entry.clone();
@@ -466,21 +588,20 @@ fn merge_fields(document: &mut toml_edit::DocumentMut, frame: &FrameDef, fresh: 
     // else in the file, so it is done only when the order actually changed.
     // Reusing a table keeps the position it was parsed at, and two entries that
     // swapped places would otherwise be rendered in their old order.
-    let reordered = source
+    let in_order = source
         .iter()
         .flatten()
         .try_fold(None::<usize>, |last, &at| {
             (last.is_none_or(|last| last < at)).then_some(Some(at))
         })
-        .is_none()
-        || source.iter().any(Option::is_none);
-    if reordered {
-        let mut next = document::last_position(document);
+        .is_some()
+        && source.iter().all(Option::is_some);
+    if !in_order {
         for entry in rebuilt.iter_mut() {
-            document::place_after(entry, &mut next);
+            document::place_after(entry, next);
         }
     }
-    document.insert("field", Item::ArrayOfTables(rebuilt));
+    holder.insert("field", Item::ArrayOfTables(rebuilt));
 }
 
 /// Which entry in the file each declared field should be written over.
@@ -572,6 +693,47 @@ fn cover_name(frame: &FrameDef, index: usize, edge: Edge) -> String {
     }
 }
 
+/// A type as the file writes it.
+///
+/// Only the fields the file wrote, for the same reason a frame's writer keeps
+/// to those: a field that came out of another type cannot be folded back into
+/// the name that produced it.
+fn lower_type(type_def: &TypeDef) -> RawType {
+    let (base, range) = match &type_def.narrows {
+        Some(subtype) => (Some(subtype.base.clone()), subtype.range.map(lower_range)),
+        None => (None, None),
+    };
+    let mut fields: Vec<RawField> = type_def
+        .layout
+        .fields
+        .iter()
+        .filter(|field| type_def.layout.declared.contains(&field.name))
+        .map(|field| lower_field(field, &type_def.layout))
+        .collect();
+    for field in &mut fields {
+        field.endian = None;
+    }
+    RawType {
+        name: type_def.layout.name.clone(),
+        description: type_def.layout.description.clone(),
+        base,
+        range,
+        fields,
+    }
+}
+
+fn lower_range(range: ValueRange) -> RawRange {
+    let (min, max) = match range {
+        ValueRange::Uint { min, max } => (
+            toml::Value::Integer(i64::try_from(min).unwrap_or(i64::MAX)),
+            toml::Value::Integer(i64::try_from(max).unwrap_or(i64::MAX)),
+        ),
+        ValueRange::Int { min, max } => (toml::Value::Integer(min), toml::Value::Integer(max)),
+        ValueRange::Float { min, max } => (toml::Value::Float(min), toml::Value::Float(max)),
+    };
+    RawRange { min, max }
+}
+
 /// The entries under `key`, however they were written.
 ///
 /// Serialising a frame produces one array of inline tables where a person would
@@ -602,6 +764,88 @@ fn as_document(frame: &FrameDef) -> Result<toml_edit::DocumentMut, SchemaError> 
         field.endian = None;
     }
     toml_edit::ser::to_document(&raw).map_err(SchemaError::Rewrite)
+}
+
+/// Writes a type back into the file it came from, keeping every comment.
+///
+/// Unlike a frame, a types file holds as many types as someone cared to put in
+/// it, so the one to overwrite is found by the name it currently answers to.
+/// A type not in the file yet is appended.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML, or the type not
+/// serialisable.
+pub fn update_type_in(text: &str, name: &str, type_def: &TypeDef) -> Result<String, SchemaError> {
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(SchemaError::Edit)?;
+    // Serialised inside a file rather than alone, so that it comes out as the
+    // `[[type]]` entry the document is going to hold it as.
+    let fresh = toml_edit::ser::to_document(&RawTypeFile {
+        types: vec![lower_type(type_def)],
+    })
+    .map_err(SchemaError::Rewrite)?;
+    let Some(fresh) = sections(fresh.as_table(), "type").into_iter().next() else {
+        return Ok(document.to_string());
+    };
+
+    if document.get("type").is_none() {
+        document.insert("type", Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    }
+    let mut next = document::last_position(&document);
+    let Some(entries) = document
+        .get_mut("type")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return Ok(document.to_string());
+    };
+
+    let at = entries
+        .iter()
+        .position(|entry| entry.get("name").and_then(Item::as_str) == Some(name));
+    if let Some(entry) = at.and_then(|at| entries.get_mut(at)) {
+        // `field` is merged apart, an array of tables being a run of sections
+        // rather than one value to be dropped in.
+        {
+            document::merge(entry, &fresh, &["field"]);
+            let declared: Vec<String> = sections(&fresh, "field")
+                .iter()
+                .filter_map(|held| Some(held.get("name").and_then(Item::as_str)?.to_owned()))
+                .collect();
+            reconcile(entry, &fresh, &declared, &mut next);
+        }
+    } else {
+        let mut appended = fresh;
+        document::place_after(&mut appended, &mut next);
+        entries.push(appended);
+    }
+    Ok(document.to_string())
+}
+
+/// Takes a type out of a file.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML.
+pub fn remove_type_from(text: &str, name: &str) -> Result<String, SchemaError> {
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(SchemaError::Edit)?;
+    if let Some(entries) = document
+        .get_mut("type")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        entries.retain(|entry| entry.get("name").and_then(Item::as_str) != Some(name));
+    }
+    Ok(document.to_string())
+}
+
+/// A types file holding nothing but this one type.
+///
+/// # Errors
+///
+/// Returns an error if the type cannot be serialised.
+pub fn type_to_toml(type_def: &TypeDef) -> Result<String, SchemaError> {
+    Ok(toml::to_string_pretty(&RawTypeFile {
+        types: vec![lower_type(type_def)],
+    })?)
 }
 
 /// Loads a frame definition from disk.

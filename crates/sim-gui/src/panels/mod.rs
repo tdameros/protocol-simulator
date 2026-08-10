@@ -5,6 +5,7 @@ pub mod hex_inject;
 pub mod live_monitor;
 pub mod scenario_edit;
 pub mod scenario_list;
+pub mod type_edit;
 
 use egui::{Color32, Layout, Response, TextStyle, Ui, WidgetText};
 use egui_dock::tab_viewer::OnCloseResponse;

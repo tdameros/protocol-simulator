@@ -272,3 +272,50 @@ fn editing_a_subtyped_field_changes_the_value_and_not_the_type() {
     assert_eq!(reread.fields[target].default, Some(Value::Uint(75)));
     assert_eq!(reread.fields[target].range, frame.fields[target].range);
 }
+
+#[test]
+fn rewriting_a_shared_type_unchanged_leaves_the_file_alone() {
+    let dir = examples_dir().join("types");
+    let types = TypeLibrary::load_dir(&dir).expect("shared types should load");
+    for path in schema::toml_files(&dir).expect("types folder should be readable") {
+        let text = std::fs::read_to_string(&path).expect("readable");
+        for definition in types.definitions().expect("every type is valid") {
+            let written =
+                schema::update_type_in(&text, definition.name(), &definition).expect("rewritten");
+            assert_eq!(
+                written,
+                text,
+                "{} disturbed by {}",
+                path.display(),
+                definition.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_shared_type_is_read_as_the_two_things_a_type_can_be() {
+    let types = TypeLibrary::load_dir(&examples_dir().join("types")).expect("types");
+
+    let percent = types.definition("Percent").expect("valid").expect("there");
+    assert_eq!(
+        percent
+            .narrows
+            .as_ref()
+            .map(|narrows| narrows.base.as_str()),
+        Some("u8")
+    );
+    assert_eq!(
+        percent.narrows.and_then(|narrows| narrows.range),
+        Some(ValueRange::Uint { min: 0, max: 100 })
+    );
+    assert!(percent.layout.fields.is_empty());
+
+    let led = types
+        .definition("LedConfig")
+        .expect("valid")
+        .expect("there");
+    assert!(led.narrows.is_none());
+    assert_eq!(led.layout.declared, ["mode", "brightness", "period_ms"]);
+    assert_eq!(led.layout.size(), 4);
+}

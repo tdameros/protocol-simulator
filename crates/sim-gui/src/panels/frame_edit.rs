@@ -13,7 +13,7 @@ use sim_core::frame::{
     BitDef, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType, ValueRange,
 };
 
-use crate::frames::Draft;
+use crate::layout;
 use crate::panels::number;
 use crate::state::AppState;
 
@@ -42,20 +42,22 @@ enum Edit {
 }
 
 pub fn fields(ui: &mut Ui, state: &mut AppState) {
-    let Some(draft) = &state.frames.draft else {
+    let hex = state.hex_values;
+    let Some(draft) = &mut state.frames.draft else {
         return;
     };
+    layout(ui, &mut draft.frame, hex);
+}
+
+/// One pass over a field list, whoever it belongs to.
+pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool) {
     // Drawn from a copy so a row may decide to remove itself without the rest
     // of the pass reading a list that has moved under it.
-    let frame = draft.frame.clone();
-    let hex = state.hex_values;
+    let frame = list.clone();
     let mut edit = None;
 
     for (index, declared) in frame.declared.iter().enumerate() {
-        let Some(draft) = &mut state.frames.draft else {
-            return;
-        };
-        field_row(ui, draft, &frame, index, declared, hex, &mut edit);
+        field_row(ui, list, &frame, index, declared, hex, &mut edit);
     }
 
     ui.horizontal(|ui| {
@@ -69,16 +71,13 @@ pub fn fields(ui: &mut Ui, state: &mut AppState) {
         ui.label(RichText::new(format!("{} bytes", frame.size())).weak());
     });
 
-    let Some(draft) = &mut state.frames.draft else {
-        return;
-    };
     match edit {
-        Some(Edit::Add(after)) => draft.add_field(after, blank_field()),
-        Some(Edit::Remove(index)) => draft.remove_field(index),
-        Some(Edit::Move(index, down)) => draft.move_field(index, down),
-        Some(Edit::Rename(index, name)) => draft.rename_field(index, &name),
+        Some(Edit::Add(after)) => layout::add_field(list, after, blank_field()),
+        Some(Edit::Remove(index)) => layout::remove_field(list, index),
+        Some(Edit::Move(index, down)) => layout::move_field(list, index, down),
+        Some(Edit::Rename(index, name)) => layout::rename_field(list, index, &name),
         Some(Edit::Kind(index, kind)) => {
-            if let Some(field) = draft.plain_field_mut(index) {
+            if let Some(field) = layout::plain_field_mut(list, index) {
                 // A default that still means something under the new kind is
                 // kept, the rest starting clean rather than half converted.
                 field.default = field
@@ -95,7 +94,7 @@ pub fn fields(ui: &mut Ui, state: &mut AppState) {
 
 fn field_row(
     ui: &mut Ui,
-    draft: &mut Draft,
+    layout: &mut FrameDef,
     frame: &FrameDef,
     index: usize,
     declared: &str,
@@ -103,7 +102,7 @@ fn field_row(
     edit: &mut Option<Edit>,
 ) {
     let id = Id::new(("frame_field", index, declared));
-    let expanded = draft.is_expanded(declared);
+    let expanded = layout::is_expanded(layout, declared);
     CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
             if ui
@@ -141,7 +140,7 @@ fn field_row(
             if ui.text_edit_singleline(&mut name).changed() {
                 *edit = Some(Edit::Rename(index, name));
             }
-            kind_picker(ui, draft, frame, index, edit);
+            kind_picker(ui, layout, frame, index, edit);
         })
         .body(|ui| {
             if expanded {
@@ -158,18 +157,18 @@ fn field_row(
                 ui.label(RichText::new("Stated as a type, and edited where the type is.").weak());
                 return;
             }
-            details(ui, draft, frame, index, hex);
+            details(ui, layout, frame, index, hex);
         });
 }
 
 fn kind_picker(
     ui: &mut Ui,
-    draft: &Draft,
+    layout: &FrameDef,
     frame: &FrameDef,
     index: usize,
     edit: &mut Option<Edit>,
 ) {
-    let Some(field) = draft.plain_field(index) else {
+    let Some(field) = layout::plain_field(layout, index) else {
         return;
     };
     let current = label_of(&field.kind);
@@ -192,8 +191,8 @@ fn kind_picker(
 }
 
 /// The kind-specific part of a field, below the row that names it.
-fn details(ui: &mut Ui, draft: &mut Draft, frame: &FrameDef, index: usize, hex: bool) {
-    let Some(field) = draft.plain_field_mut(index) else {
+fn details(ui: &mut Ui, layout: &mut FrameDef, frame: &FrameDef, index: usize, hex: bool) {
+    let Some(field) = layout::plain_field_mut(layout, index) else {
         return;
     };
 
@@ -221,7 +220,7 @@ fn details(ui: &mut Ui, draft: &mut Draft, frame: &FrameDef, index: usize, hex: 
         FieldKind::Bits { repr, bits } => bits_details(ui, index, *repr, bits),
         FieldKind::Checksum { covers, .. } => {
             let span = *covers;
-            coverage_picker(ui, draft, frame, index, span);
+            coverage_picker(ui, layout, frame, index, span);
         }
     }
 }
@@ -377,7 +376,7 @@ fn bits_details(ui: &mut Ui, index: usize, repr: ScalarType, bits: &mut Vec<BitD
 /// Which stretch of the frame a checksum protects, named rather than counted.
 fn coverage_picker(
     ui: &mut Ui,
-    draft: &mut Draft,
+    layout: &mut FrameDef,
     frame: &FrameDef,
     index: usize,
     span: FieldSpan,
@@ -410,7 +409,7 @@ fn coverage_picker(
     });
 
     if changed {
-        draft.set_coverage(index, &from, &to);
+        layout::set_coverage(layout, index, &from, &to);
     }
 }
 

@@ -26,17 +26,26 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         draft_editor(ui, state);
         return;
     }
-
-    if state.frames.is_empty() {
-        if state.frames.directory.is_some() && state.frames.failures.is_empty() {
-            ui.label("No .toml frame definition in that folder.");
-        }
-        show_failures(ui, state);
+    if state.frames.type_draft.is_some() {
+        super::type_edit::editor(ui, state);
         return;
     }
 
-    frame_picker(ui, state);
+    let empty = state.frames.is_empty();
+    if empty {
+        if state.frames.directory.is_some() && state.frames.failures.is_empty() {
+            ui.label("No .toml frame definition in that folder.");
+        }
+    } else {
+        frame_picker(ui, state);
+    }
+    // Offered even with no frame yet: a folder often starts with the types
+    // everything in it is going to be built from.
+    super::type_edit::library_bar(ui, state);
     show_failures(ui, state);
+    if empty {
+        return;
+    }
     ui.separator();
 
     let Some(frame) = state.frames.selected_frame().cloned() else {
@@ -133,9 +142,6 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         ui.label(RichText::new(directory.display().to_string()).weak());
     } else {
         ui.label("Pick the folder holding your frame .toml files.");
-    }
-    if !state.frames.shared_types.is_empty() {
-        ui.label(RichText::new(format!("types/: {}", state.frames.shared_types.join(", "))).weak());
     }
 }
 
