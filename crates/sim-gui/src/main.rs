@@ -8,6 +8,7 @@
 mod app;
 mod engine_handle;
 mod frames;
+mod layout;
 mod panels;
 mod prefs;
 mod project;

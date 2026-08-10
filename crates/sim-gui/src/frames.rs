@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use sim_core::frame::schema::{self, TypeLibrary};
+use sim_core::frame::schema::{self, TypeDef, TypeLibrary};
 use sim_core::frame::value::{seed_values, FieldValues};
-use sim_core::frame::{FieldDef, FieldKind, FieldSpan, FrameDef};
+use sim_core::frame::FrameDef;
 
 /// Subdirectory holding the type definitions every frame in the folder can use.
 const TYPES_DIR: &str = "types";
@@ -35,11 +35,53 @@ pub struct FrameLibrary {
     pub selected: Option<usize>,
     /// The frame being edited, if any.
     pub draft: Option<Draft>,
+    /// The shared types, and where each of them lives.
+    pub type_entries: Vec<TypeEntry>,
+    pub type_selected: Option<usize>,
+    /// The shared type being edited, if any.
+    pub type_draft: Option<TypeDraft>,
     /// Kept so a draft can be read back against the same types it was written
     /// against, which is the only way the guard means anything.
     types: TypeLibrary,
     /// Edited values, keyed by frame name so switching frames keeps your input.
     values: BTreeMap<String, FieldValues>,
+}
+
+/// A shared type and the file it came from.
+///
+/// Unlike a frame, a types file holds as many as someone put in it, so the name
+/// is half of the identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeEntry {
+    pub file: PathBuf,
+    pub definition: TypeDef,
+}
+
+/// A shared type as the panel has it, which is not yet what the disk has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDraft {
+    pub definition: TypeDef,
+    pub origin: Option<TypeOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeOrigin {
+    pub file: PathBuf,
+    pub text: String,
+    /// The name the file still knows it by, renaming being an edit like any
+    /// other.
+    pub name: String,
+}
+
+/// What editing a shared type would do to a frame that uses it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// The frame would no longer load at all.
+    Broken(String),
+    /// The frame still loads, but not as the same bytes.
+    Resized { was: usize, now: usize },
+    /// Same size, different layout.
+    Reshaped,
 }
 
 /// A frame as the panel has it, which is not yet what the disk has.
@@ -65,7 +107,9 @@ impl FrameLibrary {
         self.entries.clear();
         self.failures.clear();
         self.shared_types.clear();
+        self.type_entries.clear();
         self.draft = None;
+        self.type_draft = None;
 
         self.types = self.load_shared_types(&directory);
 
@@ -164,7 +208,44 @@ impl FrameLibrary {
         }
 
         self.shared_types = types.names().into_iter().map(ToOwned::to_owned).collect();
+        self.attribute_types(&types_dir, &types);
         types
+    }
+
+    /// Records which file each shared type was written in.
+    ///
+    /// Read a second time, one file at a time, only to learn the names each one
+    /// holds: a type may name a type from another file, so what they mean can
+    /// only be worked out from the library as a whole.
+    fn attribute_types(&mut self, directory: &Path, types: &TypeLibrary) {
+        let Ok(paths) = schema::toml_files(directory) else {
+            return;
+        };
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut alone = TypeLibrary::default();
+            if alone.merge_toml(&text).is_err() {
+                continue;
+            }
+            for name in alone.names() {
+                match types.definition(name) {
+                    Ok(Some(definition)) => self.type_entries.push(TypeEntry {
+                        file: path.clone(),
+                        definition,
+                    }),
+                    Ok(None) => {}
+                    Err(error) => self.failures.push((
+                        format!("{TYPES_DIR}/{}", file_label(&path)),
+                        error.to_string(),
+                    )),
+                }
+            }
+        }
+        self.type_entries
+            .sort_by(|a, b| a.definition.name().cmp(b.definition.name()));
+        self.type_selected = (!self.type_entries.is_empty()).then_some(0);
     }
 
     pub fn reload(&mut self) {
@@ -202,6 +283,208 @@ impl FrameLibrary {
 
     pub fn reset_values(&mut self, frame: &FrameDef) {
         self.values.insert(frame.name.clone(), seed_values(frame));
+    }
+
+    #[must_use]
+    pub fn selected_type(&self) -> Option<&TypeEntry> {
+        self.type_selected.and_then(|at| self.type_entries.get(at))
+    }
+
+    /// Starts editing the selected shared type, as a copy.
+    pub fn begin_type_edit(&mut self) {
+        let Some(entry) = self.selected_type() else {
+            return;
+        };
+        let origin = std::fs::read_to_string(&entry.file)
+            .ok()
+            .map(|text| TypeOrigin {
+                file: entry.file.clone(),
+                text,
+                name: entry.definition.name().to_owned(),
+            });
+        self.type_draft = Some(TypeDraft {
+            definition: entry.definition.clone(),
+            origin,
+        });
+    }
+
+    pub fn begin_new_type(&mut self, definition: TypeDef) {
+        self.type_draft = Some(TypeDraft {
+            definition,
+            origin: None,
+        });
+    }
+
+    pub fn cancel_type_edit(&mut self) {
+        self.type_draft = None;
+    }
+
+    #[must_use]
+    pub fn type_draft_is_dirty(&self) -> bool {
+        let Some(draft) = &self.type_draft else {
+            return false;
+        };
+        let Some(origin) = &draft.origin else {
+            return true;
+        };
+        self.type_entries
+            .iter()
+            .find(|entry| entry.definition.name() == origin.name)
+            .is_none_or(|entry| entry.definition != draft.definition)
+    }
+
+    /// What the type draft would do to the frames that use it.
+    ///
+    /// Nothing on this list stops a save. A type exists to be shared, so
+    /// changing it is meant to reach the frames naming it, and the point is
+    /// that it says so first rather than after the next Reload.
+    #[must_use]
+    pub fn type_draft_impact(&self) -> Vec<(String, Effect)> {
+        let Some(candidate) = self.candidate_types() else {
+            return Vec::new();
+        };
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let effect = match schema::load_with(&entry.file, &candidate) {
+                    Err(error) => Effect::Broken(error.to_string()),
+                    Ok(now) if now.size() != entry.frame.size() => Effect::Resized {
+                        was: entry.frame.size(),
+                        now: now.size(),
+                    },
+                    Ok(now) if now.fields != entry.frame.fields => Effect::Reshaped,
+                    Ok(_) => return None,
+                };
+                Some((entry.frame.name.clone(), effect))
+            })
+            .collect()
+    }
+
+    /// Why the type draft cannot be saved, if it cannot.
+    #[must_use]
+    pub fn type_draft_problem(&self) -> Option<String> {
+        let draft = self.type_draft.as_ref()?;
+        let name = draft.definition.name();
+        if name.trim().is_empty() {
+            return Some("a type needs a name".to_owned());
+        }
+        let taken = self.type_entries.iter().any(|entry| {
+            entry.definition.name() == name
+                && draft
+                    .origin
+                    .as_ref()
+                    .is_none_or(|origin| origin.name != entry.definition.name())
+        });
+        if taken {
+            return Some(format!("a type named \"{name}\" already exists"));
+        }
+
+        let candidate = self.candidate_types()?;
+        match candidate.definition(name) {
+            Err(error) => Some(error.to_string()),
+            Ok(None) => Some(format!("{name} would not be read back")),
+            Ok(Some(reread)) if reread != draft.definition => Some(format!(
+                "{name} cannot be written the way this file states it"
+            )),
+            Ok(Some(_)) => None,
+        }
+    }
+
+    /// The library as it would be with the draft saved.
+    fn candidate_types(&self) -> Option<TypeLibrary> {
+        let draft = self.type_draft.as_ref()?;
+        let written = self.type_text(draft).ok()?;
+        let edited = draft
+            .origin
+            .as_ref()
+            .map_or_else(|| self.types_file(), |origin| origin.file.clone());
+
+        let mut candidate = TypeLibrary::default();
+        let directory = self.directory.as_ref()?.join(TYPES_DIR);
+        let others = schema::toml_files(&directory).unwrap_or_default();
+        for path in others.iter().filter(|path| **path != edited) {
+            candidate.merge_file(path).ok()?;
+        }
+        candidate.merge_toml(&written).ok()?;
+        Some(candidate)
+    }
+
+    /// The text saving the type draft would write.
+    fn type_text(&self, draft: &TypeDraft) -> Result<String, schema::SchemaError> {
+        match &draft.origin {
+            Some(origin) => schema::update_type_in(&origin.text, &origin.name, &draft.definition),
+            None => match std::fs::read_to_string(self.types_file()) {
+                Ok(text) => {
+                    schema::update_type_in(&text, draft.definition.name(), &draft.definition)
+                }
+                Err(_) => schema::type_to_toml(&draft.definition),
+            },
+        }
+    }
+
+    /// Where a type nobody has saved yet belongs.
+    ///
+    /// One file for everything shared, unless someone has made others: types
+    /// name each other freely, so splitting them buys nothing and a technician
+    /// should not have to choose.
+    fn types_file(&self) -> PathBuf {
+        let directory = self.directory.clone().unwrap_or_default().join(TYPES_DIR);
+        self.type_entries
+            .first()
+            .map_or_else(|| directory.join("types.toml"), |entry| entry.file.clone())
+    }
+
+    /// Writes the type draft to disk and reloads, every frame naming it having
+    /// possibly changed shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the draft cannot be written back faithfully, or the
+    /// file cannot be written.
+    pub fn save_type_draft(&mut self) -> Result<()> {
+        let Some(draft) = self.type_draft.clone() else {
+            return Ok(());
+        };
+        if let Some(reason) = self.type_draft_problem() {
+            bail!("{reason}");
+        }
+        let file = draft
+            .origin
+            .as_ref()
+            .map_or_else(|| self.types_file(), |origin| origin.file.clone());
+        let written = self
+            .type_text(&draft)
+            .with_context(|| format!("cannot describe {}", draft.definition.name()))?;
+
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        std::fs::write(&file, written)
+            .with_context(|| format!("cannot write {}", file.display()))?;
+
+        self.reload();
+        Ok(())
+    }
+
+    /// Deletes the selected shared type from its file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or written.
+    pub fn delete_selected_type(&mut self) -> Result<()> {
+        let Some(entry) = self.selected_type().cloned() else {
+            return Ok(());
+        };
+        let text = std::fs::read_to_string(&entry.file)
+            .with_context(|| format!("cannot read {}", entry.file.display()))?;
+        let written = schema::remove_type_from(&text, entry.definition.name())
+            .with_context(|| format!("cannot remove {}", entry.definition.name()))?;
+        std::fs::write(&entry.file, written)
+            .with_context(|| format!("cannot write {}", entry.file.display()))?;
+
+        self.reload();
+        Ok(())
     }
 
     /// Starts editing the selected frame, as a copy.
@@ -373,206 +656,6 @@ impl FrameLibrary {
 }
 
 impl Draft {
-    /// Whether the file states this declared field in a way the editor cannot
-    /// unpick.
-    ///
-    /// True for a type instance and for a repeat: both stand for wire fields
-    /// that carry no record of the type or the count that produced them, so the
-    /// editor can move or remove the whole thing but not reword it.
-    #[must_use]
-    pub fn is_expanded(&self, declared: &str) -> bool {
-        self.frame.field_index(declared).is_none()
-    }
-
-    /// The declared field at `index`, if the editor may reword it.
-    #[must_use]
-    pub fn plain_field(&self, index: usize) -> Option<&FieldDef> {
-        let name = self.frame.declared.get(index)?;
-        self.frame.field(name)
-    }
-
-    pub fn plain_field_mut(&mut self, index: usize) -> Option<&mut FieldDef> {
-        let name = self.frame.declared.get(index)?.clone();
-        let at = self.frame.field_index(&name)?;
-        self.frame.fields.get_mut(at)
-    }
-
-    /// Renames a declared field.
-    ///
-    /// Refused for an expanded one. Its wire fields carry the instance name as
-    /// a prefix, and the writer states it as `type = "Point"` with no room to
-    /// say the new name, so a rename here could be shown but never saved.
-    pub fn rename_field(&mut self, index: usize, name: &str) {
-        let Some(old) = self.frame.declared.get(index).cloned() else {
-            return;
-        };
-        if name == old || self.is_expanded(&old) {
-            return;
-        }
-        let Some(at) = self.frame.field_index(&old) else {
-            return;
-        };
-        // Nothing moves, so the ranges stored as indices still hold.
-        name.clone_into(&mut self.frame.fields[at].name);
-        name.clone_into(&mut self.frame.declared[index]);
-    }
-
-    /// Adds a field after the declared one at `index`, or at the end.
-    pub fn add_field(&mut self, index: Option<usize>, field: FieldDef) {
-        let name = self.unused_name(&field.name);
-        let at = match index.and_then(|index| self.frame.declared.get(index)) {
-            Some(after) => self.frame.expansion_of(after).end,
-            None => self.frame.fields.len(),
-        };
-        let declared_at = index.map_or(self.frame.declared.len(), |index| index + 1);
-
-        self.with_spans_kept(|frame| {
-            frame.fields.insert(at, FieldDef { name, ..field });
-            frame
-                .declared
-                .insert(declared_at, frame.fields[at].name.clone());
-        });
-    }
-
-    /// Removes a declared field, and everything it expanded into.
-    pub fn remove_field(&mut self, index: usize) {
-        let Some(name) = self.frame.declared.get(index).cloned() else {
-            return;
-        };
-        self.with_spans_kept(|frame| {
-            frame.fields.drain(frame.expansion_of(&name));
-            frame.declared.remove(index);
-        });
-    }
-
-    /// Moves a declared field one place up or down, expansion and all.
-    pub fn move_field(&mut self, index: usize, down: bool) {
-        let Some(other) = (if down {
-            index.checked_add(1)
-        } else {
-            index.checked_sub(1)
-        }) else {
-            return;
-        };
-        if index >= self.frame.declared.len() || other >= self.frame.declared.len() {
-            return;
-        }
-        let (first, second) = if down { (index, other) } else { (other, index) };
-        let (Some(above), Some(below)) = (
-            self.frame.declared.get(first).cloned(),
-            self.frame.declared.get(second).cloned(),
-        ) else {
-            return;
-        };
-
-        self.with_spans_kept(|frame| {
-            let above = frame.expansion_of(&above);
-            let below = frame.expansion_of(&below);
-            // Rotating rather than swapping: the two runs need not be the same
-            // length, one being a type instance and the other a single byte.
-            frame.fields[above.start..below.end].rotate_left(above.len());
-            frame.declared.swap(first, second);
-        });
-    }
-
-    /// A name no field is using yet, `sample` becoming `sample2` if it is.
-    fn unused_name(&self, wanted: &str) -> String {
-        if self.frame.field_index(wanted).is_none()
-            && !self.frame.declared.iter().any(|name| name == wanted)
-        {
-            return wanted.to_owned();
-        }
-        // Bounded by the field count: one of that many suffixes is free, since
-        // that is how many names there are to collide with.
-        (2..=self.frame.fields.len() + 2)
-            .map(|suffix| format!("{wanted}{suffix}"))
-            .find(|name| {
-                self.frame.field_index(name).is_none()
-                    && !self.frame.declared.iter().any(|held| held == name)
-            })
-            .unwrap_or_else(|| wanted.to_owned())
-    }
-
-    /// Runs a structural change with every checksum still covering the fields
-    /// it was covering, wherever they have gone.
-    ///
-    /// Ranges are stored as indices, which is what the encoder needs and what
-    /// the editor must not let it mean. Inserting a field above a checksum
-    /// would otherwise quietly shift its range by one and protect the wrong
-    /// bytes, with nothing on screen to say so.
-    ///
-    /// What is remembered is the set of covered fields, not the two ends.
-    /// Reordering can put the field that was last in front of the one that was
-    /// first, and a range rebuilt from the old ends would come back inside out.
-    fn with_spans_kept(&mut self, change: impl FnOnce(&mut FrameDef)) {
-        let covered: Vec<(String, Vec<String>)> = self
-            .frame
-            .fields
-            .iter()
-            .filter_map(|field| match &field.kind {
-                FieldKind::Checksum { covers, .. } => Some((
-                    field.name.clone(),
-                    self.frame.fields[covers.from..=covers.to]
-                        .iter()
-                        .map(|held| held.name.clone())
-                        .collect(),
-                )),
-                _ => None,
-            })
-            .collect();
-
-        change(&mut self.frame);
-
-        for (owner, was) in covered {
-            let Some(at) = self.frame.field_index(&owner) else {
-                continue;
-            };
-            let survivors: Vec<usize> = was
-                .iter()
-                .filter_map(|name| self.frame.field_index(name))
-                .collect();
-            // A range whose every field went with the deletion falls back to
-            // the field in front of the checksum: something has to be covered,
-            // and an index past the end would take the encoder with it.
-            let span = match (survivors.iter().min(), survivors.iter().max()) {
-                (Some(&from), Some(&to)) => FieldSpan { from, to },
-                _ => FieldSpan {
-                    from: at.saturating_sub(1),
-                    to: at.saturating_sub(1),
-                },
-            };
-            if let FieldKind::Checksum { covers, .. } = &mut self.frame.fields[at].kind {
-                *covers = span;
-            }
-        }
-    }
-
-    /// Sets what the checksum declared at `index` covers, by naming both ends.
-    pub fn set_coverage(&mut self, index: usize, from: &str, to: &str) {
-        let (Some(from), Some(to)) = (self.frame.field_index(from), self.frame.field_index(to))
-        else {
-            return;
-        };
-        let Some(at) = self
-            .frame
-            .declared
-            .get(index)
-            .and_then(|name| self.frame.field_index(name))
-        else {
-            return;
-        };
-        let Some(field) = self.frame.fields.get_mut(at) else {
-            return;
-        };
-        if let FieldKind::Checksum { covers, .. } = &mut field.kind {
-            // Backwards is not a range, and the picker offers both ends freely.
-            *covers = FieldSpan {
-                from: from.min(to),
-                to: from.max(to),
-            };
-        }
-    }
-
     /// The exact text a save would write.
     ///
     /// # Errors
@@ -658,8 +741,9 @@ fn file_label(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout;
     use sim_core::frame::value::Value;
-    use sim_core::frame::{Endianness, FieldDef, FieldKind, ScalarType, ValueRange};
+    use sim_core::frame::{Endianness, FieldDef, FieldKind, FieldSpan, ScalarType, ValueRange};
 
     const GOOD: &str = r#"
 name = "Telemetry"
@@ -1099,8 +1183,8 @@ covers = { from = "header", to = "here" }
         assert_eq!(draft.frame.declared, ["header", "here", "crc"]);
         assert_eq!(draft.frame.expansion_of("here"), 1..3);
         assert_eq!(draft.frame.expansion_of("header"), 0..1);
-        assert!(draft.is_expanded("here"));
-        assert!(!draft.is_expanded("header"));
+        assert!(layout::is_expanded(&draft.frame, "here"));
+        assert!(!layout::is_expanded(&draft.frame, "header"));
     }
 
     #[test]
@@ -1108,7 +1192,7 @@ covers = { from = "header", to = "here" }
         let mut draft = draft_of(LAYERED);
         assert_eq!(covered(&draft), ("header".to_owned(), "here.y".to_owned()));
 
-        draft.add_field(Some(0), plain("inserted"));
+        layout::add_field(&mut draft.frame, Some(0), plain("inserted"));
 
         assert_eq!(draft.frame.declared, ["header", "inserted", "here", "crc"]);
         assert_eq!(covered(&draft), ("header".to_owned(), "here.y".to_owned()));
@@ -1117,7 +1201,7 @@ covers = { from = "header", to = "here" }
     #[test]
     fn moving_a_type_instance_moves_all_of_it_at_once() {
         let mut draft = draft_of(LAYERED);
-        draft.move_field(1, false);
+        layout::move_field(&mut draft.frame, 1, false);
 
         assert_eq!(draft.frame.declared, ["here", "header", "crc"]);
         assert_eq!(
@@ -1136,7 +1220,7 @@ covers = { from = "header", to = "here" }
     #[test]
     fn renaming_a_plain_field_leaves_what_a_checksum_covers_alone() {
         let mut draft = draft_of(LAYERED);
-        draft.rename_field(0, "start");
+        layout::rename_field(&mut draft.frame, 0, "start");
 
         assert_eq!(draft.frame.declared, ["start", "here", "crc"]);
         assert_eq!(covered(&draft), ("start".to_owned(), "here.y".to_owned()));
@@ -1145,7 +1229,7 @@ covers = { from = "header", to = "here" }
     #[test]
     fn renaming_a_type_instance_is_refused_rather_than_shown_and_lost() {
         let mut draft = draft_of(LAYERED);
-        draft.rename_field(1, "corner");
+        layout::rename_field(&mut draft.frame, 1, "corner");
 
         assert_eq!(draft.frame.declared, ["header", "here", "crc"]);
     }
@@ -1153,7 +1237,7 @@ covers = { from = "header", to = "here" }
     #[test]
     fn removing_a_type_instance_removes_all_of_it() {
         let mut draft = draft_of(LAYERED);
-        draft.remove_field(1);
+        layout::remove_field(&mut draft.frame, 1);
 
         assert_eq!(draft.frame.declared, ["header", "crc"]);
         assert_eq!(
@@ -1170,7 +1254,7 @@ covers = { from = "header", to = "here" }
     #[test]
     fn a_checksum_losing_the_end_of_its_range_falls_back_rather_than_dangling() {
         let mut draft = draft_of(LAYERED);
-        draft.remove_field(1);
+        layout::remove_field(&mut draft.frame, 1);
 
         // Was covering up to `here.y`, which is gone. Anything is better than
         // an index past the end, which the encoder would follow.
@@ -1182,8 +1266,8 @@ covers = { from = "header", to = "here" }
     #[test]
     fn a_new_field_does_not_take_a_name_already_in_use() {
         let mut draft = draft_of(LAYERED);
-        draft.add_field(None, plain("header"));
-        draft.add_field(None, plain("header"));
+        layout::add_field(&mut draft.frame, None, plain("header"));
+        layout::add_field(&mut draft.frame, None, plain("header"));
 
         assert_eq!(
             draft.frame.declared,
@@ -1195,7 +1279,7 @@ covers = { from = "header", to = "here" }
     fn coverage_is_set_by_naming_both_ends_either_way_round() {
         let mut draft = draft_of(LAYERED);
         let crc = draft.frame.field_index("crc").expect("checksum");
-        draft.set_coverage(crc, "here.y", "header");
+        layout::set_coverage(&mut draft.frame, crc, "here.y", "header");
 
         assert_eq!(covered(&draft), ("header".to_owned(), "here.y".to_owned()));
     }
@@ -1209,9 +1293,9 @@ covers = { from = "header", to = "here" }
             }),
             ..draft_of(LAYERED)
         };
-        draft.add_field(Some(0), plain("inserted"));
-        draft.move_field(1, true);
-        draft.rename_field(0, "start");
+        layout::add_field(&mut draft.frame, Some(0), plain("inserted"));
+        layout::move_field(&mut draft.frame, 1, true);
+        layout::rename_field(&mut draft.frame, 0, "start");
 
         assert_eq!(draft.problem(&TypeLibrary::default()), None);
         let written = draft.written().expect("written");
@@ -1235,7 +1319,7 @@ covers = { from = "header", to = "here" }
             draft.frame.field_index("crc").expect("on the wire")
         );
 
-        draft.set_coverage(declared, "header", "here.x");
+        layout::set_coverage(&mut draft.frame, declared, "header", "here.x");
 
         assert_eq!(covered(&draft), ("header".to_owned(), "here.x".to_owned()));
     }
@@ -1246,8 +1330,8 @@ covers = { from = "header", to = "here" }
             frame: FrameDef::flat("Built", vec![plain("id")]),
             origin: None,
         };
-        draft.add_field(Some(0), plain("count"));
-        draft.add_field(Some(1), plain("crc"));
+        layout::add_field(&mut draft.frame, Some(0), plain("count"));
+        layout::add_field(&mut draft.frame, Some(1), plain("crc"));
 
         let crc = draft
             .frame
@@ -1255,7 +1339,7 @@ covers = { from = "header", to = "here" }
             .iter()
             .position(|n| n == "crc")
             .unwrap();
-        if let Some(field) = draft.plain_field_mut(crc) {
+        if let Some(field) = layout::plain_field_mut(&mut draft.frame, crc) {
             field.kind = FieldKind::Checksum {
                 spec: sim_core::frame::checksum::ChecksumSpec::Xor8,
                 covers: FieldSpan { from: 0, to: 1 },
@@ -1267,5 +1351,180 @@ covers = { from = "header", to = "here" }
         let reread = schema::from_toml(&written).expect("valid");
         assert_eq!(reread.declared, ["id", "count", "crc"]);
         assert_eq!(reread.size(), 3);
+    }
+
+    const SHARED: &str = r#"# Types everything here shares.
+
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 100 }
+
+# Three bytes of colour.
+[[type]]
+name = "Rgb"
+
+[[type.field]]
+name = "red"
+type = "u8"
+
+[[type.field]]
+name = "green"
+type = "u8"
+
+[[type.field]]
+name = "blue"
+type = "u8"
+"#;
+
+    const USES_RGB: &str = r#"
+name = "Lamp"
+
+[[field]]
+name = "colour"
+type = "Rgb"
+"#;
+
+    fn shared(tag: &str) -> (PathBuf, FrameLibrary) {
+        let dir = scratch(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(TYPES_DIR)).unwrap();
+        std::fs::write(dir.join(TYPES_DIR).join("shared.toml"), SHARED).unwrap();
+        std::fs::write(dir.join("lamp.toml"), USES_RGB).unwrap();
+        let mut library = FrameLibrary::default();
+        library.load_from(dir.clone());
+        (dir, library)
+    }
+
+    #[test]
+    fn a_shared_type_is_listed_with_the_file_holding_it() {
+        let (dir, library) = shared("types-listed");
+        assert_eq!(
+            library
+                .type_entries
+                .iter()
+                .map(|entry| entry.definition.name())
+                .collect::<Vec<_>>(),
+            ["Percent", "Rgb"]
+        );
+        assert_eq!(
+            library.type_entries[0].file,
+            dir.join(TYPES_DIR).join("shared.toml")
+        );
+    }
+
+    #[test]
+    fn widening_a_subtype_touches_no_frame_and_keeps_the_comments() {
+        let (dir, mut library) = shared("types-widen");
+        library.type_selected = Some(0);
+        library.begin_type_edit();
+        let draft = library.type_draft.as_mut().unwrap();
+        draft.definition.narrows.as_mut().unwrap().range =
+            Some(ValueRange::Uint { min: 0, max: 200 });
+
+        assert_eq!(library.type_draft_problem(), None);
+        assert!(library.type_draft_impact().is_empty());
+        library.save_type_draft().unwrap();
+
+        let text = std::fs::read_to_string(dir.join(TYPES_DIR).join("shared.toml")).unwrap();
+        assert!(text.contains("max = 200"));
+        assert!(text.contains("# Types everything here shares."));
+        assert!(text.contains("# Three bytes of colour."));
+    }
+
+    #[test]
+    fn adding_a_field_to_a_type_says_which_frames_it_resizes() {
+        let (_, mut library) = shared("types-grow");
+        library.type_selected = Some(1);
+        library.begin_type_edit();
+        let draft = library.type_draft.as_mut().unwrap();
+        layout::add_field(
+            &mut draft.definition.layout,
+            None,
+            FieldDef {
+                name: "white".to_owned(),
+                description: None,
+                kind: FieldKind::Scalar(ScalarType::U8),
+                endian: Endianness::Big,
+                default: None,
+                range: None,
+            },
+        );
+
+        assert_eq!(library.type_draft_problem(), None);
+        assert_eq!(
+            library.type_draft_impact(),
+            vec![("Lamp".to_owned(), Effect::Resized { was: 3, now: 4 })]
+        );
+
+        library.save_type_draft().unwrap();
+        assert_eq!(library.entries[0].frame.size(), 4);
+    }
+
+    #[test]
+    fn a_type_a_frame_still_needs_cannot_be_deleted_without_the_frame_saying_so() {
+        let (_, mut library) = shared("types-delete");
+        library.type_selected = Some(1);
+        library.delete_selected_type().unwrap();
+
+        // The type is gone, and the frame that named it now says why it will
+        // not load rather than loading as something else.
+        assert!(library.entries.is_empty());
+        assert_eq!(library.failures.len(), 1);
+        assert!(
+            library.failures[0].1.contains("Rgb"),
+            "{:?}",
+            library.failures
+        );
+    }
+
+    #[test]
+    fn a_type_nobody_saved_yet_lands_beside_the_ones_already_there() {
+        let (dir, mut library) = shared("types-new");
+        library.begin_new_type(TypeDef {
+            layout: FrameDef::flat(
+                "Pair",
+                vec![
+                    FieldDef {
+                        name: "left".to_owned(),
+                        description: None,
+                        kind: FieldKind::Scalar(ScalarType::U8),
+                        endian: Endianness::Big,
+                        default: None,
+                        range: None,
+                    },
+                    FieldDef {
+                        name: "right".to_owned(),
+                        description: None,
+                        kind: FieldKind::Scalar(ScalarType::U8),
+                        endian: Endianness::Big,
+                        default: None,
+                        range: None,
+                    },
+                ],
+            ),
+            narrows: None,
+        });
+
+        assert_eq!(library.type_draft_problem(), None);
+        library.save_type_draft().unwrap();
+
+        assert_eq!(library.type_entries.len(), 3);
+        let text = std::fs::read_to_string(dir.join(TYPES_DIR).join("shared.toml")).unwrap();
+        assert!(text.contains("# Three bytes of colour."));
+        assert!(text.contains(r#"name = "Pair""#));
+    }
+
+    #[test]
+    fn a_type_name_already_taken_is_refused() {
+        let (_, mut library) = shared("types-clash");
+        library.begin_new_type(TypeDef {
+            layout: FrameDef::flat("Rgb", vec![]),
+            narrows: None,
+        });
+
+        let problem = library.type_draft_problem().expect("refused");
+        assert!(problem.contains("Rgb"), "{problem}");
+        assert!(library.save_type_draft().is_err());
     }
 }
