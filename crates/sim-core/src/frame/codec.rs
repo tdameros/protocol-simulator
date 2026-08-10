@@ -477,15 +477,14 @@ mod tests {
 
     #[test]
     fn a_value_outside_its_subtype_is_refused_on_the_way_out() {
-        let frame = FrameDef {
-            name: "duty".to_owned(),
-            description: None,
-            fields: vec![constrained(
+        let frame = FrameDef::flat(
+            "duty".to_owned(),
+            vec![constrained(
                 "percent",
                 ScalarType::U8,
                 ValueRange::Uint { min: 0, max: 99 },
             )],
-        };
+        );
 
         let mut values = FieldValues::new();
         values.insert("percent".to_owned(), Value::Uint(99));
@@ -502,15 +501,14 @@ mod tests {
 
     #[test]
     fn a_value_outside_its_subtype_is_only_reported_on_the_way_in() {
-        let frame = FrameDef {
-            name: "duty".to_owned(),
-            description: None,
-            fields: vec![constrained(
+        let frame = FrameDef::flat(
+            "duty".to_owned(),
+            vec![constrained(
                 "percent",
                 ScalarType::U8,
                 ValueRange::Uint { min: 0, max: 99 },
             )],
-        };
+        );
 
         // What the equipment actually sent, out of range and all.
         let decoded = decode(&frame, &[120]).expect("a bad value is still a readable frame");
@@ -524,14 +522,13 @@ mod tests {
 
     #[test]
     fn endianness_applies_per_field() {
-        let frame = FrameDef {
-            name: "mixed".to_owned(),
-            description: None,
-            fields: vec![
+        let frame = FrameDef::flat(
+            "mixed".to_owned(),
+            vec![
                 field("be", FieldKind::Scalar(ScalarType::U16), Endianness::Big),
                 field("le", FieldKind::Scalar(ScalarType::U16), Endianness::Little),
             ],
-        };
+        );
         let mut values = FieldValues::new();
         values.insert("be".to_owned(), Value::Uint(0x1234));
         values.insert("le".to_owned(), Value::Uint(0x1234));
@@ -542,15 +539,14 @@ mod tests {
 
     #[test]
     fn signed_scalars_round_trip_through_twos_complement() {
-        let frame = FrameDef {
-            name: "signed".to_owned(),
-            description: None,
-            fields: vec![field(
+        let frame = FrameDef::flat(
+            "signed".to_owned(),
+            vec![field(
                 "temp",
                 FieldKind::Scalar(ScalarType::I16),
                 Endianness::Big,
             )],
-        };
+        );
         let mut values = FieldValues::new();
         values.insert("temp".to_owned(), Value::Int(-40));
 
@@ -563,14 +559,13 @@ mod tests {
 
     #[test]
     fn floats_round_trip() {
-        let frame = FrameDef {
-            name: "floats".to_owned(),
-            description: None,
-            fields: vec![
+        let frame = FrameDef::flat(
+            "floats".to_owned(),
+            vec![
                 field("a", FieldKind::Scalar(ScalarType::F32), Endianness::Big),
                 field("b", FieldKind::Scalar(ScalarType::F64), Endianness::Little),
             ],
-        };
+        );
         let mut values = FieldValues::new();
         values.insert("a".to_owned(), Value::Float(1.5));
         values.insert("b".to_owned(), Value::Float(-2.25));
@@ -582,10 +577,9 @@ mod tests {
 
     #[test]
     fn bitfields_pack_most_significant_first() {
-        let frame = FrameDef {
-            name: "flags".to_owned(),
-            description: None,
-            fields: vec![field(
+        let frame = FrameDef::flat(
+            "flags".to_owned(),
+            vec![field(
                 "f",
                 FieldKind::Bits {
                     repr: ScalarType::U8,
@@ -606,7 +600,7 @@ mod tests {
                 },
                 Endianness::Big,
             )],
-        };
+        );
         let mut bits = BTreeMap::new();
         bits.insert("armed".to_owned(), 1);
         bits.insert("heater".to_owned(), 0);
@@ -623,10 +617,9 @@ mod tests {
 
     #[test]
     fn enum_accepts_a_variant_name() {
-        let frame = FrameDef {
-            name: "modes".to_owned(),
-            description: None,
-            fields: vec![field(
+        let frame = FrameDef::flat(
+            "modes".to_owned(),
+            vec![field(
                 "mode",
                 FieldKind::Enum {
                     repr: ScalarType::U8,
@@ -643,7 +636,7 @@ mod tests {
                 },
                 Endianness::Big,
             )],
-        };
+        );
         let mut values = FieldValues::new();
         values.insert("mode".to_owned(), Value::Text("RUN".to_owned()));
         assert_eq!(encode(&frame, &values).unwrap(), vec![7]);
@@ -656,10 +649,9 @@ mod tests {
     }
 
     fn crc_frame() -> FrameDef {
-        FrameDef {
-            name: "telemetry".to_owned(),
-            description: None,
-            fields: vec![
+        FrameDef::flat(
+            "telemetry".to_owned(),
+            vec![
                 field("sync", FieldKind::Scalar(ScalarType::U16), Endianness::Big),
                 field("payload", FieldKind::Bytes { len: 3 }, Endianness::Big),
                 field(
@@ -671,7 +663,7 @@ mod tests {
                     Endianness::Big,
                 ),
             ],
-        }
+        )
     }
 
     #[test]
@@ -717,11 +709,7 @@ mod tests {
     fn defaults_fill_in_omitted_fields() {
         let mut sync = field("sync", FieldKind::Scalar(ScalarType::U16), Endianness::Big);
         sync.default = Some(Value::Uint(0xAA55));
-        let frame = FrameDef {
-            name: "defaulted".to_owned(),
-            description: None,
-            fields: vec![sync],
-        };
+        let frame = FrameDef::flat("defaulted".to_owned(), vec![sync]);
         assert_eq!(
             encode(&frame, &FieldValues::new()).unwrap(),
             vec![0xAA, 0x55]
@@ -730,15 +718,14 @@ mod tests {
 
     #[test]
     fn a_field_with_neither_value_nor_default_is_an_error() {
-        let frame = FrameDef {
-            name: "bare".to_owned(),
-            description: None,
-            fields: vec![field(
+        let frame = FrameDef::flat(
+            "bare".to_owned(),
+            vec![field(
                 "x",
                 FieldKind::Scalar(ScalarType::U8),
                 Endianness::Big,
             )],
-        };
+        );
         assert!(matches!(
             encode(&frame, &FieldValues::new()),
             Err(CodecError::MissingValue { .. })
@@ -747,15 +734,14 @@ mod tests {
 
     #[test]
     fn out_of_range_values_are_rejected() {
-        let frame = FrameDef {
-            name: "narrow".to_owned(),
-            description: None,
-            fields: vec![field(
+        let frame = FrameDef::flat(
+            "narrow".to_owned(),
+            vec![field(
                 "x",
                 FieldKind::Scalar(ScalarType::U8),
                 Endianness::Big,
             )],
-        };
+        );
         let mut values = FieldValues::new();
         values.insert("x".to_owned(), Value::Uint(256));
         assert!(matches!(
@@ -775,11 +761,10 @@ mod tests {
 
     #[test]
     fn text_is_nul_padded_and_trimmed() {
-        let frame = FrameDef {
-            name: "label".to_owned(),
-            description: None,
-            fields: vec![field("tag", FieldKind::Text { len: 6 }, Endianness::Big)],
-        };
+        let frame = FrameDef::flat(
+            "label".to_owned(),
+            vec![field("tag", FieldKind::Text { len: 6 }, Endianness::Big)],
+        );
         let mut values = FieldValues::new();
         values.insert("tag".to_owned(), Value::Text("ok".to_owned()));
 

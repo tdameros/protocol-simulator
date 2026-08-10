@@ -120,6 +120,68 @@ fn the_documented_sizes_are_accurate() {
     }
 }
 
+/// A frame says which of its fields the file actually writes, and which it
+/// produced by expanding a type or a repeat.
+///
+/// The editor leans on this: an expanded field cannot be changed where it sits,
+/// only where it is declared, and writing one back as a plain field would
+/// flatten what someone took the trouble to factorise.
+#[test]
+fn a_frame_knows_which_of_its_fields_the_file_wrote() {
+    let dir = examples_dir();
+    let types = TypeLibrary::load_dir(&dir.join("types")).expect("shared types should load");
+
+    // Four entries in the file, twenty-one on the wire.
+    let templates = schema::load_with(&dir.join("06-templates.toml"), &types).expect("should load");
+    assert_eq!(
+        templates.declared,
+        ["header", "zone_count", "zone", "crc"],
+        "the names the file writes, in the order it writes them"
+    );
+    assert_eq!(templates.fields.len(), 21);
+    assert!(templates.fields.len() > templates.declared.len());
+
+    // Everything on the wire is either written down or attributable to
+    // something that is. Nothing may be orphaned, or the editor would not know
+    // where to send someone who wants to change it.
+    for field in &templates.fields {
+        let declared = templates.declared.contains(&field.name);
+        let generated = templates.generated_by(&field.name);
+        assert!(
+            declared || generated.is_some(),
+            "{} belongs to nothing",
+            field.name
+        );
+    }
+    // Two levels of type and a repeat, all attributed to the one field the file
+    // writes.
+    assert_eq!(
+        templates.generated_by("zone.left.led[0].mode"),
+        Some("zone")
+    );
+    assert_eq!(
+        templates.generated_by("zone.right.accent.blue"),
+        Some("zone")
+    );
+    // Fields the file writes are nobody's expansion, and `zone_count` in
+    // particular must not be mistaken for something `zone` produced.
+    assert_eq!(templates.generated_by("zone_count"), None);
+    assert_eq!(templates.generated_by("crc"), None);
+
+    // A frame with no types and no repeats declares exactly what it carries.
+    let flat = schema::load_with(&dir.join("02-scalars.toml"), &types).expect("should load");
+    let names: Vec<&str> = flat
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(flat.declared, names);
+    assert!(flat
+        .fields
+        .iter()
+        .all(|field| flat.generated_by(&field.name).is_none()));
+}
+
 /// The shipped scenarios are held to the same standard: they parse, and every
 /// frame they name is one the example frames actually define.
 #[test]

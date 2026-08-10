@@ -441,6 +441,9 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
         types.insert(local.name.clone(), local.clone());
     }
 
+    // Captured before expansion, which is the only moment the two are still
+    // distinguishable.
+    let written: Vec<String> = raw.fields.iter().map(|field| field.name.clone()).collect();
     let expanded = expand(&raw.fields, &types)?;
 
     let mut seen: Vec<&str> = Vec::new();
@@ -478,6 +481,7 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
         name: raw.name,
         description: raw.description,
         fields,
+        declared: written,
     })
 }
 
@@ -2026,12 +2030,31 @@ repeat = 2
         }
     }
 
+    /// Writing a factorised frame back out flattens it: same bytes on the wire,
+    /// no types and no repeats left in the file.
+    ///
+    /// Spelled out rather than glossed over, because it is what stops an editor
+    /// from simply re-serialising whatever it is shown. `declared` is the only
+    /// thing that can tell the two apart, which is why it exists.
     #[test]
-    fn an_expanded_frame_still_round_trips_through_toml() {
+    fn writing_an_expanded_frame_keeps_the_wire_and_loses_the_factorisation() {
         let frame = from_toml(LED_BANK).unwrap();
         let reparsed = from_toml(&to_toml(&frame).unwrap()).expect("rendered toml should parse");
-        // The types are gone from the file, the layout is identical.
-        assert_eq!(frame, reparsed);
+
+        // Byte for byte the same frame.
+        assert_eq!(frame.fields, reparsed.fields);
+        assert_eq!(frame.size(), reparsed.size());
+
+        // Three entries in the file became fourteen.
+        assert_eq!(frame.declared, ["header", "led", "crc"]);
+        assert_eq!(reparsed.declared.len(), reparsed.fields.len());
+        assert!(reparsed.declared.len() > frame.declared.len());
+        assert_eq!(frame.generated_by("led[0].mode"), Some("led"));
+        assert_eq!(
+            reparsed.generated_by("led[0].mode"),
+            None,
+            "flattened, it is nobody's expansion any more"
+        );
     }
 
     #[test]

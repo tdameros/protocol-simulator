@@ -270,10 +270,56 @@ pub struct FieldDef {
 pub struct FrameDef {
     pub name: String,
     pub description: Option<String>,
+    /// Every field on the wire, types and repeats already expanded.
     pub fields: Vec<FieldDef>,
+    /// The names the file actually writes, in the order it writes them.
+    ///
+    /// A frame that instantiates a type or repeats a field declares four things
+    /// and carries twenty-one, and nothing in `fields` says which is which. An
+    /// editor has to know: an expanded field cannot be changed where it sits,
+    /// only where it is declared, and rewriting it as a plain field would flatten
+    /// what someone took the trouble to factorise.
+    pub declared: Vec<String>,
 }
 
 impl FrameDef {
+    /// A frame whose every field is written out as its own entry.
+    ///
+    /// What a file with no types and no repeats produces, and what anything
+    /// building a frame by hand means.
+    #[must_use]
+    pub fn flat(name: impl Into<String>, fields: Vec<FieldDef>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            declared: fields.iter().map(|field| field.name.clone()).collect(),
+            fields,
+        }
+    }
+
+    /// The declared field a wire field came from, or `None` where the file
+    /// writes it directly.
+    ///
+    /// Matched on the longest declared name it starts at, since expansion only
+    /// ever appends: `zone` produces `zone.left.led[0].mode`, and a repeat of
+    /// `led` produces `led[0]`. The separator has to be there, or `zone_count`
+    /// would look like it came from `zone`.
+    #[must_use]
+    pub fn generated_by(&self, field: &str) -> Option<&str> {
+        if self.declared.iter().any(|name| name == field) {
+            return None;
+        }
+        self.declared
+            .iter()
+            .filter(|name| {
+                field
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|rest| rest.starts_with(['.', '[']))
+            })
+            .max_by_key(|name| name.len())
+            .map(String::as_str)
+    }
+
     #[must_use]
     pub fn field_index(&self, name: &str) -> Option<usize> {
         self.fields.iter().position(|field| field.name == name)
@@ -297,5 +343,79 @@ impl FrameDef {
             .iter()
             .map(|field| field.kind.size())
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(declared: &[&str], wire: &[&str]) -> FrameDef {
+        FrameDef {
+            name: "F".to_owned(),
+            description: None,
+            declared: declared.iter().map(|name| (*name).to_owned()).collect(),
+            fields: wire
+                .iter()
+                .map(|name| FieldDef {
+                    name: (*name).to_owned(),
+                    description: None,
+                    kind: FieldKind::Scalar(ScalarType::U8),
+                    endian: Endianness::Big,
+                    default: None,
+                    range: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_expanded_field_is_traced_back_to_the_one_that_declared_it() {
+        let frame = frame(
+            &["header", "zone", "zone_count", "led"],
+            &[
+                "header",
+                "zone.left.accent.red",
+                "zone_count",
+                "led[0]",
+                "led[1]",
+            ],
+        );
+
+        // A type instance, however deeply nested, and a repeat.
+        assert_eq!(frame.generated_by("zone.left.accent.red"), Some("zone"));
+        assert_eq!(frame.generated_by("led[0]"), Some("led"));
+
+        // The trap the separator check exists for: `zone_count` starts with
+        // `zone` and has nothing to do with it.
+        assert_eq!(frame.generated_by("zone_count"), None);
+        assert_eq!(frame.generated_by("header"), None);
+    }
+
+    #[test]
+    fn the_longest_declared_name_wins() {
+        // A field declared inside what looks like another one's territory is
+        // still its own, so its expansions belong to it and not to the shorter
+        // name it happens to sit under.
+        let frame = frame(&["a", "a.b"], &["a.x", "a.b.y"]);
+        assert_eq!(frame.generated_by("a.x"), Some("a"));
+        assert_eq!(frame.generated_by("a.b.y"), Some("a.b"));
+    }
+
+    #[test]
+    fn a_flat_frame_declares_everything_it_carries() {
+        let built = FrameDef::flat(
+            "F",
+            vec![FieldDef {
+                name: "only".to_owned(),
+                description: None,
+                kind: FieldKind::Scalar(ScalarType::U8),
+                endian: Endianness::Big,
+                default: None,
+                range: None,
+            }],
+        );
+        assert_eq!(built.declared, ["only"]);
+        assert_eq!(built.generated_by("only"), None);
     }
 }
