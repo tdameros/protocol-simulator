@@ -8,9 +8,7 @@
 
 use egui::{ComboBox, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
-use std::collections::BTreeMap;
-
-use sim_core::frame::schema::{self, Subtype, TypeDef};
+use sim_core::frame::schema::{Subtype, TypeDef};
 use sim_core::frame::{FrameDef, ScalarType, ValueRange};
 
 use crate::frames::Effect;
@@ -114,13 +112,19 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
     let dirty = state.frames.type_draft_is_dirty();
     let problem = state.frames.type_draft_problem();
     let impact = state.frames.type_draft_impact();
+    // Its own name left out: a type naming itself is the one thing the loader
+    // refuses outright.
+    let editing = state
+        .frames
+        .type_draft
+        .as_ref()
+        .map(|draft| draft.definition.name().to_owned());
+    let shared = state.frames.shared_choices(editing.as_deref());
+    let types = state.frames.types().clone();
     let Some(draft) = &mut state.frames.type_draft else {
         return;
     };
     let subtype = draft.definition.narrows.is_some();
-    let stated = draft.origin.as_ref().map_or_else(BTreeMap::new, |origin| {
-        schema::type_stated_as_types(&origin.text, &origin.name)
-    });
 
     ui.horizontal(|ui| {
         ui.label(if subtype { "Subtype:" } else { "Type:" });
@@ -150,7 +154,8 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
                 ui,
                 &mut draft.definition.layout,
                 state.hex_values,
-                &stated,
+                &shared,
+                &types,
             ),
         });
 

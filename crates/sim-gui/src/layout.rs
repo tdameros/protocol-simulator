@@ -4,7 +4,7 @@
 //! The two are the same problem: a run of declared fields, some of which stand
 //! for several fields on the wire. Sharing it is what lets one editor draw both.
 
-use sim_core::frame::{Endianness, FieldDef, FieldKind, FieldSpan, FrameDef};
+use sim_core::frame::{Endianness, FieldDef, FieldKind, FieldSpan, FrameDef, Stated};
 /// Whether the file states this declared field in a way the editor cannot
 /// unpick.
 ///
@@ -272,4 +272,41 @@ pub fn has_byte_order(field: &FieldDef) -> bool {
         // Written in the order they are given, whatever the frame says.
         FieldKind::Bytes { .. } | FieldKind::Text { .. } => false,
     }
+}
+
+/// Restates a declared field as something else, expansion and all.
+///
+/// The one operation that changes how many fields a frame has without changing
+/// how many it declares: naming a type of three fields where a byte stood puts
+/// three on the wire under one heading.
+///
+/// `expansion` is what the type contributes, worked out by the core so that the
+/// names match what a reload would produce.
+pub fn state_as(
+    layout: &mut FrameDef,
+    index: usize,
+    stated: Option<&Stated>,
+    expansion: Vec<FieldDef>,
+) {
+    let Some(name) = layout.declared.get(index).cloned() else {
+        return;
+    };
+    with_spans_kept(layout, |layout| {
+        let held = layout.expansion_of(&name);
+        layout.fields.splice(held, expansion);
+        match stated {
+            Some(stated) => {
+                layout.stated.insert(name.clone(), stated.clone());
+            }
+            None => {
+                layout.stated.remove(&name);
+            }
+        }
+    });
+}
+
+/// How the file states this declared field, if a name alone would not do.
+#[must_use]
+pub fn stated_of(layout: &FrameDef, index: usize) -> Option<&Stated> {
+    layout.stated.get(layout.declared.get(index)?)
 }
