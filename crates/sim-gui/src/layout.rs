@@ -4,7 +4,7 @@
 //! The two are the same problem: a run of declared fields, some of which stand
 //! for several fields on the wire. Sharing it is what lets one editor draw both.
 
-use sim_core::frame::{FieldDef, FieldKind, FieldSpan, FrameDef};
+use sim_core::frame::{Endianness, FieldDef, FieldKind, FieldSpan, FrameDef};
 /// Whether the file states this declared field in a way the editor cannot
 /// unpick.
 ///
@@ -196,5 +196,38 @@ pub fn set_coverage(layout: &mut FrameDef, index: usize, from: &str, to: &str) {
             from: from.min(to),
             to: from.max(to),
         };
+    }
+}
+
+/// Changes the order the whole frame is written in.
+///
+/// A field that was following the frame follows it still; one that had been
+/// given an order of its own keeps it. That is what inheriting means, and
+/// leaving the fields alone here would turn every one of them into an override
+/// the moment the frame changed its mind.
+pub fn set_endian(layout: &mut FrameDef, endian: Endianness) {
+    let was = layout.endian;
+    if was == endian {
+        return;
+    }
+    for field in &mut layout.fields {
+        if field.endian == was {
+            field.endian = endian;
+        }
+    }
+    layout.endian = endian;
+}
+
+/// Whether stating a byte order for this field would mean anything.
+///
+/// One byte reads the same either way round, so the question is not put.
+#[must_use]
+pub fn has_byte_order(field: &FieldDef) -> bool {
+    match &field.kind {
+        FieldKind::Scalar(scalar) | FieldKind::Enum { repr: scalar, .. } => scalar.size() > 1,
+        FieldKind::Bits { repr, .. } => repr.size() > 1,
+        FieldKind::Checksum { spec, .. } => spec.width_bytes() > 1,
+        // Written in the order they are given, whatever the frame says.
+        FieldKind::Bytes { .. } | FieldKind::Text { .. } => false,
     }
 }
