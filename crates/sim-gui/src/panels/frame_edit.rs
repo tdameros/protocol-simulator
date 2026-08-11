@@ -5,6 +5,8 @@
 //! technician cannot name a kind that does not exist. What the editor cannot
 //! express, it shows and refuses to touch rather than quietly rewording.
 
+use std::collections::BTreeMap;
+
 use egui::{collapsing_header::CollapsingState, ComboBox, Id, RichText, Ui};
 use egui_phosphor::regular as icons;
 use sim_core::frame::checksum::{ChecksumSpec, CrcSpec};
@@ -17,6 +19,9 @@ use sim_core::frame::{
 use crate::layout;
 use crate::panels::number;
 use crate::state::AppState;
+
+/// Room for a field name, in the width of the box that edits one.
+const NAME_WIDTH: f32 = 120.0;
 
 /// The scalars a field may be written as, in the order a datasheet lists them.
 const SCALARS: [ScalarType; 10] = [
@@ -47,18 +52,37 @@ pub fn fields(ui: &mut Ui, state: &mut AppState) {
     let Some(draft) = &mut state.frames.draft else {
         return;
     };
-    layout(ui, &mut draft.frame, hex);
+    let stated = draft
+        .origin
+        .as_ref()
+        .map(|origin| origin.stated.clone())
+        .unwrap_or_default();
+    layout(ui, &mut draft.frame, hex, &stated);
 }
 
 /// One pass over a field list, whoever it belongs to.
-pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool) {
+///
+/// `stated` names the declared fields the file writes through a named type,
+/// which are shown but not reworded.
+pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool, stated: &BTreeMap<String, String>) {
     // Drawn from a copy so a row may decide to remove itself without the rest
     // of the pass reading a list that has moved under it.
     let frame = list.clone();
     let mut edit = None;
 
     for (index, declared) in frame.declared.iter().enumerate() {
-        field_row(ui, list, &frame, index, declared, hex, &mut edit);
+        field_row(
+            ui,
+            list,
+            &frame,
+            &Row {
+                index,
+                declared,
+                hex,
+                stated: stated.get(declared).map(String::as_str),
+            },
+            &mut edit,
+        );
     }
 
     ui.horizontal(|ui| {
@@ -77,7 +101,9 @@ pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool) {
             let endian = list.endian;
             layout::add_field(list, after, blank_field(endian));
         }
-        Some(Edit::Remove(index)) => layout::remove_field(list, index),
+        Some(Edit::Remove(index)) => {
+            layout::remove_field(list, index);
+        }
         Some(Edit::Move(index, down)) => layout::move_field(list, index, down),
         Some(Edit::Rename(index, name)) => layout::rename_field(list, index, &name),
         Some(Edit::Kind(index, kind)) => {
@@ -96,15 +122,29 @@ pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool) {
     }
 }
 
+/// Everything one row needs to know that is not the field list itself.
+struct Row<'a> {
+    index: usize,
+    declared: &'a str,
+    hex: bool,
+    /// The type the file states this field as, which is what cannot be
+    /// reworded here.
+    stated: Option<&'a str>,
+}
+
 fn field_row(
     ui: &mut Ui,
     layout: &mut FrameDef,
     frame: &FrameDef,
-    index: usize,
-    declared: &str,
-    hex: bool,
+    row: &Row<'_>,
     edit: &mut Option<Edit>,
 ) {
+    let Row {
+        index,
+        declared,
+        hex,
+        stated,
+    } = *row;
     let id = Id::new(("frame_field", index, declared));
     let expanded = layout::is_expanded(layout, declared);
     CollapsingState::load_with_default_open(ui.ctx(), id, false)
@@ -124,7 +164,16 @@ fn field_row(
             {
                 *edit = Some(Edit::Move(index, true));
             }
-            if ui.button(icons::TRASH).on_hover_text("Remove").clicked() {
+            let removable = layout::may_remove(frame, index);
+            if ui
+                .add_enabled(removable, egui::Button::new(icons::TRASH))
+                .on_hover_text(if removable {
+                    "Remove"
+                } else {
+                    "The checksum after it would have nothing to cover"
+                })
+                .clicked()
+            {
                 *edit = Some(Edit::Remove(index));
             }
 
@@ -141,10 +190,23 @@ fn field_row(
             }
 
             let mut name = declared.to_owned();
-            if ui.text_edit_singleline(&mut name).changed() {
+            if ui
+                .add_enabled(
+                    stated.is_none(),
+                    egui::TextEdit::singleline(&mut name).desired_width(NAME_WIDTH),
+                )
+                .changed()
+            {
                 *edit = Some(Edit::Rename(index, name));
             }
-            kind_picker(ui, layout, frame, index, edit);
+            match stated {
+                // Its type, its bounds and its name all come from somewhere
+                // else, so the only honest thing to show is where.
+                Some(kind) => {
+                    ui.label(RichText::new(kind).italics());
+                }
+                None => kind_picker(ui, layout, frame, index, edit),
+            }
         })
         .body(|ui| {
             if expanded {
@@ -161,7 +223,12 @@ fn field_row(
                 ui.label(RichText::new("Stated as a type, and edited where the type is.").weak());
                 return;
             }
-            details(ui, layout, frame, index, hex);
+            if let Some(kind) = stated {
+                ui.label(
+                    RichText::new(format!("Stated as {kind}, and edited where {kind} is.")).weak(),
+                );
+            }
+            details(ui, layout, frame, index, hex, stated.is_some());
         });
 }
 
@@ -195,7 +262,14 @@ fn kind_picker(
 }
 
 /// The kind-specific part of a field, below the row that names it.
-fn details(ui: &mut Ui, layout: &mut FrameDef, frame: &FrameDef, index: usize, hex: bool) {
+fn details(
+    ui: &mut Ui,
+    layout: &mut FrameDef,
+    frame: &FrameDef,
+    index: usize,
+    hex: bool,
+    stated: bool,
+) {
     let inherited = layout.endian;
     let Some(field) = layout::plain_field_mut(layout, index) else {
         return;
@@ -215,7 +289,7 @@ fn details(ui: &mut Ui, layout: &mut FrameDef, frame: &FrameDef, index: usize, h
     match &mut field.kind {
         FieldKind::Scalar(scalar) => {
             let scalar = *scalar;
-            scalar_details(ui, field, scalar, hex);
+            scalar_details(ui, field, scalar, hex, stated);
         }
         FieldKind::Bytes { len } | FieldKind::Text { len } => {
             ui.horizontal(|ui| {
@@ -233,7 +307,7 @@ fn details(ui: &mut Ui, layout: &mut FrameDef, frame: &FrameDef, index: usize, h
     }
 }
 
-fn scalar_details(ui: &mut Ui, field: &mut FieldDef, scalar: ScalarType, hex: bool) {
+fn scalar_details(ui: &mut Ui, field: &mut FieldDef, scalar: ScalarType, hex: bool, stated: bool) {
     let digits = scalar.size() * 2;
     let showing = hex
         .then_some(digits)
@@ -269,6 +343,14 @@ fn scalar_details(ui: &mut Ui, field: &mut FieldDef, scalar: ScalarType, hex: bo
     });
 
     let representable = scalar.representable();
+    if stated {
+        // The bounds belong to the type, and the writer will not put them on
+        // the field. Shown, and left alone.
+        if let Some(range) = &field.range {
+            ui.label(RichText::new(format!("Range: {}", range.describe())).weak());
+        }
+        return;
+    }
     ui.horizontal(|ui| {
         let mut narrowed = field.range.is_some();
         if ui
@@ -374,10 +456,13 @@ fn bits_details(ui: &mut Ui, index: usize, repr: ScalarType, bits: &mut Vec<BitD
         )
         .clicked()
     {
-        bits.push(BitDef {
-            name: format!("bit{}", bits.len()),
-            width: 1,
-        });
+        // Counted names collide after a removal in the middle, and two bits of
+        // one name share a single value: setting either would set both.
+        let name = (bits.len()..=bits.len() * 2 + 1)
+            .map(|at| format!("bit{at}"))
+            .find(|wanted| !bits.iter().any(|held| held.name == *wanted))
+            .unwrap_or_else(|| format!("bit{}", bits.len()));
+        bits.push(BitDef { name, width: 1 });
     }
 }
 

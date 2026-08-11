@@ -59,6 +59,9 @@ pub enum SchemaError {
     #[error("duplicate type name {name}")]
     DuplicateType { name: String },
 
+    #[error("field {field}: two bits are both named {name}")]
+    DuplicateBit { field: String, name: String },
+
     #[error("type {name} has no fields")]
     EmptyType { name: String },
 
@@ -822,6 +825,44 @@ fn as_document(frame: &FrameDef) -> Result<toml_edit::DocumentMut, SchemaError> 
     toml_edit::ser::to_document(&raw).map_err(SchemaError::Rewrite)
 }
 
+/// The declared fields a file states through a named type, and which one.
+///
+/// The model cannot answer this: by the time a frame is loaded, `Percent` has
+/// become a `u8` with bounds and `Rgb` has become three fields, with nothing
+/// left pointing back at the name. The file still says it, so the file is
+/// asked. What is listed here is exactly what the writer refuses to reword.
+#[must_use]
+pub fn stated_as_types(text: &str) -> BTreeMap<String, String> {
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return BTreeMap::new();
+    };
+    stated_in(document.as_table())
+}
+
+/// The same, for the fields of one type in a shared types file.
+#[must_use]
+pub fn type_stated_as_types(text: &str, name: &str) -> BTreeMap<String, String> {
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return BTreeMap::new();
+    };
+    sections(document.as_table(), "type")
+        .iter()
+        .find(|entry| entry.get("name").and_then(Item::as_str) == Some(name))
+        .map(stated_in)
+        .unwrap_or_default()
+}
+
+fn stated_in(holder: &toml_edit::Table) -> BTreeMap<String, String> {
+    sections(holder, "field")
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name").and_then(Item::as_str)?;
+            let kind = entry.get("type").and_then(Item::as_str)?;
+            (!is_builtin_kind(kind)).then(|| (name.to_owned(), kind.to_owned()))
+        })
+        .collect()
+}
+
 /// Writes a type back into the file it came from, keeping every comment.
 ///
 /// Unlike a frame, a types file holds as many types as someone cared to put in
@@ -1420,6 +1461,18 @@ fn build_kind(field: &RawField, index: usize, names: &[String]) -> Result<FieldK
                     kind: field.kind.clone(),
                     missing: "bits",
                 })?;
+            // Values are held against a bitfield by name, so two bits sharing
+            // one would share a single value: setting either would set both,
+            // and the frame would go out with a number in a place nobody put
+            // it. Refused here rather than encoded wrong.
+            for (at, bit) in bits.iter().enumerate() {
+                if bits[..at].iter().any(|earlier| earlier.name == bit.name) {
+                    return Err(SchemaError::DuplicateBit {
+                        field: field.name.clone(),
+                        name: bit.name.clone(),
+                    });
+                }
+            }
             let total: u32 = bits.iter().map(|bit| bit.width).sum();
             let capacity = u32::try_from(repr.size() * 8).unwrap_or(u32::MAX);
             if total != capacity {

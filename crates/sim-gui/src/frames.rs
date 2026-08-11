@@ -30,8 +30,6 @@ pub struct FrameLibrary {
     pub entries: Vec<Entry>,
     /// Files that failed to load, as (file name, reason).
     pub failures: Vec<(String, String)>,
-    /// Names of the shared types available to every frame in the folder.
-    pub shared_types: Vec<String>,
     pub selected: Option<usize>,
     /// The frame being edited, if any.
     pub draft: Option<Draft>,
@@ -40,6 +38,13 @@ pub struct FrameLibrary {
     pub type_selected: Option<usize>,
     /// The shared type being edited, if any.
     pub type_draft: Option<TypeDraft>,
+    /// The last answer given about the type draft, and the draft it was given
+    /// about.
+    ///
+    /// Both answers go to the disk, and the panel asks for them on every
+    /// repaint. Kept so that looking at an editor nobody is typing into costs
+    /// nothing.
+    type_review: Option<(TypeDraft, Review)>,
     /// Kept so a draft can be read back against the same types it was written
     /// against, which is the only way the guard means anything.
     types: TypeLibrary,
@@ -73,6 +78,13 @@ pub struct TypeOrigin {
     pub name: String,
 }
 
+/// What is known about the type draft as it stands.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Review {
+    problem: Option<String>,
+    impact: Vec<(String, Effect)>,
+}
+
 /// What editing a shared type would do to a frame that uses it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -100,13 +112,15 @@ pub struct Draft {
 pub struct Origin {
     pub file: PathBuf,
     pub text: String,
+    /// The declared fields the file states through a named type, worked out
+    /// once when editing starts rather than parsed again on every repaint.
+    pub stated: BTreeMap<String, String>,
 }
 
 impl FrameLibrary {
     pub fn load_from(&mut self, directory: PathBuf) {
         self.entries.clear();
         self.failures.clear();
-        self.shared_types.clear();
         self.type_entries.clear();
         self.draft = None;
         self.type_draft = None;
@@ -207,7 +221,6 @@ impl FrameLibrary {
                 .push((TYPES_DIR.to_owned(), error.to_string())),
         }
 
-        self.shared_types = types.names().into_iter().map(ToOwned::to_owned).collect();
         self.attribute_types(&types_dir, &types);
         types
     }
@@ -333,13 +346,42 @@ impl FrameLibrary {
             .is_none_or(|entry| entry.definition != draft.definition)
     }
 
+    /// Whether the type draft can be saved, and what it would do to the frames
+    /// that use it.
+    ///
+    /// Worked out once per change rather than once per repaint: both answers
+    /// read every file in `types/`, and the impact reloads every frame besides.
+    fn type_review(&mut self) -> Review {
+        let Some(draft) = self.type_draft.clone() else {
+            return Review::default();
+        };
+        if let Some((asked, review)) = &self.type_review {
+            if *asked == draft {
+                return review.clone();
+            }
+        }
+        let review = Review {
+            problem: self.compute_type_problem(),
+            impact: self.compute_type_impact(),
+        };
+        self.type_review = Some((draft, review.clone()));
+        review
+    }
+
     /// What the type draft would do to the frames that use it.
     ///
     /// Nothing on this list stops a save. A type exists to be shared, so
     /// changing it is meant to reach the frames naming it, and the point is
     /// that it says so first rather than after the next Reload.
-    #[must_use]
-    pub fn type_draft_impact(&self) -> Vec<(String, Effect)> {
+    pub fn type_draft_impact(&mut self) -> Vec<(String, Effect)> {
+        self.type_review().impact
+    }
+
+    pub fn type_draft_problem(&mut self) -> Option<String> {
+        self.type_review().problem
+    }
+
+    fn compute_type_impact(&self) -> Vec<(String, Effect)> {
         let Some(candidate) = self.candidate_types() else {
             return Vec::new();
         };
@@ -361,8 +403,7 @@ impl FrameLibrary {
     }
 
     /// Why the type draft cannot be saved, if it cannot.
-    #[must_use]
-    pub fn type_draft_problem(&self) -> Option<String> {
+    fn compute_type_problem(&self) -> Option<String> {
         let draft = self.type_draft.as_ref()?;
         let name = draft.definition.name();
         if name.trim().is_empty() {
@@ -377,6 +418,12 @@ impl FrameLibrary {
         });
         if taken {
             return Some(format!("a type named \"{name}\" already exists"));
+        }
+        // A type with neither fields nor a base is refused where it is named,
+        // not where it is written, so the round-trip guard below reads it back
+        // happily and only a frame using it would ever complain.
+        if draft.definition.narrows.is_none() && draft.definition.layout.fields.is_empty() {
+            return Some(format!("{name} needs at least one field"));
         }
 
         let Some(candidate) = self.candidate_types() else {
@@ -504,6 +551,7 @@ impl FrameLibrary {
         let origin = std::fs::read_to_string(&entry.file)
             .ok()
             .map(|text| Origin {
+                stated: schema::stated_as_types(&text),
                 file: entry.file.clone(),
                 text,
             });
@@ -680,6 +728,7 @@ impl FrameLibrary {
         // row edits that rather than reverting to how the file used to read.
         self.draft = Some(Draft {
             origin: Some(Origin {
+                stated: schema::stated_as_types(&written),
                 file: file.to_path_buf(),
                 text: written,
             }),
@@ -903,7 +952,14 @@ repeat = 3
         library.load_from(dir.clone());
 
         assert!(library.failures.is_empty(), "{:?}", library.failures);
-        assert_eq!(library.shared_types, ["LedConfig"]);
+        assert_eq!(
+            library
+                .type_entries
+                .iter()
+                .map(|entry| entry.definition.name())
+                .collect::<Vec<_>>(),
+            ["LedConfig"]
+        );
         // The subfolder itself must not be mistaken for a frame file.
         assert_eq!(library.entries.len(), 1);
         assert_eq!(library.entries[0].frame.fields.len(), 6);
@@ -1322,6 +1378,7 @@ covers = { from = "header", to = "here" }
         let mut draft = Draft {
             origin: Some(Origin {
                 file: PathBuf::from("layered.toml"),
+                stated: schema::stated_as_types(LAYERED),
                 text: LAYERED.to_owned(),
             }),
             ..draft_of(LAYERED)
@@ -1643,6 +1700,7 @@ endian = "big"
         let mut draft = Draft {
             origin: Some(Origin {
                 file: PathBuf::from("little.toml"),
+                stated: schema::stated_as_types(LITTLE),
                 text: LITTLE.to_owned(),
             }),
             ..draft_of(LITTLE)
@@ -1661,6 +1719,7 @@ endian = "big"
         let mut draft = Draft {
             origin: Some(Origin {
                 file: PathBuf::from("little.toml"),
+                stated: schema::stated_as_types(LITTLE),
                 text: LITTLE.to_owned(),
             }),
             ..draft_of(LITTLE)
@@ -1673,5 +1732,74 @@ endian = "big"
         let reread = schema::from_toml(&written).expect("valid");
         assert_eq!(reread.endian, Endianness::Little);
         assert_eq!(reread.fields[a].endian, Endianness::Big);
+    }
+
+    #[test]
+    fn a_group_type_with_no_fields_is_refused() {
+        let (_, mut library) = shared("types-empty");
+        library.begin_new_type(TypeDef {
+            layout: FrameDef::flat("NewType", Vec::new()),
+            narrows: None,
+        });
+
+        // It reads back exactly as written, so only asking what it means
+        // catches it: a frame naming it would fail with "has no fields".
+        let problem = library.type_draft_problem().expect("refused");
+        assert!(problem.contains("NewType"), "{problem}");
+        assert!(library.save_type_draft().is_err());
+    }
+
+    #[test]
+    fn a_subtype_named_field_is_shown_as_what_the_file_states() {
+        let (dir, mut library) = library_of("stated", &[("setpoints.toml", SUBTYPED)]);
+        let _ = dir;
+        library.begin_edit();
+        let draft = library.draft.as_ref().expect("editing");
+
+        // What the panel greys out, and what the writer refuses to reword.
+        assert_eq!(
+            draft.origin.as_ref().map(|origin| origin.stated.clone()),
+            Some([("target".to_owned(), "Percent".to_owned())].into())
+        );
+    }
+
+    #[test]
+    fn a_removal_that_would_leave_a_checksum_first_is_refused() {
+        let text = r#"
+name = "Guarded"
+
+[[field]]
+name = "data"
+type = "u8"
+
+[[field]]
+name = "crc"
+type = "crc16"
+algo = "crc16-ccitt"
+covers = { from = "data", to = "data" }
+"#;
+        let mut draft = draft_of(text);
+        assert!(!layout::may_remove(&draft.frame, 0));
+        assert!(!layout::remove_field(&mut draft.frame, 0));
+        assert_eq!(draft.frame.declared, ["data", "crc"]);
+
+        // Nor by moving the checksum in front of it, which lands in the same
+        // place: a checksum with nothing to cover.
+        layout::move_field(&mut draft.frame, 1, false);
+        assert_eq!(draft.frame.declared, ["data", "crc"]);
+    }
+
+    #[test]
+    fn the_type_review_is_worked_out_once_per_change() {
+        let (dir, mut library) = shared("types-cached");
+        library.type_selected = Some(1);
+        library.begin_type_edit();
+        let first = library.type_draft_problem();
+
+        // Taking the folder away must not change the answer: asking twice about
+        // the same draft must not go back to the disk.
+        std::fs::remove_dir_all(dir.join(TYPES_DIR)).unwrap();
+        assert_eq!(library.type_draft_problem(), first);
+        assert!(library.type_draft_impact().is_empty());
     }
 }
