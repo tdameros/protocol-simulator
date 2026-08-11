@@ -8,8 +8,10 @@ use value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Endianness {
-    #[default]
     Big,
+    /// What a file means by saying nothing, most of the hardware this talks to
+    /// being little-endian.
+    #[default]
     Little,
 }
 
@@ -278,6 +280,13 @@ pub struct FrameDef {
     pub endian: Endianness,
     /// Every field on the wire, types and repeats already expanded.
     pub fields: Vec<FieldDef>,
+    /// How the file writes the declared fields that are not plain builtins.
+    ///
+    /// A name on its own does not say that `zone` was `type = "Zone"` with two
+    /// named instances. Without that, a frame can be shown and moved about but
+    /// never written back, since twenty-one expanded fields cannot be folded
+    /// into the four lines that produced them.
+    pub stated: std::collections::BTreeMap<String, Stated>,
     /// The names the file actually writes, in the order it writes them.
     ///
     /// A frame that instantiates a type or repeats a field declares four things
@@ -286,6 +295,17 @@ pub struct FrameDef {
     /// only where it is declared, and rewriting it as a plain field would flatten
     /// what someone took the trouble to factorise.
     pub declared: Vec<String>,
+}
+
+/// What a file says about a declared field beyond its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stated {
+    /// The type it is written as, builtin or shared.
+    pub kind: String,
+    /// Repeated this many times, as `name[0]`, `name[1]` and so on.
+    pub repeat: Option<usize>,
+    /// Repeated once per name, as `name.left`, `name.right`.
+    pub instances: Option<Vec<String>>,
 }
 
 impl FrameDef {
@@ -299,6 +319,7 @@ impl FrameDef {
             name: name.into(),
             description: None,
             endian: Endianness::default(),
+            stated: std::collections::BTreeMap::new(),
             declared: fields.iter().map(|field| field.name.clone()).collect(),
             fields,
         }
@@ -381,6 +402,7 @@ mod tests {
             name: "F".to_owned(),
             description: None,
             endian: Endianness::Big,
+            stated: std::collections::BTreeMap::new(),
             declared: declared.iter().map(|name| (*name).to_owned()).collect(),
             fields: wire
                 .iter()

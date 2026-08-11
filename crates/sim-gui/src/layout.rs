@@ -38,7 +38,10 @@ pub fn rename_field(layout: &mut FrameDef, index: usize, name: &str) {
     let Some(old) = layout.declared.get(index).cloned() else {
         return;
     };
-    if name == old || is_expanded(layout, &old) {
+    // Refused for a field the file states as a named type, for the same reason
+    // it is refused for an expanded one: the writer keeps the word the file
+    // used, and has nowhere to put the new name.
+    if name == old || is_expanded(layout, &old) || layout.stated.contains_key(&old) {
         return;
     }
     let Some(at) = layout.field_index(&old) else {
@@ -82,6 +85,9 @@ pub fn remove_field(layout: &mut FrameDef, index: usize) -> bool {
     with_spans_kept(layout, |layout| {
         layout.fields.drain(layout.expansion_of(&name));
         layout.declared.remove(index);
+        // How the file wrote it goes with it, or the frame would still claim a
+        // field it no longer has and could never be written back.
+        layout.stated.remove(&name);
     });
     true
 }

@@ -17,7 +17,7 @@ use crate::document;
 use super::checksum::{ChecksumSpec, CrcSpec};
 use super::value::Value;
 use super::{
-    BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType,
+    BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType, Stated,
     ValueRange,
 };
 
@@ -762,8 +762,18 @@ fn lower_type(type_def: &TypeDef) -> RawType {
         .filter(|field| type_def.layout.declared.contains(&field.name))
         .map(|field| lower_field(field, &type_def.layout))
         .collect();
-    for field in &mut fields {
-        field.endian = None;
+    // As for a frame: a field following the order it is given says nothing, one
+    // that overrides it has to say so or it comes back as the other.
+    for (field, held) in fields.iter_mut().zip(
+        type_def
+            .layout
+            .fields
+            .iter()
+            .filter(|held| type_def.layout.declared.contains(&held.name)),
+    ) {
+        if held.endian == type_def.layout.endian {
+            field.endian = None;
+        }
     }
     RawType {
         name: type_def.layout.name.clone(),
@@ -809,6 +819,28 @@ fn as_document(frame: &FrameDef) -> Result<toml_edit::DocumentMut, SchemaError> 
     // own, so it has no business being written back.
     raw.fields
         .retain(|field| frame.declared.contains(&field.name));
+    // A declared field standing for several on the wire has no field of its own
+    // to lower, only the leaves it produced. What it was written as is the one
+    // record of it, and without this a type instance could be shown and moved
+    // about but never written.
+    for (at, name) in frame.declared.iter().enumerate() {
+        let Some(stated) = frame.stated.get(name) else {
+            continue;
+        };
+        if raw.fields.iter().any(|held| held.name == *name) {
+            continue;
+        }
+        raw.fields.insert(
+            at.min(raw.fields.len()),
+            RawField {
+                name: name.clone(),
+                kind: stated.kind.clone(),
+                repeat: stated.repeat,
+                instances: stated.instances.clone(),
+                ..RawField::default()
+            },
+        );
+    }
     // A field inheriting the frame's order says nothing about it, as the file
     // does. One that differs has to say so, or it would be read back as the
     // frame's and quietly change what goes on the wire.
@@ -1017,6 +1049,25 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
     // Captured before expansion, which is the only moment the two are still
     // distinguishable.
     let written: Vec<String> = raw.fields.iter().map(|field| field.name.clone()).collect();
+    // Only what a name cannot carry: a plain builtin written once needs no
+    // record, being exactly the field it produces.
+    let stated: BTreeMap<String, Stated> = raw
+        .fields
+        .iter()
+        .filter(|field| {
+            !is_builtin_kind(&field.kind) || field.repeat.is_some() || field.instances.is_some()
+        })
+        .map(|field| {
+            (
+                field.name.clone(),
+                Stated {
+                    kind: field.kind.clone(),
+                    repeat: field.repeat,
+                    instances: field.instances.clone(),
+                },
+            )
+        })
+        .collect();
     let expanded = expand(&raw.fields, &types)?;
 
     let mut seen: Vec<&str> = Vec::new();
@@ -1054,6 +1105,7 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
         name: raw.name,
         description: raw.description,
         endian: frame_endian,
+        stated,
         fields,
         declared: written,
     })
@@ -1747,6 +1799,17 @@ fn lower_field(field: &FieldDef, frame: &FrameDef) -> RawField {
         }
     }
 
+    // A plain field the file states as a named type keeps that word: writing
+    // `u8` in place of `Percent` would be the flattening this writer exists to
+    // avoid.
+    if let Some(stated) = frame.stated.get(&field.name) {
+        raw.kind.clone_from(&stated.kind);
+        raw.repeat = stated.repeat;
+        raw.instances.clone_from(&stated.instances);
+        // Both belong to the type, not to the field it was resolved into.
+        raw.range = None;
+        raw.repr = None;
+    }
     raw
 }
 
@@ -2472,8 +2535,37 @@ range = { min = -500, max = 500 }
 
     #[test]
     fn subtypes_survive_a_round_trip_through_toml() {
-        let frame = from_toml(SUBTYPES).unwrap();
-        let reparsed = from_toml(&to_toml(&frame).unwrap()).expect("rendered toml should parse");
+        // Written back through a library rather than alone: the type names are
+        // kept now, so what is written needs them to still be defined
+        // somewhere. Flattening them to `u8` plus bounds is exactly what this
+        // writer refuses to do.
+        let mut library = TypeLibrary::default();
+        library
+            .merge_toml(
+                r#"
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 99 }
+
+[[type]]
+name = "LowPercent"
+base = "Percent"
+range = { min = 0, max = 9 }
+"#,
+            )
+            .unwrap();
+        let shared = SUBTYPES
+            .replace("[[type]]\nname = \"Percent\"\nbase = \"u8\"\nrange = { min = 0, max = 99 }\n\n", "")
+            .replace(
+                "[[type]]\nname = \"LowPercent\"\nbase = \"Percent\"\nrange = { min = 0, max = 9 }\n\n",
+                "",
+            );
+        let frame = from_toml_with(&shared, &library).expect("subtypes should parse");
+
+        let written = to_toml(&frame).unwrap();
+        assert!(written.contains(r#"type = "Percent""#), "{written}");
+        let reparsed = from_toml_with(&written, &library).expect("rendered toml should parse");
         assert_eq!(frame, reparsed);
     }
 

@@ -153,7 +153,7 @@ fn blank() -> FrameDef {
             name: "id".to_owned(),
             description: None,
             kind: FieldKind::Scalar(ScalarType::U8),
-            endian: sim_core::frame::Endianness::Big,
+            endian: sim_core::frame::Endianness::default(),
             default: None,
             range: None,
         }],
