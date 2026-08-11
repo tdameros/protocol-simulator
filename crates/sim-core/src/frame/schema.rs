@@ -421,7 +421,11 @@ impl TypeLibrary {
     fn define(&self, raw: &RawType) -> Result<TypeDef, SchemaError> {
         let narrows = if raw.is_subtype() {
             let mut stack = Vec::new();
-            let (base, range) = resolve_subtype(raw, &self.types, &mut stack)?;
+            // Called for what it refuses rather than for what it returns: the
+            // range it hands back is the one inherited down the chain, and
+            // writing that back would stamp the parent's bounds into a child
+            // that declared none, cutting it loose from its parent.
+            let (base, _inherited) = resolve_subtype(raw, &self.types, &mut stack)?;
             // Shown against the scalar it ends up being, since that is what
             // decides whether the bounds are signed, unsigned or fractional.
             let scalar = ScalarType::parse(&base).ok_or_else(|| SchemaError::BadSubtypeBase {
@@ -430,7 +434,7 @@ impl TypeLibrary {
             })?;
             Some(Subtype {
                 base: raw.base.clone().unwrap_or(base),
-                range: declared_range(range.as_ref(), scalar, &raw.name)?,
+                range: declared_range(raw.range.as_ref(), scalar, &raw.name)?,
             })
         } else {
             None
@@ -552,7 +556,7 @@ fn reconcile(
     fresh: &toml_edit::Table,
     declared: &[String],
     next: &mut isize,
-) {
+) -> bool {
     let written: BTreeMap<String, toml_edit::Table> = sections(fresh, "field")
         .into_iter()
         .filter_map(|entry| {
@@ -602,6 +606,7 @@ fn reconcile(
         }
     }
     holder.insert("field", Item::ArrayOfTables(rebuilt));
+    !in_order
 }
 
 /// Which entry in the file each declared field should be written over.
@@ -757,11 +762,18 @@ fn as_document(frame: &FrameDef) -> Result<toml_edit::DocumentMut, SchemaError> 
     // own, so it has no business being written back.
     raw.fields
         .retain(|field| frame.declared.contains(&field.name));
-    // Every field carries a resolved endianness, most of them inherited from
-    // the frame. Writing that back would stamp `endian` onto fields that never
-    // asked for it, so byte order stays the file's to state.
-    for field in &mut raw.fields {
-        field.endian = None;
+    // A field inheriting the frame's order says nothing about it, as the file
+    // does. One that differs has to say so, or it would be read back as the
+    // frame's and quietly change what goes on the wire.
+    for (field, held) in raw.fields.iter_mut().zip(
+        frame
+            .fields
+            .iter()
+            .filter(|held| frame.declared.contains(&held.name)),
+    ) {
+        if held.endian == frame.endian {
+            field.endian = None;
+        }
     }
     toml_edit::ser::to_document(&raw).map_err(SchemaError::Rewrite)
 }
@@ -802,6 +814,7 @@ pub fn update_type_in(text: &str, name: &str, type_def: &TypeDef) -> Result<Stri
     let at = entries
         .iter()
         .position(|entry| entry.get("name").and_then(Item::as_str) == Some(name));
+    let mut moved = false;
     if let Some(entry) = at.and_then(|at| entries.get_mut(at)) {
         // `field` is merged apart, an array of tables being a run of sections
         // rather than one value to be dropped in.
@@ -811,12 +824,28 @@ pub fn update_type_in(text: &str, name: &str, type_def: &TypeDef) -> Result<Stri
                 .iter()
                 .filter_map(|held| Some(held.get("name").and_then(Item::as_str)?.to_owned()))
                 .collect();
-            reconcile(entry, &fresh, &declared, &mut next);
+            moved = reconcile(entry, &fresh, &declared, &mut next);
         }
     } else {
         let mut appended = fresh;
         document::place_after(&mut appended, &mut next);
         entries.push(appended);
+    }
+
+    // A `[[type.field]]` belongs to whichever `[[type]]` was written last, so
+    // sending one run of them past the end of the document hands them to
+    // another type. Moving any of them means renumbering every type in the
+    // file, which is what keeps each one's fields under its own heading.
+    if moved {
+        let mut next = document::last_position(&document);
+        if let Some(entries) = document
+            .get_mut("type")
+            .and_then(Item::as_array_of_tables_mut)
+        {
+            for entry in entries.iter_mut() {
+                document::place_after(entry, &mut next);
+            }
+        }
     }
     Ok(document.to_string())
 }
@@ -939,6 +968,7 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
     Ok(FrameDef {
         name: raw.name,
         description: raw.description,
+        endian: frame_endian,
         fields,
         declared: written,
     })
@@ -1538,7 +1568,12 @@ fn lower(frame: &FrameDef) -> RawFrame {
     RawFrame {
         name: frame.name.clone(),
         description: frame.description.clone(),
-        endian: None,
+        // Stated only when it is not what a file says by saying nothing, so a
+        // frame nobody gave an order to does not grow one.
+        endian: (frame.endian != Endianness::default()).then_some(match frame.endian {
+            Endianness::Big => RawEndian::Big,
+            Endianness::Little => RawEndian::Little,
+        }),
         // Types are resolved at load time, so what is written back is the
         // expanded layout: identical on the wire, no longer factorised.
         types: Vec::new(),
