@@ -379,7 +379,9 @@ impl FrameLibrary {
             return Some(format!("a type named \"{name}\" already exists"));
         }
 
-        let candidate = self.candidate_types()?;
+        let Some(candidate) = self.candidate_types() else {
+            return Some("the types folder cannot be read as it stands".to_owned());
+        };
         match candidate.definition(name) {
             Err(error) => Some(error.to_string()),
             Ok(None) => Some(format!("{name} would not be read back")),
@@ -403,7 +405,11 @@ impl FrameLibrary {
         let directory = self.directory.as_ref()?.join(TYPES_DIR);
         let others = schema::toml_files(&directory).unwrap_or_default();
         for path in others.iter().filter(|path| **path != edited) {
-            candidate.merge_file(path).ok()?;
+            // A broken file costs only itself here too, as it does at load
+            // time. Giving up on the whole library would leave the guard with
+            // nothing to check against, which reads as nothing to complain
+            // about.
+            let _ = candidate.merge_file(path);
         }
         candidate.merge_toml(&written).ok()?;
         Some(candidate)
@@ -541,15 +547,42 @@ impl FrameLibrary {
     #[must_use]
     pub fn draft_problem(&self) -> Option<String> {
         let draft = self.draft.as_ref()?;
-        draft.problem(&self.types).or_else(|| {
-            self.name_taken(draft).map(|file| {
-                format!(
-                    "a frame named \"{}\" already lives in {}",
-                    draft.frame.name,
-                    file_label(&file)
-                )
+        draft
+            .problem(&self.types)
+            .or_else(|| {
+                self.name_taken(draft).map(|file| {
+                    format!(
+                        "a frame named \"{}\" already lives in {}",
+                        draft.frame.name,
+                        file_label(&file)
+                    )
+                })
             })
-        })
+            .or_else(|| self.file_taken(draft))
+    }
+
+    /// Whether saving would land on a file another frame already occupies.
+    ///
+    /// The name is not the file. `suggested_file` folds case and punctuation
+    /// away, so "telemetry" and "Telemetry" both want `telemetry.toml`, and the
+    /// name check above lets the pair through. Writing would take the other
+    /// frame's definition with it, and nothing would say so.
+    fn file_taken(&self, draft: &Draft) -> Option<String> {
+        if draft.origin.is_some() {
+            return None;
+        }
+        let directory = self.directory.as_ref()?;
+        let wanted = suggested_file(directory, &draft.frame.name);
+        let held = self.entries.iter().find(|entry| entry.file == wanted);
+        match held {
+            Some(entry) => Some(format!(
+                "{} already holds {}",
+                file_label(&wanted),
+                entry.frame.name
+            )),
+            None if wanted.exists() => Some(format!("{} already exists", file_label(&wanted))),
+            None => None,
+        }
     }
 
     /// The file already holding a frame of that name, if it is not this one.
@@ -1526,5 +1559,54 @@ type = "Rgb"
         let problem = library.type_draft_problem().expect("refused");
         assert!(problem.contains("Rgb"), "{problem}");
         assert!(library.save_type_draft().is_err());
+    }
+
+    #[test]
+    fn a_new_frame_whose_file_is_taken_is_refused_rather_than_writing_over_it() {
+        let (dir, mut library) = library_of("file-clash", &[("telemetry.toml", GOOD)]);
+        // A different name, since the name check would catch the same one, but
+        // one that wants the same file.
+        library.begin_new(FrameDef::flat("telemetry", vec![plain("tick")]));
+
+        let problem = library.draft_problem().expect("refused");
+        assert!(problem.contains("telemetry.toml"), "{problem}");
+        assert!(library
+            .save_draft(&suggested_file(&dir, "telemetry"))
+            .is_err());
+
+        let mut reloaded = FrameLibrary::default();
+        reloaded.load_from(dir);
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(reloaded.entries[0].frame.name, "Telemetry");
+    }
+
+    #[test]
+    fn a_broken_types_file_does_not_turn_the_guard_off() {
+        let (dir, mut library) = shared("types-broken");
+        std::fs::write(dir.join(TYPES_DIR).join("bad.toml"), "[[type]]\nname =").unwrap();
+
+        library.type_selected = Some(1);
+        library.begin_type_edit();
+        let draft = library.type_draft.as_mut().unwrap();
+        layout::add_field(
+            &mut draft.definition.layout,
+            None,
+            FieldDef {
+                name: "white".to_owned(),
+                description: None,
+                kind: FieldKind::Scalar(ScalarType::U8),
+                endian: Endianness::Big,
+                default: None,
+                range: None,
+            },
+        );
+
+        // Giving up on the library because a neighbour is broken leaves the
+        // guard with nothing to check against, which reads as nothing to say.
+        assert_eq!(library.type_draft_problem(), None);
+        assert_eq!(
+            library.type_draft_impact(),
+            vec![("Lamp".to_owned(), Effect::Resized { was: 3, now: 4 })]
+        );
     }
 }

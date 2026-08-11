@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use sim_core::frame::codec;
 use sim_core::frame::schema::{self, TypeLibrary};
 use sim_core::frame::value::{FieldValues, Value};
-use sim_core::frame::{FieldKind, FrameDef, ScalarType, ValueRange};
+use sim_core::frame::{Endianness, FieldDef, FieldKind, FrameDef, ScalarType, ValueRange};
 
 fn examples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/frames")
@@ -318,4 +318,157 @@ fn a_shared_type_is_read_as_the_two_things_a_type_can_be() {
     assert!(led.narrows.is_none());
     assert_eq!(led.layout.declared, ["mode", "brightness", "period_ms"]);
     assert_eq!(led.layout.size(), 4);
+}
+
+/// A subtype narrowing another one, which the shipped examples do not have and
+/// which is where an inherited range gets mistaken for a declared one.
+const CHAINED: &str = r#"
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 100 }
+
+[[type]]
+name = "Duty"
+base = "Percent"
+"#;
+
+#[test]
+fn a_subtype_that_declares_no_range_of_its_own_is_not_given_one() {
+    let mut types = TypeLibrary::default();
+    types.merge_toml(CHAINED).expect("valid");
+
+    let duty = types.definition("Duty").expect("valid").expect("there");
+    assert_eq!(
+        duty.narrows.as_ref().and_then(|narrows| narrows.range),
+        None
+    );
+
+    // An unchanged save must leave it following `Percent`, not pinned to what
+    // `Percent` happens to say today.
+    let written = schema::update_type_in(CHAINED, "Duty", &duty).expect("rewritten");
+    assert_eq!(written, CHAINED);
+}
+
+#[test]
+fn a_field_added_to_a_little_endian_frame_says_its_own_order() {
+    let text =
+        "name = \"Little\"\nendian = \"little\"\n\n[[field]]\nname = \"a\"\ntype = \"u16\"\n";
+    let frame = schema::from_toml(text).expect("valid");
+    assert_eq!(frame.endian, Endianness::Little);
+
+    let mut grown = frame.clone();
+    grown.fields.push(FieldDef {
+        name: "b".to_owned(),
+        description: None,
+        kind: FieldKind::Scalar(ScalarType::U16),
+        endian: Endianness::Big,
+        default: None,
+        range: None,
+    });
+    grown.declared.push("b".to_owned());
+
+    let written = schema::update_in(text, &grown).expect("rewritten");
+
+    // Without this the field reads back little-endian, and the editor refuses
+    // to save a frame it cannot write faithfully.
+    assert_eq!(schema::from_toml(&written).expect("valid"), grown);
+    assert!(written.contains("endian = \"big\""));
+}
+
+const TWO_GROUPS: &str = r#"
+[[type]]
+name = "Rgb"
+
+[[type.field]]
+name = "red"
+type = "u8"
+
+[[type.field]]
+name = "green"
+type = "u8"
+
+[[type]]
+name = "Pair"
+
+[[type.field]]
+name = "left"
+type = "u8"
+
+[[type.field]]
+name = "right"
+type = "u8"
+"#;
+
+#[test]
+fn reordering_one_types_fields_leaves_them_under_that_type() {
+    let mut types = TypeLibrary::default();
+    types.merge_toml(TWO_GROUPS).expect("valid");
+    let mut rgb = types.definition("Rgb").expect("valid").expect("there");
+    rgb.layout.fields.swap(0, 1);
+    rgb.layout.declared.swap(0, 1);
+
+    let written = schema::update_type_in(TWO_GROUPS, "Rgb", &rgb).expect("rewritten");
+
+    // A `[[type.field]]` attaches to the last `[[type]]` written, so a run of
+    // them sent past the end of the file is handed to somebody else's type.
+    let mut after = TypeLibrary::default();
+    after.merge_toml(&written).expect("still valid");
+    assert_eq!(
+        after
+            .definition("Rgb")
+            .expect("valid")
+            .expect("there")
+            .layout
+            .declared,
+        ["green", "red"]
+    );
+    assert_eq!(
+        after
+            .definition("Pair")
+            .expect("valid")
+            .expect("there")
+            .layout
+            .declared,
+        ["left", "right"]
+    );
+}
+
+#[test]
+fn adding_a_field_to_the_first_of_two_types_does_not_give_it_to_the_second() {
+    let mut types = TypeLibrary::default();
+    types.merge_toml(TWO_GROUPS).expect("valid");
+    let mut rgb = types.definition("Rgb").expect("valid").expect("there");
+    rgb.layout.fields.push(FieldDef {
+        name: "blue".to_owned(),
+        description: None,
+        kind: FieldKind::Scalar(ScalarType::U8),
+        endian: Endianness::Big,
+        default: None,
+        range: None,
+    });
+    rgb.layout.declared.push("blue".to_owned());
+
+    let written = schema::update_type_in(TWO_GROUPS, "Rgb", &rgb).expect("rewritten");
+
+    let mut after = TypeLibrary::default();
+    after.merge_toml(&written).expect("still valid");
+    assert_eq!(
+        after
+            .definition("Rgb")
+            .expect("valid")
+            .expect("there")
+            .layout
+            .declared,
+        ["red", "green", "blue"]
+    );
+    assert_eq!(
+        after
+            .definition("Pair")
+            .expect("valid")
+            .expect("there")
+            .layout
+            .declared,
+        ["left", "right"]
+    );
 }

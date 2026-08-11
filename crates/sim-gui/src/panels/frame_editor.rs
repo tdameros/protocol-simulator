@@ -78,7 +78,7 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
         // Both throw the draft away, so neither is offered while one is open:
         // losing unsaved work to a stray click is not a trade worth making.
-        let idle = state.frames.draft.is_none();
+        let idle = state.frames.draft.is_none() && state.frames.type_draft.is_none();
         if ui
             .add_enabled(
                 idle,

@@ -270,6 +270,12 @@ pub struct FieldDef {
 pub struct FrameDef {
     pub name: String,
     pub description: Option<String>,
+    /// The byte order every field inherits unless it says otherwise.
+    ///
+    /// Held even though each field already carries its own resolved order: an
+    /// editor adding a field has to know what the frame's own answer is, and a
+    /// writer has to know which fields are worth stating an order for.
+    pub endian: Endianness,
     /// Every field on the wire, types and repeats already expanded.
     pub fields: Vec<FieldDef>,
     /// The names the file actually writes, in the order it writes them.
@@ -292,6 +298,7 @@ impl FrameDef {
         Self {
             name: name.into(),
             description: None,
+            endian: Endianness::default(),
             declared: fields.iter().map(|field| field.name.clone()).collect(),
             fields,
         }
@@ -373,6 +380,7 @@ mod tests {
         FrameDef {
             name: "F".to_owned(),
             description: None,
+            endian: Endianness::Big,
             declared: declared.iter().map(|name| (*name).to_owned()).collect(),
             fields: wire
                 .iter()
