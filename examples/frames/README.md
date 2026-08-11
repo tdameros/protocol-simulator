@@ -28,7 +28,7 @@ load, encode, decode, and match the byte count stated in its description.
 ```toml
 name = "Telemetry"                 # required, shown in the picker
 description = "Downlink, 26 bytes" # optional
-endian = "big"                     # "big" (default) or "little"
+endian = "little"                  # "little" (default) or "big"
 ```
 
 ## Fields
