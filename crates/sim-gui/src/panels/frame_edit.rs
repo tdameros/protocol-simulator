@@ -10,7 +10,8 @@ use egui_phosphor::regular as icons;
 use sim_core::frame::checksum::{ChecksumSpec, CrcSpec};
 use sim_core::frame::value::Value;
 use sim_core::frame::{
-    BitDef, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType, ValueRange,
+    BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType,
+    ValueRange,
 };
 
 use crate::layout;
@@ -72,7 +73,10 @@ pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool) {
     });
 
     match edit {
-        Some(Edit::Add(after)) => layout::add_field(list, after, blank_field()),
+        Some(Edit::Add(after)) => {
+            let endian = list.endian;
+            layout::add_field(list, after, blank_field(endian));
+        }
         Some(Edit::Remove(index)) => layout::remove_field(list, index),
         Some(Edit::Move(index, down)) => layout::move_field(list, index, down),
         Some(Edit::Rename(index, name)) => layout::rename_field(list, index, &name),
@@ -192,6 +196,7 @@ fn kind_picker(
 
 /// The kind-specific part of a field, below the row that names it.
 fn details(ui: &mut Ui, layout: &mut FrameDef, frame: &FrameDef, index: usize, hex: bool) {
+    let inherited = layout.endian;
     let Some(field) = layout::plain_field_mut(layout, index) else {
         return;
     };
@@ -203,6 +208,9 @@ fn details(ui: &mut Ui, layout: &mut FrameDef, frame: &FrameDef, index: usize, h
             field.description = (!description.trim().is_empty()).then_some(description);
         }
     });
+    if layout::has_byte_order(field) {
+        byte_order(ui, &mut field.endian, Some(inherited));
+    }
 
     match &mut field.kind {
         FieldKind::Scalar(scalar) => {
@@ -429,12 +437,15 @@ fn end_picker(ui: &mut Ui, salt: (&str, usize), names: &[String], chosen: &mut S
 }
 
 /// What New starts a field as: one byte, to be told what it is.
-fn blank_field() -> FieldDef {
+///
+/// Following the frame's order rather than assuming one, or widening it to a
+/// `u16` afterwards would silently put it on the wire the wrong way round.
+fn blank_field(endian: Endianness) -> FieldDef {
     FieldDef {
         name: "field".to_owned(),
         description: None,
         kind: FieldKind::Scalar(ScalarType::U8),
-        endian: sim_core::frame::Endianness::Big,
+        endian,
         default: None,
         range: None,
     }
@@ -517,4 +528,26 @@ fn kind_named(label: &str, frame: &FrameDef, index: usize) -> Option<FieldKind> 
         spec,
         covers: FieldSpan { from: 0, to },
     })
+}
+
+/// A byte order picker, with the frame's own answer marked where a field is
+/// free to differ from it.
+pub fn byte_order(ui: &mut Ui, endian: &mut Endianness, inherited: Option<Endianness>) {
+    ui.horizontal(|ui| {
+        ui.label("Byte order:");
+        for choice in [Endianness::Big, Endianness::Little] {
+            let word = match choice {
+                Endianness::Big => "big",
+                Endianness::Little => "little",
+            };
+            let label = if inherited == Some(choice) {
+                format!("{word} (frame)")
+            } else {
+                word.to_owned()
+            };
+            if ui.selectable_label(*endian == choice, label).clicked() {
+                *endian = choice;
+            }
+        }
+    });
 }

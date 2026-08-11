@@ -1609,4 +1609,69 @@ type = "Rgb"
             vec![("Lamp".to_owned(), Effect::Resized { was: 3, now: 4 })]
         );
     }
+
+    const LITTLE: &str = r#"
+name = "Little"
+endian = "little"
+
+[[field]]
+name = "a"
+type = "u16"
+
+[[field]]
+name = "b"
+type = "u16"
+endian = "big"
+"#;
+
+    #[test]
+    fn changing_the_frames_order_carries_the_fields_that_were_following_it() {
+        let mut draft = draft_of(LITTLE);
+        assert_eq!(draft.frame.fields[0].endian, Endianness::Little);
+        assert_eq!(draft.frame.fields[1].endian, Endianness::Big);
+
+        layout::set_endian(&mut draft.frame, Endianness::Big);
+
+        // `a` was following the frame and follows it still. `b` had said its
+        // own, and keeps saying it.
+        assert_eq!(draft.frame.fields[0].endian, Endianness::Big);
+        assert_eq!(draft.frame.fields[1].endian, Endianness::Big);
+    }
+
+    #[test]
+    fn changing_the_frames_order_is_written_and_reads_back() {
+        let mut draft = Draft {
+            origin: Some(Origin {
+                file: PathBuf::from("little.toml"),
+                text: LITTLE.to_owned(),
+            }),
+            ..draft_of(LITTLE)
+        };
+        layout::set_endian(&mut draft.frame, Endianness::Big);
+
+        assert_eq!(draft.problem(&TypeLibrary::default()), None);
+        let written = draft.written().expect("written");
+        assert!(written.contains(r#"endian = "big""#));
+        assert!(!written.contains(r#"endian = "little""#));
+        assert_eq!(schema::from_toml(&written).expect("valid"), draft.frame);
+    }
+
+    #[test]
+    fn giving_one_field_its_own_order_says_so_and_leaves_the_rest_alone() {
+        let mut draft = Draft {
+            origin: Some(Origin {
+                file: PathBuf::from("little.toml"),
+                text: LITTLE.to_owned(),
+            }),
+            ..draft_of(LITTLE)
+        };
+        let a = draft.frame.field_index("a").expect("there");
+        draft.frame.fields[a].endian = Endianness::Big;
+
+        assert_eq!(draft.problem(&TypeLibrary::default()), None);
+        let written = draft.written().expect("written");
+        let reread = schema::from_toml(&written).expect("valid");
+        assert_eq!(reread.endian, Endianness::Little);
+        assert_eq!(reread.fields[a].endian, Endianness::Big);
+    }
 }

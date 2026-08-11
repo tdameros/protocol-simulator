@@ -530,15 +530,16 @@ pub fn update_in(text: &str, frame: &FrameDef) -> Result<String, SchemaError> {
     let mut document: toml_edit::DocumentMut = text.parse().map_err(SchemaError::Edit)?;
     let fresh = as_document(frame)?;
 
-    // `endian` is spent at load time, folded into each field's scalar type, so
-    // the model has nothing left to say about it and the file keeps the last
-    // word. `type` likewise: the expansion is downstream of it.
+    // `type` is kept because the expansion is downstream of it, and `endian`
+    // because how a file states byte order is its own business: the pass below
+    // touches it only where leaving it would mean the wrong bytes.
     document::merge(
         document.as_table_mut(),
         fresh.as_table(),
         &["endian", "type", "field"],
     );
     merge_fields(&mut document, frame, fresh.as_table());
+    state_endianness(&mut document, frame);
     Ok(document.to_string())
 }
 
@@ -645,6 +646,49 @@ fn pair_up(
         }
     }
     source
+}
+
+/// Writes byte order wherever the file would otherwise be read as the wrong one.
+///
+/// Endianness is inherited, so most of it is written by saying nothing, and a
+/// writer that spelt it out everywhere would bury the two places it matters.
+/// Only a disagreement between what the file would be read as and what the
+/// frame now says is worth a line.
+fn state_endianness(document: &mut toml_edit::DocumentMut, frame: &FrameDef) {
+    let stated = |table: &toml_edit::Table| match table.get("endian").and_then(Item::as_str) {
+        Some("little") => Some(Endianness::Little),
+        Some("big") => Some(Endianness::Big),
+        _ => None,
+    };
+    let word = |endian: Endianness| match endian {
+        Endianness::Big => "big",
+        Endianness::Little => "little",
+    };
+
+    if stated(document.as_table()).unwrap_or_default() != frame.endian {
+        document["endian"] = toml_edit::value(word(frame.endian));
+    }
+
+    let Some(entries) = document
+        .get_mut("field")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return;
+    };
+    for entry in entries.iter_mut() {
+        let Some(field) = entry
+            .get("name")
+            .and_then(Item::as_str)
+            .and_then(|name| frame.field(name))
+        else {
+            continue;
+        };
+        // What this field would be read as today: its own word, or the frame's
+        // for want of one.
+        if stated(entry).unwrap_or(frame.endian) != field.endian {
+            entry["endian"] = toml_edit::value(word(field.endian));
+        }
+    }
 }
 
 /// What the model is not allowed to overwrite on a field the file already

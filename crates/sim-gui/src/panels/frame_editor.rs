@@ -171,6 +171,11 @@ fn draft_editor(ui: &mut Ui, state: &mut AppState) {
         ui.label("Name:");
         ui.text_edit_singleline(&mut draft.frame.name);
     });
+    let mut endian = draft.frame.endian;
+    super::frame_edit::byte_order(ui, &mut endian, None);
+    // Through the layout rather than by assignment: the fields that were
+    // following the frame have to keep following it.
+    crate::layout::set_endian(&mut draft.frame, endian);
     let mut description = draft.frame.description.clone().unwrap_or_default();
     ui.horizontal(|ui| {
         ui.label("Description:");
