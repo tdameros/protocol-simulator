@@ -299,6 +299,28 @@ impl FrameLibrary {
     }
 
     #[must_use]
+    pub fn types(&self) -> &TypeLibrary {
+        &self.types
+    }
+
+    /// The shared types a field may be declared as.
+    ///
+    /// `without` leaves one out, for the type editor: a type naming itself is
+    /// the one thing the loader refuses outright.
+    #[must_use]
+    pub fn shared_choices(&self, without: Option<&str>) -> Vec<crate::panels::frame_edit::Shared> {
+        self.type_entries
+            .iter()
+            .filter(|entry| Some(entry.definition.name()) != without)
+            .map(|entry| crate::panels::frame_edit::Shared {
+                name: entry.definition.name().to_owned(),
+                group: entry.definition.narrows.is_none(),
+                size: entry.definition.layout.size(),
+            })
+            .collect()
+    }
+
+    #[must_use]
     pub fn selected_type(&self) -> Option<&TypeEntry> {
         self.type_selected.and_then(|at| self.type_entries.get(at))
     }
@@ -825,7 +847,9 @@ mod tests {
     use super::*;
     use crate::layout;
     use sim_core::frame::value::Value;
-    use sim_core::frame::{Endianness, FieldDef, FieldKind, FieldSpan, ScalarType, ValueRange};
+    use sim_core::frame::{
+        Endianness, FieldDef, FieldKind, FieldSpan, ScalarType, Stated, ValueRange,
+    };
 
     const GOOD: &str = r#"
 name = "Telemetry"
@@ -1801,5 +1825,90 @@ covers = { from = "data", to = "data" }
         std::fs::remove_dir_all(dir.join(TYPES_DIR)).unwrap();
         assert_eq!(library.type_draft_problem(), first);
         assert!(library.type_draft_impact().is_empty());
+    }
+
+    /// The frame a technician would build: one byte, then a shared type.
+    #[test]
+    fn a_field_can_be_stated_as_a_shared_type_and_written_back_factorised() {
+        let (dir, mut library) = shared("state-as");
+        let types = library.types().clone();
+        library.begin_new(FrameDef::flat("Built", vec![plain("id"), plain("colour")]));
+        let draft = library.draft.as_mut().unwrap();
+
+        let stated = Stated {
+            kind: "Rgb".to_owned(),
+            repeat: None,
+            instances: None,
+        };
+        let expansion =
+            schema::instantiate(&types, "colour", "Rgb", &stated, draft.frame.endian).unwrap();
+        layout::state_as(&mut draft.frame, 1, Some(&stated), expansion);
+
+        // One declaration, three fields on the wire.
+        assert_eq!(draft.frame.declared, ["id", "colour"]);
+        assert_eq!(
+            draft
+                .frame
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "colour.red", "colour.green", "colour.blue"]
+        );
+        assert_eq!(draft.frame.size(), 4);
+
+        assert_eq!(library.draft_problem(), None);
+        library.save_draft(&suggested_file(&dir, "Built")).unwrap();
+
+        let written = std::fs::read_to_string(suggested_file(&dir, "Built")).unwrap();
+        assert!(written.contains(r#"type = "Rgb""#), "{written}");
+        assert!(!written.contains("colour.red"), "{written}");
+    }
+
+    #[test]
+    fn a_repeated_instance_expands_under_the_names_it_is_given() {
+        let (_, mut library) = shared("state-instances");
+        let types = library.types().clone();
+        library.begin_new(FrameDef::flat("Zones", vec![plain("zone")]));
+        let draft = library.draft.as_mut().unwrap();
+
+        let stated = Stated {
+            kind: "Rgb".to_owned(),
+            repeat: None,
+            instances: Some(vec!["left".to_owned(), "right".to_owned()]),
+        };
+        let expansion =
+            schema::instantiate(&types, "zone", "Rgb", &stated, draft.frame.endian).unwrap();
+        layout::state_as(&mut draft.frame, 0, Some(&stated), expansion);
+
+        assert_eq!(draft.frame.declared, ["zone"]);
+        assert_eq!(draft.frame.size(), 6);
+        assert!(draft.frame.field_index("zone.right.blue").is_some());
+        assert_eq!(library.draft_problem(), None);
+    }
+
+    #[test]
+    fn dropping_the_type_leaves_one_plain_field_again() {
+        let (_, mut library) = shared("state-drop");
+        let types = library.types().clone();
+        library.begin_new(FrameDef::flat("Built", vec![plain("colour")]));
+        let draft = library.draft.as_mut().unwrap();
+
+        let stated = Stated {
+            kind: "Rgb".to_owned(),
+            repeat: Some(2),
+            instances: None,
+        };
+        let expansion =
+            schema::instantiate(&types, "colour", "Rgb", &stated, draft.frame.endian).unwrap();
+        layout::state_as(&mut draft.frame, 0, Some(&stated), expansion);
+        assert_eq!(draft.frame.fields.len(), 6);
+
+        layout::state_as(&mut draft.frame, 0, None, vec![plain("colour")]);
+
+        assert_eq!(draft.frame.declared, ["colour"]);
+        assert_eq!(draft.frame.fields.len(), 1);
+        assert!(draft.frame.stated.is_empty());
+        assert_eq!(library.draft_problem(), None);
     }
 }

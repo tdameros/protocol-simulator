@@ -514,6 +514,44 @@ pub fn to_toml(frame: &FrameDef) -> Result<String, SchemaError> {
     Ok(toml::to_string_pretty(&lower(frame))?)
 }
 
+/// The fields naming a type contributes, under the name it is given.
+///
+/// The expansion rules live in one place and this is how an editor reaches
+/// them: reimplementing `zone.left.led[0].mode` on the other side of the crate
+/// would drift the day either side changed.
+///
+/// # Errors
+///
+/// Returns an error if the type is unknown, or the instance not valid.
+pub fn instantiate(
+    library: &TypeLibrary,
+    name: &str,
+    kind: &str,
+    stated: &Stated,
+    endian: Endianness,
+) -> Result<Vec<FieldDef>, SchemaError> {
+    let frame = build(
+        RawFrame {
+            name: String::new(),
+            description: None,
+            endian: Some(match endian {
+                Endianness::Big => RawEndian::Big,
+                Endianness::Little => RawEndian::Little,
+            }),
+            types: Vec::new(),
+            fields: vec![RawField {
+                name: name.to_owned(),
+                kind: kind.to_owned(),
+                repeat: stated.repeat,
+                instances: stated.instances.clone(),
+                ..RawField::default()
+            }],
+        },
+        library,
+    )?;
+    Ok(frame.fields)
+}
+
 /// Writes a frame back into the text it was loaded from.
 ///
 /// Unlike [`to_toml`], which serialises the expanded layout and so loses both
@@ -815,32 +853,6 @@ fn sections(table: &toml_edit::Table, key: &str) -> Vec<toml_edit::Table> {
 
 fn as_document(frame: &FrameDef) -> Result<toml_edit::DocumentMut, SchemaError> {
     let mut raw = lower(frame);
-    // A field the file did not write is one this frame cannot describe on its
-    // own, so it has no business being written back.
-    raw.fields
-        .retain(|field| frame.declared.contains(&field.name));
-    // A declared field standing for several on the wire has no field of its own
-    // to lower, only the leaves it produced. What it was written as is the one
-    // record of it, and without this a type instance could be shown and moved
-    // about but never written.
-    for (at, name) in frame.declared.iter().enumerate() {
-        let Some(stated) = frame.stated.get(name) else {
-            continue;
-        };
-        if raw.fields.iter().any(|held| held.name == *name) {
-            continue;
-        }
-        raw.fields.insert(
-            at.min(raw.fields.len()),
-            RawField {
-                name: name.clone(),
-                kind: stated.kind.clone(),
-                repeat: stated.repeat,
-                instances: stated.instances.clone(),
-                ..RawField::default()
-            },
-        );
-    }
     // A field inheriting the frame's order says nothing about it, as the file
     // does. One that differs has to say so, or it would be read back as the
     // frame's and quietly change what goes on the wire.
@@ -1723,15 +1735,45 @@ fn lower(frame: &FrameDef) -> RawFrame {
             Endianness::Big => RawEndian::Big,
             Endianness::Little => RawEndian::Little,
         }),
-        // Types are resolved at load time, so what is written back is the
-        // expanded layout: identical on the wire, no longer factorised.
+        // A frame carries the names of the types it uses, not their
+        // definitions, so what it is written into has to hold them already.
         types: Vec::new(),
-        fields: frame
-            .fields
-            .iter()
-            .map(|field| lower_field(field, frame))
-            .collect(),
+        fields: declared_fields(frame),
     }
+}
+
+/// The fields a file would write, which is not the fields on the wire.
+///
+/// A field that came out of a type is left out, and the declaration that
+/// produced it put back in its place. Writing the expansion instead would be
+/// correct on the wire and would throw away the factorisation someone took the
+/// trouble to write.
+fn declared_fields(frame: &FrameDef) -> Vec<RawField> {
+    let mut fields: Vec<RawField> = frame
+        .fields
+        .iter()
+        .filter(|field| frame.declared.contains(&field.name))
+        .map(|field| lower_field(field, frame))
+        .collect();
+    for (at, name) in frame.declared.iter().enumerate() {
+        let Some(stated) = frame.stated.get(name) else {
+            continue;
+        };
+        if fields.iter().any(|held| held.name == *name) {
+            continue;
+        }
+        fields.insert(
+            at.min(fields.len()),
+            RawField {
+                name: name.clone(),
+                kind: stated.kind.clone(),
+                repeat: stated.repeat,
+                instances: stated.instances.clone(),
+                ..RawField::default()
+            },
+        );
+    }
+    fields
 }
 
 fn lower_field(field: &FieldDef, frame: &FrameDef) -> RawField {
@@ -2720,24 +2762,25 @@ repeat = 2
     /// from simply re-serialising whatever it is shown. `declared` is the only
     /// thing that can tell the two apart, which is why it exists.
     #[test]
-    fn writing_an_expanded_frame_keeps_the_wire_and_loses_the_factorisation() {
+    fn writing_an_expanded_frame_keeps_the_factorisation_that_produced_it() {
         let frame = from_toml(LED_BANK).unwrap();
-        let reparsed = from_toml(&to_toml(&frame).unwrap()).expect("rendered toml should parse");
-
-        // Byte for byte the same frame.
-        assert_eq!(frame.fields, reparsed.fields);
-        assert_eq!(frame.size(), reparsed.size());
-
-        // Three entries in the file became fourteen.
         assert_eq!(frame.declared, ["header", "led", "crc"]);
-        assert_eq!(reparsed.declared.len(), reparsed.fields.len());
-        assert!(reparsed.declared.len() > frame.declared.len());
-        assert_eq!(frame.generated_by("led[0].mode"), Some("led"));
-        assert_eq!(
-            reparsed.generated_by("led[0].mode"),
-            None,
-            "flattened, it is nobody's expansion any more"
-        );
+
+        let written = to_toml(&frame).unwrap();
+
+        // Three entries in, three entries out. Writing the fourteen fields the
+        // three produce would be the same bytes on the wire and would throw
+        // away the type that says why they are there.
+        assert!(written.contains(r#"type = "LedConfig""#), "{written}");
+        assert!(!written.contains("led[0].mode"), "{written}");
+
+        // A frame carries the names of its types, not their definitions, so
+        // reading it back needs them defined where it lands.
+        let mut library = TypeLibrary::default();
+        library.merge_toml(LED_BANK).unwrap();
+        let reparsed = from_toml_with(&written, &library).expect("rendered toml should parse");
+        assert_eq!(frame, reparsed);
+        assert_eq!(reparsed.generated_by("led[0].mode"), Some("led"));
     }
 
     #[test]

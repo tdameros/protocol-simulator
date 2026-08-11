@@ -5,14 +5,13 @@
 //! technician cannot name a kind that does not exist. What the editor cannot
 //! express, it shows and refuses to touch rather than quietly rewording.
 
-use std::collections::BTreeMap;
-
 use egui::{collapsing_header::CollapsingState, ComboBox, Id, RichText, Ui};
 use egui_phosphor::regular as icons;
 use sim_core::frame::checksum::{ChecksumSpec, CrcSpec};
+use sim_core::frame::schema::{self, TypeLibrary};
 use sim_core::frame::value::Value;
 use sim_core::frame::{
-    BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType,
+    BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType, Stated,
     ValueRange,
 };
 
@@ -37,6 +36,15 @@ const SCALARS: [ScalarType; 10] = [
     ScalarType::F64,
 ];
 
+/// A type the folder shares, as the picker offers it.
+#[derive(Clone)]
+pub struct Shared {
+    pub name: String,
+    /// A group puts several fields on the wire; a subtype stays one scalar.
+    pub group: bool,
+    pub size: usize,
+}
+
 /// What one pass over the editor decided to do, applied once the drawing is
 /// over so that nothing is read after it has been changed underneath.
 enum Edit {
@@ -45,26 +53,25 @@ enum Edit {
     Move(usize, bool),
     Rename(usize, String),
     Kind(usize, FieldKind),
+    /// Written as a named type, or back to a plain field.
+    State(usize, Option<Stated>),
 }
 
 pub fn fields(ui: &mut Ui, state: &mut AppState) {
     let hex = state.hex_values;
+    let shared = state.frames.shared_choices(None);
+    let types = state.frames.types().clone();
     let Some(draft) = &mut state.frames.draft else {
         return;
     };
-    let stated = draft
-        .origin
-        .as_ref()
-        .map(|origin| origin.stated.clone())
-        .unwrap_or_default();
-    layout(ui, &mut draft.frame, hex, &stated);
+    layout(ui, &mut draft.frame, hex, &shared, &types);
 }
 
 /// One pass over a field list, whoever it belongs to.
 ///
-/// `stated` names the declared fields the file writes through a named type,
-/// which are shown but not reworded.
-pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool, stated: &BTreeMap<String, String>) {
+/// `shared` is what the folder's `types/` offers, which the kind picker lists
+/// after the builtins.
+pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool, shared: &[Shared], types: &TypeLibrary) {
     // Drawn from a copy so a row may decide to remove itself without the rest
     // of the pass reading a list that has moved under it.
     let frame = list.clone();
@@ -79,7 +86,8 @@ pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool, stated: &BTreeMap<Str
                 index,
                 declared,
                 hex,
-                stated: stated.get(declared).map(String::as_str),
+                stated: layout::stated_of(&frame, index).cloned(),
+                shared,
             },
             &mut edit,
         );
@@ -106,6 +114,10 @@ pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool, stated: &BTreeMap<Str
         }
         Some(Edit::Move(index, down)) => layout::move_field(list, index, down),
         Some(Edit::Rename(index, name)) => layout::rename_field(list, index, &name),
+        Some(Edit::State(index, stated)) => {
+            let expansion = restate(list, index, stated.as_ref(), types);
+            layout::state_as(list, index, stated.as_ref(), expansion);
+        }
         Some(Edit::Kind(index, kind)) => {
             if let Some(field) = layout::plain_field_mut(list, index) {
                 // A default that still means something under the new kind is
@@ -127,9 +139,9 @@ struct Row<'a> {
     index: usize,
     declared: &'a str,
     hex: bool,
-    /// The type the file states this field as, which is what cannot be
-    /// reworded here.
-    stated: Option<&'a str>,
+    /// How the file states this field, when a name alone would not say it.
+    stated: Option<Stated>,
+    shared: &'a [Shared],
 }
 
 fn field_row(
@@ -143,10 +155,17 @@ fn field_row(
         index,
         declared,
         hex,
-        stated,
+        ..
     } = *row;
+    let stated = row.stated.clone();
+    // A field the model still holds under its own name is one the editor may
+    // reword; anything else came out of a type and is shown as it stands.
+    let named_type = stated
+        .as_ref()
+        .map(|stated| stated.kind.clone())
+        .filter(|kind| row.shared.iter().any(|held| held.name == *kind));
     let id = Id::new(("frame_field", index, declared));
-    let expanded = layout::is_expanded(layout, declared);
+    let expanded = layout::is_expanded(layout, declared) && named_type.is_none();
     CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
             if ui
@@ -192,20 +211,20 @@ fn field_row(
             let mut name = declared.to_owned();
             if ui
                 .add_enabled(
-                    stated.is_none(),
+                    named_type.is_none(),
                     egui::TextEdit::singleline(&mut name).desired_width(NAME_WIDTH),
                 )
                 .changed()
             {
                 *edit = Some(Edit::Rename(index, name));
             }
-            match stated {
+            match &named_type {
                 // Its type, its bounds and its name all come from somewhere
                 // else, so the only honest thing to show is where.
                 Some(kind) => {
                     ui.label(RichText::new(kind).italics());
                 }
-                None => kind_picker(ui, layout, frame, index, edit),
+                None => kind_picker(ui, layout, frame, row, edit),
             }
         })
         .body(|ui| {
@@ -223,12 +242,14 @@ fn field_row(
                 ui.label(RichText::new("Stated as a type, and edited where the type is.").weak());
                 return;
             }
-            if let Some(kind) = stated {
+            if let Some(kind) = &named_type {
                 ui.label(
                     RichText::new(format!("Stated as {kind}, and edited where {kind} is.")).weak(),
                 );
+                repeats(ui, row, edit);
+                return;
             }
-            details(ui, layout, frame, index, hex, stated.is_some());
+            details(ui, layout, frame, index, hex, false);
         });
 }
 
@@ -236,9 +257,10 @@ fn kind_picker(
     ui: &mut Ui,
     layout: &FrameDef,
     frame: &FrameDef,
-    index: usize,
+    row: &Row<'_>,
     edit: &mut Option<Edit>,
 ) {
+    let index = row.index;
     let Some(field) = layout::plain_field(layout, index) else {
         return;
     };
@@ -258,7 +280,105 @@ fn kind_picker(
                     *edit = Some(Edit::Kind(index, kind));
                 }
             }
+
+            if row.shared.is_empty() {
+                return;
+            }
+            ui.separator();
+            ui.label(RichText::new("shared").weak());
+            for held in row.shared {
+                let said = if held.group {
+                    format!("{}  {} bytes", held.name, held.size)
+                } else {
+                    held.name.clone()
+                };
+                if ui.selectable_label(false, said).clicked() {
+                    *edit = Some(Edit::State(
+                        index,
+                        Some(Stated {
+                            kind: held.name.clone(),
+                            repeat: None,
+                            instances: None,
+                        }),
+                    ));
+                }
+            }
         });
+}
+
+/// How many of it, for a field written as a type.
+///
+/// One, a count, or a list of names. A count gives `led[0]`, a list gives
+/// `zone.left`, which is what makes a received frame readable against a
+/// datasheet rather than against an index.
+fn repeats(ui: &mut Ui, row: &Row<'_>, edit: &mut Option<Edit>) {
+    let Some(stated) = &row.stated else {
+        return;
+    };
+    let mut wanted = stated.clone();
+    let mut changed = false;
+
+    ui.horizontal(|ui| {
+        ui.label("How many:");
+        let one = wanted.repeat.is_none() && wanted.instances.is_none();
+        if ui.selectable_label(one, "one").clicked() && !one {
+            wanted.repeat = None;
+            wanted.instances = None;
+            changed = true;
+        }
+        let counted = wanted.repeat.is_some();
+        if ui.selectable_label(counted, "counted").clicked() && !counted {
+            wanted.repeat = Some(2);
+            wanted.instances = None;
+            changed = true;
+        }
+        let named = wanted.instances.is_some();
+        if ui.selectable_label(named, "named").clicked() && !named {
+            wanted.instances = Some(vec!["left".to_owned(), "right".to_owned()]);
+            wanted.repeat = None;
+            changed = true;
+        }
+    });
+
+    if let Some(count) = &mut wanted.repeat {
+        ui.horizontal(|ui| {
+            ui.label("Count:");
+            changed |= ui.add(number(count, None).range(1..=256)).changed();
+        });
+    }
+    if let Some(names) = &mut wanted.instances {
+        let mut drop = None;
+        for (at, name) in names.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(name)
+                            .id_salt(("instance", row.index, at))
+                            .desired_width(NAME_WIDTH),
+                    )
+                    .changed();
+                if ui.button(icons::MINUS).clicked() {
+                    drop = Some(at);
+                }
+            });
+        }
+        if let Some(at) = drop {
+            names.remove(at);
+            changed = true;
+        }
+        if ui.button(format!("{} Add instance", icons::PLUS)).clicked() {
+            let mut fresh = format!("copy{}", names.len());
+            while names.contains(&fresh) {
+                fresh.push('_');
+            }
+            names.push(fresh);
+            changed = true;
+        }
+    }
+
+    if changed {
+        *edit = Some(Edit::State(row.index, Some(wanted)));
+    }
 }
 
 /// The kind-specific part of a field, below the row that names it.
@@ -635,4 +755,27 @@ pub fn byte_order(ui: &mut Ui, endian: &mut Endianness, inherited: Option<Endian
             }
         }
     });
+}
+
+/// The fields a restated declaration puts on the wire.
+///
+/// A field going back to being plain keeps the one it already had, so that
+/// dropping a type does not also drop its name and its byte order.
+fn restate(
+    list: &FrameDef,
+    index: usize,
+    stated: Option<&Stated>,
+    types: &TypeLibrary,
+) -> Vec<FieldDef> {
+    let Some(name) = list.declared.get(index) else {
+        return Vec::new();
+    };
+    let endian = list.endian;
+    match stated {
+        Some(stated) => schema::instantiate(types, name, &stated.kind, stated, endian)
+            // An instance the library cannot expand leaves the field as it
+            // stands, which the guard will then refuse to save.
+            .unwrap_or_else(|_| list.fields[list.expansion_of(name)].to_vec()),
+        None => vec![blank_field(endian)],
+    }
 }
