@@ -67,14 +67,41 @@ pub fn add_field(layout: &mut FrameDef, index: Option<usize>, field: FieldDef) {
 }
 
 /// Removes a declared field, and everything it expanded into.
-pub fn remove_field(layout: &mut FrameDef, index: usize) {
+///
+/// Refused where it would leave a checksum in front of the frame, which is a
+/// checksum with nothing to cover. Better said before the click than produced
+/// and complained about afterwards, since the way back is not obvious: fields
+/// are only ever added at the end.
+pub fn remove_field(layout: &mut FrameDef, index: usize) -> bool {
+    if !may_remove(layout, index) {
+        return false;
+    }
     let Some(name) = layout.declared.get(index).cloned() else {
-        return;
+        return false;
     };
     with_spans_kept(layout, |layout| {
         layout.fields.drain(layout.expansion_of(&name));
         layout.declared.remove(index);
     });
+    true
+}
+
+/// Whether removing the declared field at `index` would leave a frame that
+/// still means something.
+#[must_use]
+pub fn may_remove(layout: &FrameDef, index: usize) -> bool {
+    let Some(name) = layout.declared.get(index) else {
+        return false;
+    };
+    let gone = layout.expansion_of(name);
+    // Nothing to check unless the removal reaches the front of the frame.
+    if gone.start != 0 {
+        return true;
+    }
+    !matches!(
+        layout.fields.get(gone.end).map(|field| &field.kind),
+        Some(FieldKind::Checksum { .. })
+    )
 }
 
 /// Moves a declared field one place up or down, expansion and all.
@@ -96,6 +123,15 @@ pub fn move_field(layout: &mut FrameDef, index: usize, down: bool) {
     ) else {
         return;
     };
+
+    if first == 0
+        && matches!(
+            layout.field(&below).map(|field| &field.kind),
+            Some(FieldKind::Checksum { .. })
+        )
+    {
+        return;
+    }
 
     with_spans_kept(layout, |layout| {
         let above = layout.expansion_of(&above);

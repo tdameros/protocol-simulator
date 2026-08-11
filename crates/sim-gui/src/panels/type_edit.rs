@@ -8,7 +8,9 @@
 
 use egui::{ComboBox, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
-use sim_core::frame::schema::{Subtype, TypeDef};
+use std::collections::BTreeMap;
+
+use sim_core::frame::schema::{self, Subtype, TypeDef};
 use sim_core::frame::{FrameDef, ScalarType, ValueRange};
 
 use crate::frames::Effect;
@@ -116,6 +118,9 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
         return;
     };
     let subtype = draft.definition.narrows.is_some();
+    let stated = draft.origin.as_ref().map_or_else(BTreeMap::new, |origin| {
+        schema::type_stated_as_types(&origin.text, &origin.name)
+    });
 
     ui.horizontal(|ui| {
         ui.label(if subtype { "Subtype:" } else { "Type:" });
@@ -141,7 +146,12 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
         .max_height(ui.available_height() * 0.5)
         .show(ui, |ui| match &mut draft.definition.narrows {
             Some(narrows) => narrowing(ui, narrows),
-            None => super::frame_edit::layout(ui, &mut draft.definition.layout, state.hex_values),
+            None => super::frame_edit::layout(
+                ui,
+                &mut draft.definition.layout,
+                state.hex_values,
+                &stated,
+            ),
         });
 
     ui.separator();

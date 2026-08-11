@@ -472,3 +472,20 @@ fn adding_a_field_to_the_first_of_two_types_does_not_give_it_to_the_second() {
         ["left", "right"]
     );
 }
+
+#[test]
+fn two_bits_of_one_name_are_refused_rather_than_sharing_a_value() {
+    let text = r#"
+name = "Dup"
+[[field]]
+name = "flags"
+type = "bits"
+repr = "u8"
+bits = [{ name = "value", width = 1 }, { name = "spare", width = 3 }, { name = "spare", width = 4 }]
+"#;
+    // Values are held against a bitfield by name, so the two would share one
+    // entry: setting either set both, and the second copy went out carrying a
+    // number nobody put there.
+    let error = schema::from_toml(text).expect_err("refused");
+    assert!(error.to_string().contains("spare"), "{error}");
+}
