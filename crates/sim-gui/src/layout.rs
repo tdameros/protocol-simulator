@@ -38,17 +38,20 @@ pub fn rename_field(layout: &mut FrameDef, index: usize, name: &str) {
     let Some(old) = layout.declared.get(index).cloned() else {
         return;
     };
-    // Refused for a field the file states as a named type, for the same reason
-    // it is refused for an expanded one: the writer keeps the word the file
-    // used, and has nowhere to put the new name.
-    if name == old || is_expanded(layout, &old) || layout.stated.contains_key(&old) {
+    if name == old || name.is_empty() {
         return;
     }
-    let Some(at) = layout.field_index(&old) else {
-        return;
-    };
-    // Nothing moves, so the ranges stored as indices still hold.
-    name.clone_into(&mut layout.fields[at].name);
+    // Nothing moves, so the ranges stored as indices still hold, whether this
+    // renames one field or the twenty a type expanded into.
+    for at in layout.expansion_of(&old) {
+        // The tail is what expansion appended, and it follows the name it was
+        // appended to: `colour.red` under `tint` is `tint.red`.
+        let tail = layout.fields[at].name[old.len()..].to_owned();
+        layout.fields[at].name = format!("{name}{tail}");
+    }
+    if let Some(stated) = layout.stated.remove(&old) {
+        layout.stated.insert(name.to_owned(), stated);
+    }
     name.clone_into(&mut layout.declared[index]);
 }
 

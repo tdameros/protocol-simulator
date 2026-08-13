@@ -1372,11 +1372,37 @@ covers = { from = "header", to = "here" }
     }
 
     #[test]
-    fn renaming_a_type_instance_is_refused_rather_than_shown_and_lost() {
-        let mut draft = draft_of(LAYERED);
+    fn renaming_a_type_instance_carries_its_expansion_and_is_written_back() {
+        let mut draft = Draft {
+            origin: Some(Origin {
+                file: PathBuf::from("layered.toml"),
+                stated: schema::stated_as_types(LAYERED),
+                text: LAYERED.to_owned(),
+            }),
+            ..draft_of(LAYERED)
+        };
         layout::rename_field(&mut draft.frame, 1, "corner");
 
-        assert_eq!(draft.frame.declared, ["header", "here", "crc"]);
+        assert_eq!(draft.frame.declared, ["header", "corner", "crc"]);
+        assert_eq!(
+            draft
+                .frame
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["header", "corner.x", "corner.y", "crc"]
+        );
+        // The checksum still covers the same three fields under their new names.
+        assert_eq!(
+            covered(&draft),
+            ("header".to_owned(), "corner.y".to_owned())
+        );
+
+        assert_eq!(draft.problem(&TypeLibrary::default()), None);
+        let written = draft.written().expect("written");
+        assert!(written.contains(r#"name = "corner""#), "{written}");
+        assert!(written.contains(r#"type = "Point""#), "{written}");
     }
 
     #[test]
@@ -2030,5 +2056,67 @@ covers = { from = "data", to = "data" }
         let text = std::fs::read_to_string(dir.join(TYPES_DIR).join("shared.toml")).unwrap();
         assert!(text.contains(r#"base = "u8""#), "{text}");
         assert!(!text.contains(r#"name = "red""#), "{text}");
+    }
+
+    #[test]
+    fn a_field_set_to_a_type_by_mistake_can_be_set_back() {
+        let (_, mut library) = shared("state-undo");
+        let types = library.types().clone();
+        library.begin_new(FrameDef::flat("Built", vec![plain("colour")]));
+        let draft = library.draft.as_mut().unwrap();
+
+        let stated = Stated {
+            kind: "Rgb".to_owned(),
+            repeat: None,
+            instances: None,
+        };
+        let expansion =
+            schema::instantiate(&types, "colour", "Rgb", &stated, draft.frame.endian).unwrap();
+        layout::state_as(&mut draft.frame, 0, Some(&stated), expansion);
+        assert_eq!(draft.frame.fields.len(), 3);
+
+        // What the kind picker does when a builtin is chosen on it: back to one
+        // plain field, under the name the frame still declares.
+        layout::state_as(
+            &mut draft.frame,
+            0,
+            None,
+            vec![FieldDef {
+                name: "colour".to_owned(),
+                ..plain("colour")
+            }],
+        );
+
+        assert_eq!(draft.frame.declared, ["colour"]);
+        assert_eq!(draft.frame.fields.len(), 1);
+        assert_eq!(draft.frame.fields[0].name, "colour");
+        assert!(draft.frame.stated.is_empty());
+        assert_eq!(library.draft_problem(), None);
+    }
+
+    #[test]
+    fn a_field_written_as_a_type_can_still_be_renamed() {
+        let (_, mut library) = shared("state-rename");
+        let types = library.types().clone();
+        library.begin_new(FrameDef::flat("Built", vec![plain("field")]));
+        let draft = library.draft.as_mut().unwrap();
+
+        let stated = Stated {
+            kind: "Rgb".to_owned(),
+            repeat: None,
+            instances: None,
+        };
+        let expansion =
+            schema::instantiate(&types, "field", "Rgb", &stated, draft.frame.endian).unwrap();
+        layout::state_as(&mut draft.frame, 0, Some(&stated), expansion);
+
+        // Add field names it "field"; being stuck with `field.red` afterwards
+        // is not a frame anybody meant to build.
+        layout::rename_field(&mut draft.frame, 0, "tint");
+
+        assert_eq!(draft.frame.declared, ["tint"]);
+        assert!(draft.frame.field_index("tint.green").is_some());
+        assert_eq!(draft.frame.stated.keys().collect::<Vec<_>>(), ["tint"]);
+        assert_eq!(library.draft_problem(), None);
     }
 }

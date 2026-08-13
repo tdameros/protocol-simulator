@@ -119,6 +119,12 @@ pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool, shared: &[Shared], ty
             layout::state_as(list, index, stated.as_ref(), expansion);
         }
         Some(Edit::Kind(index, kind)) => {
+            // A field written as a type has no field of its own to change, so
+            // it goes back to being plain first.
+            if layout::stated_of(list, index).is_some() {
+                let expansion = restate(list, index, None, types);
+                layout::state_as(list, index, None, expansion);
+            }
             if let Some(field) = layout::plain_field_mut(list, index) {
                 // A default that still means something under the new kind is
                 // kept, the rest starting clean rather than half converted.
@@ -210,22 +216,12 @@ fn field_row(
 
             let mut name = declared.to_owned();
             if ui
-                .add_enabled(
-                    named_type.is_none(),
-                    egui::TextEdit::singleline(&mut name).desired_width(NAME_WIDTH),
-                )
+                .add(egui::TextEdit::singleline(&mut name).desired_width(NAME_WIDTH))
                 .changed()
             {
                 *edit = Some(Edit::Rename(index, name));
             }
-            match &named_type {
-                // Its type, its bounds and its name all come from somewhere
-                // else, so the only honest thing to show is where.
-                Some(kind) => {
-                    ui.label(RichText::new(kind).italics());
-                }
-                None => kind_picker(ui, layout, frame, row, edit),
-            }
+            kind_picker(ui, layout, frame, row, edit);
         })
         .body(|ui| {
             if expanded {
@@ -243,10 +239,27 @@ fn field_row(
                 return;
             }
             if let Some(kind) = &named_type {
-                ui.label(
-                    RichText::new(format!("Stated as {kind}, and edited where {kind} is.")).weak(),
-                );
                 repeats(ui, row, edit);
+                // What the type puts on the wire, which is the thing worth
+                // seeing here. Changing any of it means changing the type,
+                // above under Shared types, since every frame naming it would
+                // change with it.
+                for at in frame.expansion_of(declared) {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  {}",
+                            frame.fields[at].name,
+                            frame.fields[at].kind.type_name()
+                        ))
+                        .weak(),
+                    );
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "Shared: editing {kind} changes every frame naming it."
+                    ))
+                    .weak(),
+                );
                 return;
             }
             details(ui, layout, frame, index, hex, false);
@@ -261,10 +274,13 @@ fn kind_picker(
     edit: &mut Option<Edit>,
 ) {
     let index = row.index;
-    let Some(field) = layout::plain_field(layout, index) else {
-        return;
+    let current = match &row.stated {
+        Some(stated) => stated.kind.clone(),
+        None => match layout::plain_field(layout, index) {
+            Some(field) => label_of(&field.kind),
+            None => return,
+        },
     };
-    let current = label_of(&field.kind);
     ComboBox::from_id_salt(("frame_kind", index))
         .selected_text(current.clone())
         .width(ui.spacing().interact_size.x * 3.0)
@@ -292,7 +308,8 @@ fn kind_picker(
                 } else {
                     held.name.clone()
                 };
-                if ui.selectable_label(false, said).clicked() {
+                if ui.selectable_label(current == held.name, said).clicked() && current != held.name
+                {
                     *edit = Some(Edit::State(
                         index,
                         Some(Stated {
@@ -776,6 +793,11 @@ fn restate(
             // An instance the library cannot expand leaves the field as it
             // stands, which the guard will then refuse to save.
             .unwrap_or_else(|_| list.fields[list.expansion_of(name)].to_vec()),
-        None => vec![blank_field(endian)],
+        // Named after the declaration it replaces, or the model would hold a
+        // field the frame does not declare.
+        None => vec![FieldDef {
+            name: name.clone(),
+            ..blank_field(endian)
+        }],
     }
 }
