@@ -447,6 +447,21 @@ impl FrameLibrary {
         if draft.definition.narrows.is_none() && draft.definition.layout.fields.is_empty() {
             return Some(format!("{name} needs at least one field"));
         }
+        // The name is not the file. Two names folding to one path would see the
+        // save take the other type's definition with it, saying nothing.
+        if draft.origin.is_none() {
+            let wanted = self.types_file(draft);
+            if let Some(held) = self.type_entries.iter().find(|entry| entry.file == wanted) {
+                return Some(format!(
+                    "{} already holds {}",
+                    file_label(&wanted),
+                    held.definition.name()
+                ));
+            }
+            if wanted.exists() {
+                return Some(format!("{} already exists", file_label(&wanted)));
+            }
+        }
 
         let Some(candidate) = self.candidate_types() else {
             return Some("the types folder cannot be read as it stands".to_owned());
@@ -464,11 +479,11 @@ impl FrameLibrary {
     /// The library as it would be with the draft saved.
     fn candidate_types(&self) -> Option<TypeLibrary> {
         let draft = self.type_draft.as_ref()?;
-        let written = self.type_text(draft).ok()?;
+        let written = Self::type_text(draft).ok()?;
         let edited = draft
             .origin
             .as_ref()
-            .map_or_else(|| self.types_file(), |origin| origin.file.clone());
+            .map_or_else(|| self.types_file(draft), |origin| origin.file.clone());
 
         let mut candidate = TypeLibrary::default();
         let directory = self.directory.as_ref()?.join(TYPES_DIR);
@@ -485,28 +500,19 @@ impl FrameLibrary {
     }
 
     /// The text saving the type draft would write.
-    fn type_text(&self, draft: &TypeDraft) -> Result<String, schema::SchemaError> {
+    fn type_text(draft: &TypeDraft) -> Result<String, schema::SchemaError> {
         match &draft.origin {
+            // Edited where it lives, which for a file somebody wrote by hand
+            // may hold several types and their comments.
             Some(origin) => schema::update_type_in(&origin.text, &origin.name, &draft.definition),
-            None => match std::fs::read_to_string(self.types_file()) {
-                Ok(text) => {
-                    schema::update_type_in(&text, draft.definition.name(), &draft.definition)
-                }
-                Err(_) => schema::type_to_toml(&draft.definition),
-            },
+            None => schema::type_to_toml(&draft.definition),
         }
     }
 
     /// Where a type nobody has saved yet belongs.
-    ///
-    /// One file for everything shared, unless someone has made others: types
-    /// name each other freely, so splitting them buys nothing and a technician
-    /// should not have to choose.
-    fn types_file(&self) -> PathBuf {
-        let directory = self.directory.clone().unwrap_or_default().join(TYPES_DIR);
-        self.type_entries
-            .first()
-            .map_or_else(|| directory.join("types.toml"), |entry| entry.file.clone())
+    fn types_file(&self, draft: &TypeDraft) -> PathBuf {
+        let directory = self.directory.clone().unwrap_or_default();
+        suggested_type_file(&directory, draft.definition.name())
     }
 
     /// Writes the type draft to disk and reloads, every frame naming it having
@@ -526,9 +532,8 @@ impl FrameLibrary {
         let file = draft
             .origin
             .as_ref()
-            .map_or_else(|| self.types_file(), |origin| origin.file.clone());
-        let written = self
-            .type_text(&draft)
+            .map_or_else(|| self.types_file(&draft), |origin| origin.file.clone());
+        let written = Self::type_text(&draft)
             .with_context(|| format!("cannot describe {}", draft.definition.name()))?;
 
         if let Some(parent) = file.parent() {
@@ -555,8 +560,18 @@ impl FrameLibrary {
             .with_context(|| format!("cannot read {}", entry.file.display()))?;
         let written = schema::remove_type_from(&text, entry.definition.name())
             .with_context(|| format!("cannot remove {}", entry.definition.name()))?;
-        std::fs::write(&entry.file, written)
-            .with_context(|| format!("cannot write {}", entry.file.display()))?;
+
+        // A types file holding no types is not a file worth keeping, and with
+        // one type per file that is the usual outcome rather than the odd one.
+        let mut left = TypeLibrary::default();
+        let holds_nothing = left.merge_toml(&written).is_ok() && left.is_empty();
+        if holds_nothing {
+            std::fs::remove_file(&entry.file)
+                .with_context(|| format!("cannot remove {}", entry.file.display()))?;
+        } else {
+            std::fs::write(&entry.file, written)
+                .with_context(|| format!("cannot write {}", entry.file.display()))?;
+        }
 
         self.reload();
         Ok(())
@@ -818,6 +833,22 @@ fn disagreement(wanted: &FrameDef, got: &FrameDef) -> String {
 /// The file a frame of this name would go in, had it none yet.
 #[must_use]
 pub fn suggested_file(directory: &Path, name: &str) -> PathBuf {
+    file_named(directory, name, "frame")
+}
+
+/// The file a shared type of this name would go in, had it none yet.
+///
+/// One type per file, as one frame per file: the path is then the whole of its
+/// identity, deleting it is deleting the file, and nobody has to be asked which
+/// of several files a new type belongs in. Types name each other across files
+/// freely, the library being merged before anything is resolved, so keeping
+/// them together buys nothing.
+#[must_use]
+pub fn suggested_type_file(directory: &Path, name: &str) -> PathBuf {
+    file_named(&directory.join(TYPES_DIR), name, "type")
+}
+
+fn file_named(directory: &Path, name: &str, fallback: &str) -> PathBuf {
     let stem: String = name
         .chars()
         .map(|character| {
@@ -831,7 +862,7 @@ pub fn suggested_file(directory: &Path, name: &str) -> PathBuf {
     let stem = stem.trim_matches('-').to_owned();
     directory.join(format!(
         "{}.toml",
-        if stem.is_empty() { "frame" } else { &stem }
+        if stem.is_empty() { fallback } else { &stem }
     ))
 }
 
@@ -846,6 +877,7 @@ fn file_label(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::layout;
+    use sim_core::frame::schema::Subtype;
     use sim_core::frame::value::Value;
     use sim_core::frame::{
         Endianness, FieldDef, FieldKind, FieldSpan, ScalarType, Stated, ValueRange,
@@ -1593,7 +1625,7 @@ type = "Rgb"
     }
 
     #[test]
-    fn a_type_nobody_saved_yet_lands_beside_the_ones_already_there() {
+    fn a_type_nobody_saved_yet_gets_a_file_of_its_own() {
         let (dir, mut library) = shared("types-new");
         library.begin_new_type(TypeDef {
             layout: FrameDef::flat(
@@ -1624,9 +1656,65 @@ type = "Rgb"
         library.save_type_draft().unwrap();
 
         assert_eq!(library.type_entries.len(), 3);
-        let text = std::fs::read_to_string(dir.join(TYPES_DIR).join("shared.toml")).unwrap();
-        assert!(text.contains("# Three bytes of colour."));
-        assert!(text.contains(r#"name = "Pair""#));
+        // Its own file, named after it, as a frame gets one.
+        let own = dir.join(TYPES_DIR).join("pair.toml");
+        assert!(own.exists(), "{own:?}");
+        assert!(std::fs::read_to_string(&own)
+            .unwrap()
+            .contains(r#"name = "Pair""#));
+        // And the file it did not go in is untouched, comments and all.
+        let shared = std::fs::read_to_string(dir.join(TYPES_DIR).join("shared.toml")).unwrap();
+        assert_eq!(shared, SHARED);
+    }
+
+    #[test]
+    fn deleting_the_last_type_in_a_file_takes_the_file_with_it() {
+        let (dir, mut library) = shared("types-lonely");
+        std::fs::write(
+            dir.join(TYPES_DIR).join("lonely.toml"),
+            "# On its own.\n[[type]]\nname = \"Solo\"\nbase = \"u8\"\n",
+        )
+        .unwrap();
+        library.reload();
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Solo");
+
+        library.delete_selected_type().unwrap();
+
+        assert!(!dir.join(TYPES_DIR).join("lonely.toml").exists());
+        // The file holding three keeps its other two.
+        assert_eq!(library.type_entries.len(), 2);
+    }
+
+    #[test]
+    fn a_type_whose_file_is_taken_is_refused_rather_than_writing_over_it() {
+        let (dir, mut library) = shared("types-file-clash");
+        std::fs::write(
+            dir.join(TYPES_DIR).join("solo.toml"),
+            "[[type]]\nname = \"Solo\"\nbase = \"u8\"\n",
+        )
+        .unwrap();
+        library.reload();
+        // A different name, which the name check would let through, wanting the
+        // same file.
+        library.begin_new_type(TypeDef {
+            layout: FrameDef::flat("solo", Vec::new()),
+            narrows: Some(Subtype {
+                base: "u8".to_owned(),
+                range: None,
+            }),
+        });
+
+        let problem = library.type_draft_problem().expect("refused");
+        assert!(problem.contains("solo.toml"), "{problem}");
+        assert!(library.save_type_draft().is_err());
+        assert!(
+            std::fs::read_to_string(dir.join(TYPES_DIR).join("solo.toml"))
+                .unwrap()
+                .contains(r#"name = "Solo""#)
+        );
     }
 
     #[test]
