@@ -489,3 +489,41 @@ bits = [{ name = "value", width = 1 }, { name = "spare", width = 3 }, { name = "
     let error = schema::from_toml(text).expect_err("refused");
     assert!(error.to_string().contains("spare"), "{error}");
 }
+
+/// Windows checks these files out with `\r\n`, and `toml_edit` renders every
+/// line ending as a bare newline whatever it read. Left alone, saving a frame
+/// on Windows turns a one-line edit into a diff touching every line.
+///
+/// Run on every platform by converting the files here, so the guard does not
+/// depend on which machine happens to run it.
+#[test]
+fn a_file_written_with_windows_line_endings_keeps_them() {
+    let dir = examples_dir();
+    let types = TypeLibrary::load_dir(&dir.join("types")).expect("shared types should load");
+    for path in schema::toml_files(&dir).expect("examples folder should be readable") {
+        let text = std::fs::read_to_string(&path)
+            .expect("readable")
+            .replace('\n', "\r\n");
+        let frame = schema::from_toml_with(&text, &types).expect("valid");
+        let written = schema::update_in(&text, &frame).expect("rewritten");
+        assert_eq!(written, text, "{} was disturbed", path.display());
+    }
+
+    let types_dir = dir.join("types");
+    for path in schema::toml_files(&types_dir).expect("types folder should be readable") {
+        let text = std::fs::read_to_string(&path)
+            .expect("readable")
+            .replace('\n', "\r\n");
+        for definition in types.definitions().expect("every type is valid") {
+            let written =
+                schema::update_type_in(&text, definition.name(), &definition).expect("rewritten");
+            assert_eq!(
+                written,
+                text,
+                "{} disturbed by {}",
+                path.display(),
+                definition.name()
+            );
+        }
+    }
+}

@@ -581,7 +581,7 @@ pub fn update_in(text: &str, frame: &FrameDef) -> Result<String, SchemaError> {
     );
     merge_fields(&mut document, frame, fresh.as_table());
     state_endianness(&mut document, frame);
-    Ok(document.to_string())
+    Ok(document::render(&document, text))
 }
 
 fn merge_fields(document: &mut toml_edit::DocumentMut, frame: &FrameDef, fresh: &toml_edit::Table) {
@@ -926,7 +926,7 @@ pub fn update_type_in(text: &str, name: &str, type_def: &TypeDef) -> Result<Stri
     })
     .map_err(SchemaError::Rewrite)?;
     let Some(fresh) = sections(fresh.as_table(), "type").into_iter().next() else {
-        return Ok(document.to_string());
+        return Ok(document::render(&document, text));
     };
 
     if document.get("type").is_none() {
@@ -937,7 +937,7 @@ pub fn update_type_in(text: &str, name: &str, type_def: &TypeDef) -> Result<Stri
         .get_mut("type")
         .and_then(Item::as_array_of_tables_mut)
     else {
-        return Ok(document.to_string());
+        return Ok(document::render(&document, text));
     };
 
     let at = entries
@@ -976,7 +976,7 @@ pub fn update_type_in(text: &str, name: &str, type_def: &TypeDef) -> Result<Stri
             }
         }
     }
-    Ok(document.to_string())
+    Ok(document::render(&document, text))
 }
 
 /// Takes a type out of a file.
@@ -992,7 +992,7 @@ pub fn remove_type_from(text: &str, name: &str) -> Result<String, SchemaError> {
     {
         entries.retain(|entry| entry.get("name").and_then(Item::as_str) != Some(name));
     }
-    Ok(document.to_string())
+    Ok(document::render(&document, text))
 }
 
 /// A types file holding nothing but this one type.

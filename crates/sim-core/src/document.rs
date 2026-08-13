@@ -139,3 +139,18 @@ pub fn compact(table: &mut Table, key: &str) {
         array.fmt();
     }
 }
+
+/// Renders a document with the line endings the text it came from used.
+///
+/// `toml_edit` keeps comments, spacing and key order, but normalises every line
+/// ending to a bare newline. On a file written on Windows that turns a one-line
+/// edit into a diff touching every line, which is the opposite of what all the
+/// care above is for.
+#[must_use]
+pub fn render(document: &toml_edit::DocumentMut, original: &str) -> String {
+    let written = document.to_string();
+    if original.contains("\r\n") && !written.contains("\r\n") {
+        return written.replace('\n', "\r\n");
+    }
+    written
+}

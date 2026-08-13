@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use toml_edit::Item;
 
-use crate::document::{compact, fold, last_position, merge, place_after};
+use crate::document::{self, compact, fold, last_position, merge, place_after};
 
 use crate::connection::ConnectionId;
 use crate::frame::value::Value;
@@ -472,7 +472,7 @@ pub fn update_in(text: &str, name: &str, scenario: &Scenario) -> Result<String, 
 
     merge(existing, &fresh, &["step"]);
     merge_steps(existing, &fresh);
-    Ok(document.to_string())
+    Ok(document::render(&document, text))
 }
 
 /// Adds a scenario at the end of a file, or creates the file's array if it has
@@ -495,7 +495,7 @@ pub fn append_to(text: &str, scenario: &Scenario) -> Result<String, ScenarioErro
     place_after(&mut fresh, &mut next);
 
     array_of_scenarios(&mut document)?.push(fresh);
-    Ok(document.to_string())
+    Ok(document::render(&document, text))
 }
 
 /// Takes a scenario out of a file.
@@ -514,7 +514,7 @@ pub fn remove_from(text: &str, name: &str) -> Result<String, ScenarioError> {
             name: name.to_owned(),
         })?;
     entries.remove(found);
-    Ok(document.to_string())
+    Ok(document::render(&document, text))
 }
 
 fn parse_document(text: &str) -> Result<toml_edit::DocumentMut, ScenarioError> {
@@ -1570,5 +1570,27 @@ wait_for = { hex = "AA 5" }
         let scenarios = from_toml(&text).expect("should parse");
         assert_eq!(scenarios.len(), 2);
         assert_eq!(scenarios[1].name, "Telemetry 10 Hz");
+    }
+
+    /// `toml_edit` renders every line ending as a bare newline whatever it
+    /// read, so a file written on Windows would come back with every one of its
+    /// lines changed. The frame writer has the same guard, for the same reason.
+    #[test]
+    fn a_file_written_with_windows_line_endings_keeps_them() {
+        let text = COMMENTED.replace('\n', "\r\n");
+        let mut scenarios = from_toml(&text).expect("should parse");
+        scenarios[0].description = Some("edited".to_owned());
+
+        let written = update_in(&text, "Boot", &scenarios[0]).expect("rewritten");
+
+        assert!(written.contains("\r\n"), "{written}");
+        assert!(!written.contains("\n\n\n"), "a lone newline crept in");
+        assert!(written.contains("# Why this scenario exists at all."));
+        assert_eq!(
+            from_toml(&written).expect("still valid")[0]
+                .description
+                .as_deref(),
+            Some("edited")
+        );
     }
 }
