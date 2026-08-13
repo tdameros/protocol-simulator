@@ -1999,4 +1999,36 @@ covers = { from = "data", to = "data" }
         assert!(draft.frame.stated.is_empty());
         assert_eq!(library.draft_problem(), None);
     }
+
+    #[test]
+    fn turning_a_group_into_a_subtype_and_back_stays_savable() {
+        let (dir, mut library) = shared("types-shape");
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Rgb");
+        library.begin_type_edit();
+
+        // What the panel's shape toggle does, in the order a mouse would.
+        let draft = library.type_draft.as_mut().unwrap();
+        draft.definition.layout.fields.clear();
+        draft.definition.layout.declared.clear();
+        draft.definition.layout.stated.clear();
+        draft.definition.narrows = Some(Subtype {
+            base: "u8".to_owned(),
+            range: Some(ValueRange::Uint { min: 0, max: 7 }),
+        });
+
+        assert_eq!(library.type_draft_problem(), None);
+        // The frame using it goes from three bytes to one, and says so.
+        assert_eq!(
+            library.type_draft_impact(),
+            vec![("Lamp".to_owned(), Effect::Resized { was: 3, now: 1 })]
+        );
+
+        library.save_type_draft().unwrap();
+        let text = std::fs::read_to_string(dir.join(TYPES_DIR).join("shared.toml")).unwrap();
+        assert!(text.contains(r#"base = "u8""#), "{text}");
+        assert!(!text.contains(r#"name = "red""#), "{text}");
+    }
 }

@@ -1,10 +1,13 @@
 //! Editing the types every frame in a folder shares.
 //!
-//! A shared type is one of two things, and the editor asks which once, when the
-//! type is created: a group of fields, edited with the very editor a frame's
-//! fields are edited with, or a scalar narrowed to the values the protocol
-//! allows. Changing one reaches every frame naming it, so what it would do to
-//! them is shown beside Save rather than discovered at the next Reload.
+//! A shared type is one of two things, and the file format will not have both:
+//! a group of fields, edited with the very editor a frame's fields are edited
+//! with, or a scalar narrowed to the values the protocol allows. Which of the
+//! two is a setting inside the type rather than a choice to be made before
+//! there is one, both being a `[[type]]` in the same folder.
+//!
+//! Changing a type reaches every frame naming it, so what it would do to them
+//! is shown beside Save rather than discovered at the next Reload.
 
 use egui::{ComboBox, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
@@ -64,26 +67,19 @@ pub fn library_bar(ui: &mut Ui, state: &mut AppState) {
             });
 
         if ui
-            .button(format!("{} Group", icons::FILE_PLUS))
-            .on_hover_text("A new type grouping fields")
+            .add_enabled(
+                state.frames.type_draft.is_none(),
+                egui::Button::new(format!("{} New", icons::FILE_PLUS)),
+            )
+            .on_hover_text("A type every frame in this folder can name")
             .clicked()
         {
+            // Started as a group with nothing in it, which Save refuses until
+            // it is told what it is. A subtype would be savable straight away,
+            // and an empty one nobody meant to make is worse than a prompt.
             state.frames.begin_new_type(TypeDef {
                 layout: FrameDef::flat("NewType", Vec::new()),
                 narrows: None,
-            });
-        }
-        if ui
-            .button(format!("{} Subtype", icons::FILE_PLUS))
-            .on_hover_text("A new scalar narrowed to what the protocol allows")
-            .clicked()
-        {
-            state.frames.begin_new_type(TypeDef {
-                layout: FrameDef::flat("NewSubtype", Vec::new()),
-                narrows: Some(Subtype {
-                    base: ScalarType::U8.name().to_owned(),
-                    range: Some(ScalarType::U8.representable()),
-                }),
             });
         }
         let chosen = state.frames.selected_type().is_some();
@@ -124,12 +120,11 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
     let Some(draft) = &mut state.frames.type_draft else {
         return;
     };
-    let subtype = draft.definition.narrows.is_some();
-
     ui.horizontal(|ui| {
-        ui.label(if subtype { "Subtype:" } else { "Type:" });
+        ui.label("Type:");
         ui.text_edit_singleline(&mut draft.definition.layout.name);
     });
+    shape(ui, &mut draft.definition);
     let mut description = draft
         .definition
         .layout
@@ -191,6 +186,35 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
         }
         if let Some(reason) = &problem {
             ui.colored_label(ERROR, reason);
+        }
+    });
+}
+
+/// Which of the two things a type is.
+///
+/// The format will not have both at once, so switching empties the other side.
+/// Deliberate rather than clever: keeping the fields of a type that is no
+/// longer a group would write a file the loader refuses, and hiding them would
+/// leave the editor showing something the file does not say.
+fn shape(ui: &mut Ui, definition: &mut TypeDef) {
+    let subtype = definition.narrows.is_some();
+    ui.horizontal(|ui| {
+        ui.label("Holds:");
+        if ui.selectable_label(!subtype, "fields").clicked() && subtype {
+            definition.narrows = None;
+        }
+        if ui
+            .selectable_label(subtype, "one narrowed scalar")
+            .clicked()
+            && !subtype
+        {
+            definition.layout.fields.clear();
+            definition.layout.declared.clear();
+            definition.layout.stated.clear();
+            definition.narrows = Some(Subtype {
+                base: ScalarType::U8.name().to_owned(),
+                range: Some(ScalarType::U8.representable()),
+            });
         }
     });
 }
