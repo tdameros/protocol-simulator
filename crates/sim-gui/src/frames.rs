@@ -637,11 +637,50 @@ impl FrameLibrary {
                 .with_context(|| format!("cannot write {}", path.display()))?;
         }
 
+        self.move_type_file(&draft)?;
+
         self.reload_keeping_the_frame_draft();
         if let Some(index) = draft.for_field {
             self.give_field_the_type(index, draft.definition.name());
         }
         Ok(())
+    }
+
+    /// Moves a renamed type's file to match, when the type is alone in it.
+    ///
+    /// A file holding several types is named after none of them in particular,
+    /// so it stays as it was. One holding a single type is named after it, and
+    /// a name that no longer matches is only confusing.
+    fn move_type_file(&mut self, draft: &TypeDraft) -> Result<()> {
+        let Some(origin) = &draft.origin else {
+            return Ok(());
+        };
+        if origin.name == draft.definition.name() {
+            return Ok(());
+        }
+        let alone = self
+            .type_entries
+            .iter()
+            .filter(|entry| entry.file == origin.file)
+            .count()
+            == 1;
+        if !alone {
+            return Ok(());
+        }
+        let Some(directory) = self.directory.as_ref() else {
+            return Ok(());
+        };
+        let wanted = suggested_type_file(directory, draft.definition.name());
+        if wanted == origin.file || wanted.exists() {
+            return Ok(());
+        }
+        std::fs::rename(&origin.file, &wanted).with_context(|| {
+            format!(
+                "cannot move {} to {}",
+                origin.file.display(),
+                wanted.display()
+            )
+        })
     }
 
     /// Declares the field that asked for this type as being of it.
@@ -924,11 +963,10 @@ impl FrameLibrary {
     /// name check above lets the pair through. Writing would take the other
     /// frame's definition with it, and nothing would say so.
     fn file_taken(&self, draft: &Draft) -> Option<String> {
-        if draft.origin.is_some() {
+        let wanted = self.target_file(draft)?;
+        if draft.origin.as_ref().map(|origin| &origin.file) == Some(&wanted) {
             return None;
         }
-        let directory = self.directory.as_ref()?;
-        let wanted = suggested_file(directory, &draft.frame.name);
         let held = self.entries.iter().find(|entry| entry.file == wanted);
         match held {
             Some(entry) => Some(format!(
@@ -939,6 +977,15 @@ impl FrameLibrary {
             None if wanted.exists() => Some(format!("{} already exists", file_label(&wanted))),
             None => None,
         }
+    }
+
+    /// The file the draft belongs in under the name it now carries.
+    ///
+    /// Renaming a frame moves its file, so that what the folder shows on disk
+    /// and what the frames are called cannot drift apart.
+    fn target_file(&self, draft: &Draft) -> Option<PathBuf> {
+        let directory = self.directory.as_ref()?;
+        Some(suggested_file(directory, &draft.frame.name))
     }
 
     /// The file already holding a frame of that name, if it is not this one.
@@ -988,6 +1035,18 @@ impl FrameLibrary {
         std::fs::write(&file, &written)
             .with_context(|| format!("cannot write {}", file.display()))?;
 
+        // Renamed, so the file follows. Written first and moved after, which
+        // leaves the content somewhere at every moment.
+        let file = match self.target_file(&draft) {
+            Some(wanted) if wanted != file => {
+                std::fs::rename(&file, &wanted).with_context(|| {
+                    format!("cannot move {} to {}", file.display(), wanted.display())
+                })?;
+                wanted
+            }
+            _ => file,
+        };
+
         self.take_in(&file, draft);
         Ok(())
     }
@@ -1022,7 +1081,9 @@ impl FrameLibrary {
 
     /// Folds a saved draft into the list, replacing what it came from.
     fn take_in(&mut self, file: &Path, draft: Draft) {
-        self.entries.retain(|entry| entry.file != file);
+        let was = draft.origin.as_ref().map(|origin| origin.file.clone());
+        self.entries
+            .retain(|entry| entry.file != file && Some(&entry.file) != was.as_ref());
         self.entries.push(Entry {
             file: file.to_path_buf(),
             frame: draft.frame,
@@ -1180,6 +1241,15 @@ name = "crc"
 type = "crc16"
 algo = "crc16-ccitt"
 covers = { from = "sync", to = "mode" }
+"#;
+
+    /// A second frame, for the cases that need two files in a folder.
+    const OTHER: &str = r#"
+name = "Beacon"
+
+[[field]]
+name = "tick"
+type = "u8"
 "#;
 
     const BROKEN: &str = r#"
@@ -1521,17 +1591,78 @@ default = 50
     }
 
     #[test]
-    fn renaming_a_frame_keeps_it_in_its_own_file() {
+    fn renaming_a_frame_takes_its_file_with_it() {
         let (dir, mut library) = library_of("rename", &[("telemetry.toml", GOOD)]);
         library.begin_edit();
         library.draft.as_mut().unwrap().frame.name = "Beacon".to_owned();
 
         assert_eq!(library.draft_problem(), None);
-        library.save_draft(&dir).unwrap();
+        library.save_draft(&suggested_file(&dir, "Beacon")).unwrap();
 
         assert_eq!(library.entries.len(), 1);
-        assert_eq!(library.entries[0].file, dir.join("telemetry.toml"));
+        assert_eq!(library.entries[0].file, dir.join("beacon.toml"));
         assert_eq!(library.entries[0].frame.name, "Beacon");
+        assert!(!dir.join("telemetry.toml").exists(), "the old one is gone");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_rename_onto_a_file_another_frame_holds_is_refused() {
+        let (dir, mut library) = library_of(
+            "rename-clash",
+            &[("telemetry.toml", GOOD), ("beacon.toml", OTHER)],
+        );
+        library.selected = library
+            .entries
+            .iter()
+            .position(|entry| entry.frame.name == "Telemetry");
+        library.begin_edit();
+        library.draft.as_mut().unwrap().frame.name = "beacon".to_owned();
+
+        let problem = library.draft_problem().expect("refused");
+        assert!(problem.contains("beacon.toml"), "{problem}");
+        assert!(library.save_draft(&suggested_file(&dir, "beacon")).is_err());
+        assert!(dir.join("telemetry.toml").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn renaming_a_type_alone_in_its_file_takes_the_file_with_it() {
+        let (dir, mut library) = shared("type-rename-file");
+        std::fs::write(
+            dir.join(TYPES_DIR).join("solo.toml"),
+            "[[type]]\nname = \"Solo\"\nbase = \"u8\"\n",
+        )
+        .unwrap();
+        library.reload();
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Solo");
+        library.begin_type_edit();
+        library.type_draft.as_mut().unwrap().definition.layout.name = "Duty".to_owned();
+
+        library.save_type_draft().unwrap();
+
+        assert!(dir.join(TYPES_DIR).join("duty.toml").exists());
+        assert!(!dir.join(TYPES_DIR).join("solo.toml").exists());
+    }
+
+    #[test]
+    fn renaming_a_type_sharing_a_file_leaves_the_file_alone() {
+        let (dir, mut library) = shared("type-rename-shared-file");
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Rgb");
+        library.begin_type_edit();
+        library.type_draft.as_mut().unwrap().definition.layout.name = "Colour".to_owned();
+
+        library.save_type_draft().unwrap();
+
+        // `shared.toml` is named after none of the three it holds.
+        assert!(dir.join(TYPES_DIR).join("shared.toml").exists());
+        assert!(!dir.join(TYPES_DIR).join("colour.toml").exists());
     }
 
     #[test]
