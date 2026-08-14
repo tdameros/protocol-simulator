@@ -90,10 +90,13 @@ fn types_row(ui: &mut Ui, state: &mut AppState) {
             // Empty, which Save refuses until it has been given a field. There
             // is nothing else to decide first.
             let name = state.frames.unused_type_name("NewType");
-            state.frames.begin_new_type(TypeDef {
-                layout: FrameDef::flat(name, Vec::new()),
-                narrows: None,
-            });
+            state.frames.begin_new_type(
+                TypeDef {
+                    layout: FrameDef::flat(name, Vec::new()),
+                    narrows: None,
+                },
+                None,
+            );
         }
         let chosen = state.frames.selected_type().is_some();
         if ui

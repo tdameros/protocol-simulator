@@ -69,6 +69,12 @@ pub struct TypeEntry {
 pub struct TypeDraft {
     pub definition: TypeDef,
     pub origin: Option<TypeOrigin>,
+    /// The declared field of the frame underneath that asked for this type.
+    ///
+    /// Set when the type was started from a field's kind picker, which is a
+    /// request for that field to be of it: making the type and then having to
+    /// go and pick it is a step nobody meant to take.
+    pub for_field: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,13 +348,15 @@ impl FrameLibrary {
         self.type_draft = Some(TypeDraft {
             definition: entry.definition.clone(),
             origin,
+            for_field: None,
         });
     }
 
-    pub fn begin_new_type(&mut self, definition: TypeDef) {
+    pub fn begin_new_type(&mut self, definition: TypeDef, for_field: Option<usize>) {
         self.type_draft = Some(TypeDraft {
             definition,
             origin: None,
+            for_field,
         });
     }
 
@@ -546,7 +554,31 @@ impl FrameLibrary {
             .with_context(|| format!("cannot write {}", file.display()))?;
 
         self.reload_keeping_the_frame_draft();
+        if let Some(index) = draft.for_field {
+            self.give_field_the_type(index, draft.definition.name());
+        }
         Ok(())
+    }
+
+    /// Declares the field that asked for this type as being of it.
+    fn give_field_the_type(&mut self, index: usize, kind: &str) {
+        let types = self.types.clone();
+        let Some(draft) = &mut self.draft else {
+            return;
+        };
+        let Some(name) = draft.frame.declared.get(index).cloned() else {
+            return;
+        };
+        let stated = sim_core::frame::Stated {
+            kind: kind.to_owned(),
+            repeat: None,
+            instances: None,
+        };
+        let Ok(expansion) = schema::instantiate(&types, &name, kind, &stated, draft.frame.endian)
+        else {
+            return;
+        };
+        layout::state_as(&mut draft.frame, index, Some(&stated), expansion);
     }
 
     /// Reloads without throwing away a frame someone is in the middle of.
@@ -1872,30 +1904,33 @@ type = "Rgb"
     #[test]
     fn a_type_nobody_saved_yet_gets_a_file_of_its_own() {
         let (dir, mut library) = shared("types-new");
-        library.begin_new_type(TypeDef {
-            layout: FrameDef::flat(
-                "Pair",
-                vec![
-                    FieldDef {
-                        name: "left".to_owned(),
-                        description: None,
-                        kind: FieldKind::Scalar(ScalarType::U8),
-                        endian: Endianness::default(),
-                        default: None,
-                        range: None,
-                    },
-                    FieldDef {
-                        name: "right".to_owned(),
-                        description: None,
-                        kind: FieldKind::Scalar(ScalarType::U8),
-                        endian: Endianness::default(),
-                        default: None,
-                        range: None,
-                    },
-                ],
-            ),
-            narrows: None,
-        });
+        library.begin_new_type(
+            TypeDef {
+                layout: FrameDef::flat(
+                    "Pair",
+                    vec![
+                        FieldDef {
+                            name: "left".to_owned(),
+                            description: None,
+                            kind: FieldKind::Scalar(ScalarType::U8),
+                            endian: Endianness::default(),
+                            default: None,
+                            range: None,
+                        },
+                        FieldDef {
+                            name: "right".to_owned(),
+                            description: None,
+                            kind: FieldKind::Scalar(ScalarType::U8),
+                            endian: Endianness::default(),
+                            default: None,
+                            range: None,
+                        },
+                    ],
+                ),
+                narrows: None,
+            },
+            None,
+        );
 
         assert_eq!(library.type_draft_problem(), None);
         library.save_type_draft().unwrap();
@@ -1944,13 +1979,16 @@ type = "Rgb"
         library.reload();
         // A different name, which the name check would let through, wanting the
         // same file.
-        library.begin_new_type(TypeDef {
-            layout: FrameDef::flat("solo", Vec::new()),
-            narrows: Some(Subtype {
-                base: "u8".to_owned(),
-                range: None,
-            }),
-        });
+        library.begin_new_type(
+            TypeDef {
+                layout: FrameDef::flat("solo", Vec::new()),
+                narrows: Some(Subtype {
+                    base: "u8".to_owned(),
+                    range: None,
+                }),
+            },
+            None,
+        );
 
         let problem = library.type_draft_problem().expect("refused");
         assert!(problem.contains("solo.toml"), "{problem}");
@@ -1965,10 +2003,13 @@ type = "Rgb"
     #[test]
     fn a_type_name_already_taken_is_refused() {
         let (_, mut library) = shared("types-clash");
-        library.begin_new_type(TypeDef {
-            layout: FrameDef::flat("Rgb", vec![]),
-            narrows: None,
-        });
+        library.begin_new_type(
+            TypeDef {
+                layout: FrameDef::flat("Rgb", vec![]),
+                narrows: None,
+            },
+            None,
+        );
 
         let problem = library.type_draft_problem().expect("refused");
         assert!(problem.contains("Rgb"), "{problem}");
@@ -2094,10 +2135,13 @@ endian = "big"
     #[test]
     fn a_group_type_with_no_fields_is_refused() {
         let (_, mut library) = shared("types-empty");
-        library.begin_new_type(TypeDef {
-            layout: FrameDef::flat("NewType", Vec::new()),
-            narrows: None,
-        });
+        library.begin_new_type(
+            TypeDef {
+                layout: FrameDef::flat("NewType", Vec::new()),
+                narrows: None,
+            },
+            None,
+        );
 
         // It reads back exactly as written, so only asking what it means
         // catches it: a frame naming it would fail with "has no fields".
@@ -2381,10 +2425,13 @@ covers = { from = "data", to = "data" }
         let (_, mut library) = shared("new-type-names");
         assert_eq!(library.unused_type_name("NewType"), "NewType");
 
-        library.begin_new_type(TypeDef {
-            layout: FrameDef::flat(library.unused_type_name("NewType"), vec![plain("id")]),
-            narrows: None,
-        });
+        library.begin_new_type(
+            TypeDef {
+                layout: FrameDef::flat(library.unused_type_name("NewType"), vec![plain("id")]),
+                narrows: None,
+            },
+            None,
+        );
         library.save_type_draft().unwrap();
 
         assert_eq!(library.unused_type_name("NewType"), "NewType 2");
@@ -2431,5 +2478,69 @@ covers = { from = "data", to = "data" }
         assert_eq!(draft.frame.size(), 4);
         assert!(draft.frame.field_index("colour.white").is_some());
         assert_eq!(library.draft_problem(), None);
+    }
+
+    #[test]
+    fn a_type_made_from_a_field_is_given_to_that_field_once_saved() {
+        let (_, mut library) = shared("type-for-field");
+        library.begin_new(FrameDef::flat(
+            "Built",
+            vec![plain("header"), plain("payload")],
+        ));
+
+        // What "New type..." in the second field's kind picker does.
+        library.begin_new_type(
+            TypeDef {
+                layout: FrameDef::flat("Stamp", Vec::new()),
+                narrows: None,
+            },
+            Some(1),
+        );
+        let type_draft = library.type_draft.as_mut().unwrap();
+        // Renamed on the way, as anyone would: the field must follow the name
+        // it was saved under, not the one it was offered.
+        type_draft.definition.layout.name = "Timestamp".to_owned();
+        layout::add_field(
+            &mut type_draft.definition.layout,
+            None,
+            FieldDef {
+                name: "seconds".to_owned(),
+                kind: FieldKind::Scalar(ScalarType::U32),
+                ..plain("seconds")
+            },
+        );
+        library.save_type_draft().unwrap();
+
+        let draft = library.draft.as_ref().expect("the frame is still waiting");
+        assert_eq!(draft.frame.declared, ["header", "payload"]);
+        assert_eq!(
+            draft
+                .frame
+                .stated
+                .get("payload")
+                .map(|held| held.kind.as_str()),
+            Some("Timestamp")
+        );
+        assert!(draft.frame.field_index("payload.seconds").is_some());
+        assert_eq!(draft.frame.size(), 5);
+        assert_eq!(library.draft_problem(), None);
+    }
+
+    #[test]
+    fn a_type_made_on_its_own_is_given_to_nothing() {
+        let (_, mut library) = shared("type-for-nobody");
+        library.begin_new(FrameDef::flat("Built", vec![plain("header")]));
+        library.begin_new_type(
+            TypeDef {
+                layout: FrameDef::flat("Spare", vec![plain("pad")]),
+                narrows: None,
+            },
+            None,
+        );
+        library.save_type_draft().unwrap();
+
+        let draft = library.draft.as_ref().expect("still waiting");
+        assert!(draft.frame.stated.is_empty());
+        assert_eq!(draft.frame.size(), 1);
     }
 }

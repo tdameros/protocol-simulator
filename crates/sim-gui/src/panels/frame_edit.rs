@@ -43,7 +43,8 @@ const SCALARS: [ScalarType; 10] = [
 /// wrong.
 pub enum TypeWanted {
     Edit(String),
-    New,
+    /// Made for the declared field that asked, and given to it once saved.
+    New(usize),
 }
 
 /// A type the folder shares, as the picker offers it.
@@ -87,14 +88,15 @@ pub fn fields(ui: &mut Ui, state: &mut AppState) {
                 .position(|entry| entry.definition.name() == name);
             state.frames.begin_type_edit();
         }
-        Some(TypeWanted::New) => {
+        Some(TypeWanted::New(index)) => {
             let name = state.frames.unused_type_name("NewType");
-            state
-                .frames
-                .begin_new_type(sim_core::frame::schema::TypeDef {
+            state.frames.begin_new_type(
+                sim_core::frame::schema::TypeDef {
                     layout: FrameDef::flat(name, Vec::new()),
                     narrows: None,
-                });
+                },
+                Some(index),
+            );
         }
         None => {}
     }
@@ -426,7 +428,7 @@ fn kind_picker(
                 .on_hover_text("Make one now, and give it to this field afterwards")
                 .clicked()
             {
-                *wanted = Some(TypeWanted::New);
+                *wanted = Some(TypeWanted::New(index));
             }
         });
 }
