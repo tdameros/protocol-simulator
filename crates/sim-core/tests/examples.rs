@@ -496,14 +496,20 @@ bits = [{ name = "value", width = 1 }, { name = "spare", width = 3 }, { name = "
 ///
 /// Run on every platform by converting the files here, so the guard does not
 /// depend on which machine happens to run it.
+/// The same text with `\r\n` throughout, whatever it arrived with.
+///
+/// Normalised first, or a run on Windows doubles the carriage returns of files
+/// git already checked out that way and hands the parser `\r\r\n`.
+fn with_windows_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
 #[test]
 fn a_file_written_with_windows_line_endings_keeps_them() {
     let dir = examples_dir();
     let types = TypeLibrary::load_dir(&dir.join("types")).expect("shared types should load");
     for path in schema::toml_files(&dir).expect("examples folder should be readable") {
-        let text = std::fs::read_to_string(&path)
-            .expect("readable")
-            .replace('\n', "\r\n");
+        let text = with_windows_line_endings(&std::fs::read_to_string(&path).expect("readable"));
         let frame = schema::from_toml_with(&text, &types).expect("valid");
         let written = schema::update_in(&text, &frame).expect("rewritten");
         assert_eq!(written, text, "{} was disturbed", path.display());
@@ -511,9 +517,7 @@ fn a_file_written_with_windows_line_endings_keeps_them() {
 
     let types_dir = dir.join("types");
     for path in schema::toml_files(&types_dir).expect("types folder should be readable") {
-        let text = std::fs::read_to_string(&path)
-            .expect("readable")
-            .replace('\n', "\r\n");
+        let text = with_windows_line_endings(&std::fs::read_to_string(&path).expect("readable"));
         for definition in types.definitions().expect("every type is valid") {
             let written =
                 schema::update_type_in(&text, definition.name(), &definition).expect("rewritten");
