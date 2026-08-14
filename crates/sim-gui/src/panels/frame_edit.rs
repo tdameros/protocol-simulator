@@ -398,11 +398,11 @@ fn kind_picker(
                 }
             }
 
-            if row.shared.is_empty() {
-                return;
-            }
             ui.separator();
-            ui.label(RichText::new("shared").weak());
+            // Named and offered even with nothing to list: a folder with no
+            // types yet is exactly when someone reaches for this, and the
+            // heading says what the button below is going to make.
+            ui.label(RichText::new("Shared types").weak());
             for held in row.shared {
                 let said = if held.group {
                     format!("{}  {} bytes", held.name, held.size)
