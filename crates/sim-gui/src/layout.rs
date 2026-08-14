@@ -344,3 +344,15 @@ pub fn inline_type(layout: &mut FrameDef, kind: &str) {
         layout.stated.remove(&name);
     }
 }
+
+/// Points every declaration made through `was` at `now` instead.
+///
+/// Only the word changes: the fields the type produced keep their names, which
+/// are built from the name the instance was given, not from the type's.
+pub fn retype(layout: &mut FrameDef, was: &str, now: &str) {
+    for stated in layout.stated.values_mut() {
+        if stated.kind == was {
+            now.clone_into(&mut stated.kind);
+        }
+    }
+}

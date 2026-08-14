@@ -745,16 +745,24 @@ fn kept_from_the_file(
     entry: &toml_edit::Table,
     fresh: Option<&toml_edit::Table>,
 ) -> &'static [&'static str] {
-    let names_a_type = |table: &toml_edit::Table| {
+    let named = |table: &toml_edit::Table| {
         table
             .get("type")
             .and_then(Item::as_str)
-            .is_some_and(|kind| !is_builtin_kind(kind))
+            .filter(|kind| !is_builtin_kind(kind))
+            .map(ToOwned::to_owned)
     };
-    // Kept only while both still say a type. A model that has stopped saying
-    // one has been told to write the field out in full, which is what deleting
-    // the type it named amounts to.
-    if names_a_type(entry) && fresh.is_none_or(names_a_type) {
+    // Kept only while both still say the same type. A model saying a different
+    // one has been renamed, and a model saying a builtin has been told to write
+    // the field out in full, which is what deleting the type it named amounts
+    // to. Neither is an edit the file gets to veto.
+    let held = named(entry);
+    let says_the_same = match (&held, fresh.map(named)) {
+        (Some(_), None) => true,
+        (Some(held), Some(Some(wanted))) => *held == wanted,
+        _ => false,
+    };
+    if says_the_same {
         &["endian", "type", "range", "repr", "variants", "bits"]
     } else {
         &["endian"]

@@ -417,10 +417,20 @@ impl FrameLibrary {
         let Some(candidate) = self.candidate_types() else {
             return Vec::new();
         };
+        let Some(draft) = self.type_draft.as_ref() else {
+            return Vec::new();
+        };
+        let pending = self.pending_for_type_draft(draft);
         self.entries
             .iter()
             .filter_map(|entry| {
-                let effect = match schema::load_with(&entry.file, &candidate) {
+                // Read as the save would leave it, not as it stands: a frame
+                // brought along by a rename has nothing to report.
+                let read = match pending.get(&entry.file) {
+                    Some(text) => schema::from_toml_with(text, &candidate),
+                    None => schema::load_with(&entry.file, &candidate),
+                };
+                let effect = match read {
                     Err(error) => Effect::Broken(error.to_string()),
                     Ok(now) if now.size() != entry.frame.size() => Effect::Resized {
                         was: entry.frame.size(),
@@ -487,36 +497,103 @@ impl FrameLibrary {
     }
 
     /// The library as it would be with the draft saved.
-    fn candidate_types(&self) -> Option<TypeLibrary> {
-        let draft = self.type_draft.as_ref()?;
-        let written = Self::type_text(draft).ok()?;
-        let edited = draft
+    /// Every file saving the type draft would rewrite, and what it would put in
+    /// them.
+    ///
+    /// Worked out in one place so that the warning shown beside Save and the
+    /// save itself cannot say different things. Renaming a type is the case
+    /// that makes this necessary: the frames naming it have to be brought
+    /// along, or they stop loading the moment it is saved.
+    fn pending_for_type_draft(&self, draft: &TypeDraft) -> BTreeMap<PathBuf, String> {
+        let mut pending: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let now = draft.definition.name();
+        let renamed = draft
+            .origin
+            .as_ref()
+            .map(|origin| origin.name.clone())
+            .filter(|was| was != now);
+
+        if let Some(was) = &renamed {
+            for held in &self.type_entries {
+                if held.definition.name() == was || !layout::uses_type(&held.definition.layout, was)
+                {
+                    continue;
+                }
+                let mut moved = held.definition.clone();
+                layout::retype(&mut moved.layout, was, now);
+                let Ok(text) = Self::text_of(&pending, &held.file) else {
+                    continue;
+                };
+                if let Ok(written) = schema::update_type_in(&text, held.definition.name(), &moved) {
+                    pending.insert(held.file.clone(), written);
+                }
+            }
+            for held in &self.entries {
+                if !layout::uses_type(&held.frame, was) {
+                    continue;
+                }
+                let mut moved = held.frame.clone();
+                layout::retype(&mut moved, was, now);
+                let Ok(text) = Self::text_of(&pending, &held.file) else {
+                    continue;
+                };
+                if let Ok(written) = schema::update_in(&text, &moved) {
+                    pending.insert(held.file.clone(), written);
+                }
+            }
+        }
+
+        // The type itself last, over whatever the cascade has already put in
+        // its file: another type in there may name it too.
+        let file = draft
             .origin
             .as_ref()
             .map_or_else(|| self.types_file(draft), |origin| origin.file.clone());
+        let written = match (&draft.origin, Self::text_of(&pending, &file)) {
+            (Some(origin), Ok(text)) => {
+                schema::update_type_in(&text, &origin.name, &draft.definition)
+            }
+            _ => schema::type_to_toml(&draft.definition),
+        };
+        if let Ok(written) = written {
+            pending.insert(file, written);
+        }
+        pending
+    }
+
+    /// A file as the pending rewrites have it, or as the disk does.
+    fn text_of(pending: &BTreeMap<PathBuf, String>, path: &Path) -> Result<String> {
+        match pending.get(path) {
+            Some(text) => Ok(text.clone()),
+            None => std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read {}", path.display())),
+        }
+    }
+
+    fn candidate_types(&self) -> Option<TypeLibrary> {
+        let draft = self.type_draft.as_ref()?;
+        let pending = self.pending_for_type_draft(draft);
 
         let mut candidate = TypeLibrary::default();
         let directory = self.directory.as_ref()?.join(TYPES_DIR);
-        let others = schema::toml_files(&directory).unwrap_or_default();
-        for path in others.iter().filter(|path| **path != edited) {
+        for path in schema::toml_files(&directory).unwrap_or_default() {
             // A broken file costs only itself here too, as it does at load
             // time. Giving up on the whole library would leave the guard with
             // nothing to check against, which reads as nothing to complain
             // about.
-            let _ = candidate.merge_file(path);
+            let _ = match pending.get(&path) {
+                Some(text) => candidate.merge_toml(text),
+                None => candidate.merge_file(&path),
+            };
         }
-        candidate.merge_toml(&written).ok()?;
+        // A type in a file of its own that nothing has written yet.
+        for (path, text) in &pending {
+            if !path.starts_with(&directory) || path.exists() {
+                continue;
+            }
+            let _ = candidate.merge_toml(text);
+        }
         Some(candidate)
-    }
-
-    /// The text saving the type draft would write.
-    fn type_text(draft: &TypeDraft) -> Result<String, schema::SchemaError> {
-        match &draft.origin {
-            // Edited where it lives, which for a file somebody wrote by hand
-            // may hold several types and their comments.
-            Some(origin) => schema::update_type_in(&origin.text, &origin.name, &draft.definition),
-            None => schema::type_to_toml(&draft.definition),
-        }
     }
 
     /// Where a type nobody has saved yet belongs.
@@ -539,19 +616,26 @@ impl FrameLibrary {
         if let Some(reason) = self.type_draft_problem() {
             bail!("{reason}");
         }
-        let file = draft
+        // The frame waiting underneath still calls the type by the name it had
+        // when it was opened. Renaming the type on disk without telling it
+        // would leave it naming something that no longer exists.
+        let renamed = draft
             .origin
             .as_ref()
-            .map_or_else(|| self.types_file(&draft), |origin| origin.file.clone());
-        let written = Self::type_text(&draft)
-            .with_context(|| format!("cannot describe {}", draft.definition.name()))?;
-
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
+            .map(|origin| origin.name.clone())
+            .filter(|was| was != draft.definition.name());
+        if let (Some(was), Some(held)) = (&renamed, self.draft.as_mut()) {
+            layout::retype(&mut held.frame, was, draft.definition.name());
         }
-        std::fs::write(&file, written)
-            .with_context(|| format!("cannot write {}", file.display()))?;
+
+        for (path, text) in &self.pending_for_type_draft(&draft) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create {}", parent.display()))?;
+            }
+            std::fs::write(path, text)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+        }
 
         self.reload_keeping_the_frame_draft();
         if let Some(index) = draft.for_field {
@@ -2542,5 +2626,110 @@ covers = { from = "data", to = "data" }
         let draft = library.draft.as_ref().expect("still waiting");
         assert!(draft.frame.stated.is_empty());
         assert_eq!(draft.frame.size(), 1);
+    }
+
+    #[test]
+    fn renaming_a_type_brings_along_the_frames_that_name_it() {
+        let (dir, mut library) = shared("type-rename");
+        let was = library.entries[0].frame.fields.clone();
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Rgb");
+        library.begin_type_edit();
+        library.type_draft.as_mut().unwrap().definition.layout.name = "Colour".to_owned();
+
+        // Nothing to report: the frames come along, so none of them changes.
+        assert_eq!(library.type_draft_problem(), None);
+        assert_eq!(library.type_draft_impact(), vec![]);
+
+        library.save_type_draft().unwrap();
+
+        assert!(library.failures.is_empty(), "{:?}", library.failures);
+        assert_eq!(library.entries.len(), 1);
+        assert_eq!(library.entries[0].frame.fields, was);
+        assert_eq!(
+            library.entries[0]
+                .frame
+                .stated
+                .get("colour")
+                .map(|held| held.kind.as_str()),
+            Some("Colour")
+        );
+        let text = std::fs::read_to_string(dir.join("lamp.toml")).unwrap();
+        assert!(text.contains(r#"type = "Colour""#), "{text}");
+    }
+
+    #[test]
+    fn renaming_a_type_another_type_names_brings_that_one_along_too() {
+        let (dir, mut library) = shared("type-rename-nested");
+        std::fs::write(
+            dir.join(TYPES_DIR).join("lamp-type.toml"),
+            "[[type]]\nname = \"Lamp\"\n\n[[type.field]]\nname = \"level\"\ntype = \"Percent\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("panel.toml"),
+            "name = \"Panel\"\n\n[[field]]\nname = \"main\"\ntype = \"Lamp\"\n",
+        )
+        .unwrap();
+        library.reload();
+
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Percent");
+        library.begin_type_edit();
+        library.type_draft.as_mut().unwrap().definition.layout.name = "Ratio".to_owned();
+        library.save_type_draft().unwrap();
+
+        assert!(library.failures.is_empty(), "{:?}", library.failures);
+        let held = std::fs::read_to_string(dir.join(TYPES_DIR).join("lamp-type.toml")).unwrap();
+        assert!(held.contains(r#"type = "Ratio""#), "{held}");
+        assert!(library
+            .entries
+            .iter()
+            .any(|entry| entry.frame.name == "Panel"));
+    }
+
+    #[test]
+    fn a_frame_waiting_under_a_type_follows_it_being_renamed() {
+        let (_, mut library) = shared("draft-under-rename");
+        let types = library.types().clone();
+        library.begin_new(FrameDef::flat("Built", vec![plain("colour")]));
+        let stated = Stated {
+            kind: "Rgb".to_owned(),
+            repeat: None,
+            instances: None,
+        };
+        {
+            let draft = library.draft.as_mut().unwrap();
+            let expansion =
+                schema::instantiate(&types, "colour", "Rgb", &stated, draft.frame.endian).unwrap();
+            layout::state_as(&mut draft.frame, 0, Some(&stated), expansion);
+        }
+
+        // Off to the type, rename it, come back.
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Rgb");
+        library.begin_type_edit();
+        library.type_draft.as_mut().unwrap().definition.layout.name = "Colour".to_owned();
+        library.save_type_draft().unwrap();
+
+        let draft = library.draft.as_ref().expect("the frame is still waiting");
+        assert_eq!(
+            draft
+                .frame
+                .stated
+                .get("colour")
+                .map(|held| held.kind.as_str()),
+            Some("Colour")
+        );
+        assert_eq!(draft.frame.size(), 3);
+        // Without this the draft names a type nothing defines any more, and
+        // Save stays refused until the editor is closed and reopened.
+        assert_eq!(library.draft_problem(), None);
     }
 }
