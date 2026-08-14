@@ -20,22 +20,24 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
     library_bar(ui, state);
 
+    // The type first: it can be opened from a field of a frame being edited,
+    // and that frame has to be waiting underneath when the type is done with.
+    if state.frames.type_draft.is_some() {
+        super::type_edit::editor(ui, state);
+        return;
+    }
     // Editing a copy, so what the list and the disk hold is untouched until
     // Save says otherwise.
     if state.frames.draft.is_some() {
         draft_editor(ui, state);
         return;
     }
-    if state.frames.type_draft.is_some() {
-        super::type_edit::editor(ui, state);
-        return;
-    }
 
     // Drawn even with nothing in the folder, both of them: New lives on these
     // rows, and a folder emptied of its last frame has to leave a way to make
     // another one.
-    frame_picker(ui, state);
     super::type_edit::library_bar(ui, state);
+    frame_picker(ui, state);
     show_failures(ui, state);
 
     if state.frames.is_empty() {

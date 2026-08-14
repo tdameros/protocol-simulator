@@ -44,8 +44,17 @@ pub fn library_bar(ui: &mut Ui, state: &mut AppState) {
     if state.frames.directory.is_none() {
         return;
     }
+    // Folded away: types belong to the folder rather than to a frame, and are
+    // made once and used for months. The daily view should not spend a row on
+    // them.
+    let held = state.frames.type_entries.len();
+    egui::CollapsingHeader::new(format!("Shared types ({held})"))
+        .id_salt("shared_types")
+        .show(ui, |ui| types_row(ui, state));
+}
+
+fn types_row(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
-        super::library_label(ui, "Shared types:");
         let names: Vec<String> = state
             .frames
             .type_entries
@@ -148,13 +157,17 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
         .max_height(ui.available_height() * 0.5)
         .show(ui, |ui| match &mut draft.definition.narrows {
             Some(narrows) => narrowing(ui, narrows),
-            None => super::frame_edit::layout(
-                ui,
-                &mut draft.definition.layout,
-                state.hex_values,
-                &shared,
-                &types,
-            ),
+            None => {
+                // A type reached from inside a type would nest with nothing to
+                // come back to, so the request is dropped here.
+                super::frame_edit::layout(
+                    ui,
+                    &mut draft.definition.layout,
+                    state.hex_values,
+                    &shared,
+                    &types,
+                );
+            }
         });
 
     ui.separator();

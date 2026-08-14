@@ -545,8 +545,41 @@ impl FrameLibrary {
         std::fs::write(&file, written)
             .with_context(|| format!("cannot write {}", file.display()))?;
 
-        self.reload();
+        self.reload_keeping_the_frame_draft();
         Ok(())
+    }
+
+    /// Reloads without throwing away a frame someone is in the middle of.
+    ///
+    /// A type can be opened from a field of a frame being edited, and that
+    /// frame is waiting underneath. Its expanded fields came from the type as
+    /// it was, so they are asked for again from the type as it now is.
+    fn reload_keeping_the_frame_draft(&mut self) {
+        let held = self.draft.take();
+        self.reload();
+        self.draft = held;
+
+        let types = self.types.clone();
+        let Some(draft) = &mut self.draft else {
+            return;
+        };
+        let endian = draft.frame.endian;
+        let stated: Vec<(String, sim_core::frame::Stated)> = draft
+            .frame
+            .stated
+            .iter()
+            .map(|(name, held)| (name.clone(), held.clone()))
+            .collect();
+        for (name, held) in stated {
+            let Ok(expansion) = schema::instantiate(&types, &name, &held.kind, &held, endian)
+            else {
+                continue;
+            };
+            let Some(at) = draft.frame.declared.iter().position(|held| *held == name) else {
+                continue;
+            };
+            layout::state_as(&mut draft.frame, at, Some(&held), expansion);
+        }
     }
 
     /// Deletes the selected shared type, writing out in full everything that
@@ -2355,5 +2388,48 @@ covers = { from = "data", to = "data" }
         library.save_type_draft().unwrap();
 
         assert_eq!(library.unused_type_name("NewType"), "NewType 2");
+    }
+
+    #[test]
+    fn a_frame_waiting_under_a_type_follows_the_type_when_it_changes() {
+        let (_, mut library) = shared("draft-under-type");
+        let types = library.types().clone();
+        library.begin_new(FrameDef::flat("Built", vec![plain("colour")]));
+        let stated = Stated {
+            kind: "Rgb".to_owned(),
+            repeat: None,
+            instances: None,
+        };
+        {
+            let draft = library.draft.as_mut().unwrap();
+            let expansion =
+                schema::instantiate(&types, "colour", "Rgb", &stated, draft.frame.endian).unwrap();
+            layout::state_as(&mut draft.frame, 0, Some(&stated), expansion);
+        }
+        assert_eq!(library.draft.as_ref().unwrap().frame.size(), 3);
+
+        // Off to the type, as the Edit button beside the field does.
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Rgb");
+        library.begin_type_edit();
+        let type_draft = library.type_draft.as_mut().unwrap();
+        layout::add_field(
+            &mut type_draft.definition.layout,
+            None,
+            FieldDef {
+                name: "white".to_owned(),
+                ..plain("white")
+            },
+        );
+        library.save_type_draft().unwrap();
+
+        // Back to the frame, which is still there and now four bytes wide.
+        let draft = library.draft.as_ref().expect("the frame is still waiting");
+        assert_eq!(draft.frame.declared, ["colour"]);
+        assert_eq!(draft.frame.size(), 4);
+        assert!(draft.frame.field_index("colour.white").is_some());
+        assert_eq!(library.draft_problem(), None);
     }
 }

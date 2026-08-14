@@ -36,6 +36,16 @@ const SCALARS: [ScalarType; 10] = [
     ScalarType::F64,
 ];
 
+/// A type the editor was asked to go and work on.
+///
+/// Reached from the field that names it rather than from a list somewhere else,
+/// which is where the question comes up: this field is an `Rgb` and the `Rgb` is
+/// wrong.
+pub enum TypeWanted {
+    Edit(String),
+    New,
+}
+
 /// A type the folder shares, as the picker offers it.
 #[derive(Clone)]
 pub struct Shared {
@@ -64,32 +74,57 @@ pub fn fields(ui: &mut Ui, state: &mut AppState) {
     let Some(draft) = &mut state.frames.draft else {
         return;
     };
-    layout(ui, &mut draft.frame, hex, &shared, &types);
+    let wanted = layout(ui, &mut draft.frame, hex, &shared, &types);
+
+    // The frame stays open underneath, so coming back from the type lands where
+    // it was left.
+    match wanted {
+        Some(TypeWanted::Edit(name)) => {
+            state.frames.type_selected = state
+                .frames
+                .type_entries
+                .iter()
+                .position(|entry| entry.definition.name() == name);
+            state.frames.begin_type_edit();
+        }
+        Some(TypeWanted::New) => {
+            let name = state.frames.unused_type_name("NewType");
+            state
+                .frames
+                .begin_new_type(sim_core::frame::schema::TypeDef {
+                    layout: FrameDef::flat(name, Vec::new()),
+                    narrows: None,
+                });
+        }
+        None => {}
+    }
 }
 
 /// One pass over a field list, whoever it belongs to.
 ///
 /// `shared` is what the folder's `types/` offers, which the kind picker lists
 /// after the builtins.
-pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool, shared: &[Shared], types: &TypeLibrary) {
+pub fn layout(
+    ui: &mut Ui,
+    list: &mut FrameDef,
+    hex: bool,
+    shared: &[Shared],
+    types: &TypeLibrary,
+) -> Option<TypeWanted> {
     // Drawn from a copy so a row may decide to remove itself without the rest
     // of the pass reading a list that has moved under it.
     let frame = list.clone();
     let mut edit = None;
+    let mut wanted = None;
 
     for (index, declared) in frame.declared.iter().enumerate() {
         field_row(
             ui,
             list,
             &frame,
-            &Row {
-                index,
-                declared,
-                hex,
-                stated: layout::stated_of(&frame, index).cloned(),
-                shared,
-            },
+            &Row::new(&frame, index, declared, hex, shared),
             &mut edit,
+            &mut wanted,
         );
     }
 
@@ -138,6 +173,7 @@ pub fn layout(ui: &mut Ui, list: &mut FrameDef, hex: bool, shared: &[Shared], ty
         }
         None => {}
     }
+    wanted
 }
 
 /// Everything one row needs to know that is not the field list itself.
@@ -145,9 +181,42 @@ struct Row<'a> {
     index: usize,
     declared: &'a str,
     hex: bool,
+    /// The type the file states this field as, when the folder shares one of
+    /// that name. Worked out once, since the header and the body both ask.
+    named_type: Option<String>,
+    /// Standing for several fields the editor cannot reword.
+    expanded: bool,
     /// How the file states this field, when a name alone would not say it.
     stated: Option<Stated>,
     shared: &'a [Shared],
+}
+
+impl<'a> Row<'a> {
+    fn new(
+        frame: &'a FrameDef,
+        index: usize,
+        declared: &'a str,
+        hex: bool,
+        shared: &'a [Shared],
+    ) -> Self {
+        let stated = layout::stated_of(frame, index).cloned();
+        // A field the model still holds under its own name is one the editor
+        // may reword; anything else came out of a type and is shown as it
+        // stands.
+        let named_type = stated
+            .as_ref()
+            .map(|stated| stated.kind.clone())
+            .filter(|kind| shared.iter().any(|held| held.name == *kind));
+        Self {
+            index,
+            declared,
+            hex,
+            expanded: layout::is_expanded(frame, declared) && named_type.is_none(),
+            named_type,
+            stated,
+            shared,
+        }
+    }
 }
 
 fn field_row(
@@ -156,19 +225,13 @@ fn field_row(
     frame: &FrameDef,
     row: &Row<'_>,
     edit: &mut Option<Edit>,
+    wanted: &mut Option<TypeWanted>,
 ) {
     let Row {
         index, declared, ..
     } = *row;
-    let stated = row.stated.clone();
-    // A field the model still holds under its own name is one the editor may
-    // reword; anything else came out of a type and is shown as it stands.
-    let named_type = stated
-        .as_ref()
-        .map(|stated| stated.kind.clone())
-        .filter(|kind| row.shared.iter().any(|held| held.name == *kind));
+    let expanded = row.expanded;
     let id = Id::new(("frame_field", index, declared));
-    let expanded = layout::is_expanded(layout, declared) && named_type.is_none();
     CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
             if ui
@@ -218,18 +281,10 @@ fn field_row(
             {
                 *edit = Some(Edit::Rename(index, name));
             }
-            kind_picker(ui, layout, frame, row, edit);
+            kind_picker(ui, layout, frame, row, edit, wanted);
         })
         .body(|ui| {
-            field_body(
-                ui,
-                layout,
-                frame,
-                row,
-                named_type.as_deref(),
-                expanded,
-                edit,
-            );
+            field_body(ui, layout, frame, row, edit, wanted);
         });
 }
 
@@ -239,16 +294,17 @@ fn field_body(
     layout: &mut FrameDef,
     frame: &FrameDef,
     row: &Row<'_>,
-    named_type: Option<&str>,
-    expanded: bool,
     edit: &mut Option<Edit>,
+    wanted: &mut Option<TypeWanted>,
 ) {
     let Row {
         index,
         declared,
         hex,
+        expanded,
         ..
     } = *row;
+    let named_type = row.named_type.as_deref();
     if expanded {
         for at in frame.expansion_of(declared) {
             ui.label(
@@ -289,12 +345,22 @@ fn field_body(
                 .weak(),
             );
         }
-        ui.label(
-            RichText::new(format!(
-                "Shared: editing {kind} changes every frame naming it."
-            ))
-            .weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Shared: editing {kind} changes every frame naming it."
+                ))
+                .weak(),
+            );
+            // Reached from the field that names it, which is where the wish to
+            // change it comes up.
+            if ui
+                .button(format!("{} Edit {kind}", icons::PENCIL_SIMPLE))
+                .clicked()
+            {
+                *wanted = Some(TypeWanted::Edit((*kind).to_owned()));
+            }
+        });
         return;
     }
     details(ui, layout, frame, index, hex, false);
@@ -306,6 +372,7 @@ fn kind_picker(
     frame: &FrameDef,
     row: &Row<'_>,
     edit: &mut Option<Edit>,
+    wanted: &mut Option<TypeWanted>,
 ) {
     let index = row.index;
     let current = match &row.stated {
@@ -353,6 +420,13 @@ fn kind_picker(
                         }),
                     ));
                 }
+            }
+            if ui
+                .button(format!("{} New type...", icons::PLUS))
+                .on_hover_text("Make one now, and give it to this field afterwards")
+                .clicked()
+            {
+                *wanted = Some(TypeWanted::New);
             }
         });
 }
