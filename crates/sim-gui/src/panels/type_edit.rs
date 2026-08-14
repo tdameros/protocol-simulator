@@ -169,6 +169,7 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
                     state.hex_values,
                     &shared,
                     &types,
+                    false,
                 );
             }
         });

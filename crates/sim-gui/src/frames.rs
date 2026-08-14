@@ -2409,10 +2409,11 @@ covers = { from = "data", to = "data" }
         assert!(!layout::remove_field(&mut draft.frame, 0));
         assert_eq!(draft.frame.declared, ["data", "crc"]);
 
-        // Nor by moving the checksum in front of it, which lands in the same
-        // place: a checksum with nothing to cover.
+        // Moving it in front is another matter: a checksum before what it
+        // covers still loads and still encodes, so nothing stands in the way.
         layout::move_field(&mut draft.frame, 1, false);
-        assert_eq!(draft.frame.declared, ["data", "crc"]);
+        assert_eq!(draft.frame.declared, ["crc", "data"]);
+        assert_eq!(draft.problem(&TypeLibrary::default()), None);
     }
 
     #[test]
@@ -2916,6 +2917,35 @@ covers = { from = "data", to = "data" }
 
         layout::rename_field(&mut draft.frame, 0, "start");
         assert_eq!(draft.frame.declared, ["start", "here", "crc"]);
+        assert_eq!(draft.problem(&TypeLibrary::default()), None);
+    }
+
+    #[test]
+    fn a_checksum_cannot_be_moved_above_what_it_covers() {
+        let text = r#"
+name = "Guarded"
+
+[[field]]
+name = "a"
+type = "u8"
+
+[[field]]
+name = "b"
+type = "u8"
+
+[[field]]
+name = "crc"
+type = "crc16"
+algo = "crc16-ccitt"
+covers = { from = "a", to = "b" }
+"#;
+        let mut draft = draft_of(text);
+
+        // Moving it up puts it between the two bytes it protects, which leaves
+        // it inside its own range and unsavable.
+        layout::move_field(&mut draft.frame, 2, false);
+
+        assert_eq!(draft.frame.declared, ["a", "b", "crc"]);
         assert_eq!(draft.problem(&TypeLibrary::default()), None);
     }
 }

@@ -143,18 +143,28 @@ pub fn move_field(layout: &mut FrameDef, index: usize, down: bool) {
         return;
     };
 
-    if first == 0
-        && matches!(
-            layout.field(&below).map(|field| &field.kind),
-            Some(FieldKind::Checksum { .. })
-        )
-    {
+    // Tried on a copy: a move can put a checksum inside the run it covers, and
+    // there is no sensible range left once it has.
+    let mut candidate = layout.clone();
+    reorder(&mut candidate, first, second, &above, &below);
+    if covers_itself(&candidate) {
         return;
     }
+    *layout = candidate;
+}
 
+/// Whether any checksum has ended up inside the stretch it protects.
+fn covers_itself(layout: &FrameDef) -> bool {
+    layout.fields.iter().enumerate().any(|(at, field)| {
+        matches!(&field.kind, FieldKind::Checksum { covers, .. }
+            if (covers.from..=covers.to).contains(&at))
+    })
+}
+
+fn reorder(layout: &mut FrameDef, first: usize, second: usize, above: &str, below: &str) {
     with_spans_kept(layout, |layout| {
-        let above = layout.expansion_of(&above);
-        let below = layout.expansion_of(&below);
+        let above = layout.expansion_of(above);
+        let below = layout.expansion_of(below);
         // Rotating rather than swapping: the two runs need not be the same
         // length, one being a type instance and the other a single byte.
         layout.fields[above.start..below.end].rotate_left(above.len());

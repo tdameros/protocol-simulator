@@ -75,7 +75,7 @@ pub fn fields(ui: &mut Ui, state: &mut AppState) {
     let Some(draft) = &mut state.frames.draft else {
         return;
     };
-    let wanted = layout(ui, &mut draft.frame, hex, &shared, &types);
+    let wanted = layout(ui, &mut draft.frame, hex, &shared, &types, true);
 
     // The frame stays open underneath, so coming back from the type lands where
     // it was left.
@@ -112,10 +112,14 @@ pub fn layout(
     hex: bool,
     shared: &[Shared],
     types: &TypeLibrary,
+    inherits: bool,
 ) -> Option<TypeWanted> {
     // Drawn from a copy so a row may decide to remove itself without the rest
     // of the pass reading a list that has moved under it.
     let frame = list.clone();
+    // A frame lends its order to the fields that say nothing; a type has none
+    // to lend, being given one by whichever frame names it.
+    let inherited = inherits.then_some(list.endian);
     let mut edit = None;
     let mut wanted = None;
 
@@ -124,7 +128,7 @@ pub fn layout(
             ui,
             list,
             &frame,
-            &Row::new(&frame, index, declared, hex, shared),
+            &Row::new(&frame, index, declared, hex, shared, inherited),
             &mut edit,
             &mut wanted,
         );
@@ -180,6 +184,9 @@ pub fn layout(
 
 /// Everything one row needs to know that is not the field list itself.
 struct Row<'a> {
+    /// The list as it stood when the pass began, which a row reads while the
+    /// live one is being changed under it.
+    frame: &'a FrameDef,
     index: usize,
     declared: &'a str,
     hex: bool,
@@ -188,6 +195,12 @@ struct Row<'a> {
     named_type: Option<String>,
     /// Standing for several fields the editor cannot reword.
     expanded: bool,
+    /// The order a field follows by saying nothing, when there is one.
+    ///
+    /// `None` inside a shared type: a type has no byte order of its own, its
+    /// fields taking the order of whichever frame names it. Offering a picker
+    /// there would have to name an order, and any it named would be a guess.
+    inherited: Option<Endianness>,
     /// How the file states this field, when a name alone would not say it.
     stated: Option<Stated>,
     shared: &'a [Shared],
@@ -200,6 +213,7 @@ impl<'a> Row<'a> {
         declared: &'a str,
         hex: bool,
         shared: &'a [Shared],
+        inherited: Option<Endianness>,
     ) -> Self {
         let stated = layout::stated_of(frame, index).cloned();
         // A field the model still holds under its own name is one the editor
@@ -210,6 +224,7 @@ impl<'a> Row<'a> {
             .map(|stated| stated.kind.clone())
             .filter(|kind| shared.iter().any(|held| held.name == *kind));
         Self {
+            frame,
             index,
             declared,
             hex,
@@ -217,6 +232,7 @@ impl<'a> Row<'a> {
             named_type,
             stated,
             shared,
+            inherited,
         }
     }
 }
@@ -304,11 +320,7 @@ fn field_body(
     wanted: &mut Option<TypeWanted>,
 ) {
     let Row {
-        index,
-        declared,
-        hex,
-        expanded,
-        ..
+        declared, expanded, ..
     } = *row;
     let named_type = row.named_type.as_deref();
     if expanded {
@@ -335,7 +347,7 @@ fn field_body(
             .iter()
             .any(|held| held.name == *kind && !held.group)
         {
-            details(ui, layout, frame, index, hex, true);
+            details(ui, layout, row, true);
         }
         // What the type puts on the wire, which is the thing worth
         // seeing here. Changing any of it means changing the type,
@@ -367,7 +379,7 @@ fn field_body(
         );
         return;
     }
-    details(ui, layout, frame, index, hex, false);
+    details(ui, layout, row, false);
 }
 
 fn kind_picker(
@@ -511,15 +523,13 @@ fn repeats(ui: &mut Ui, row: &Row<'_>, edit: &mut Option<Edit>) {
 }
 
 /// The kind-specific part of a field, below the row that names it.
-fn details(
-    ui: &mut Ui,
-    layout: &mut FrameDef,
-    frame: &FrameDef,
-    index: usize,
-    hex: bool,
-    stated: bool,
-) {
-    let inherited = layout.endian;
+fn details(ui: &mut Ui, layout: &mut FrameDef, row: &Row<'_>, stated: bool) {
+    let Row {
+        index,
+        hex,
+        inherited,
+        ..
+    } = *row;
     let Some(field) = layout::plain_field_mut(layout, index) else {
         return;
     };
@@ -531,7 +541,7 @@ fn details(
             field.description = (!description.trim().is_empty()).then_some(description);
         }
     });
-    if layout::has_byte_order(field) {
+    if let Some(inherited) = inherited.filter(|_| layout::has_byte_order(field)) {
         byte_order(ui, &mut field.endian, Some(inherited));
     }
 
@@ -551,7 +561,7 @@ fn details(
         FieldKind::Bits { repr, bits } => bits_details(ui, index, *repr, bits),
         FieldKind::Checksum { covers, .. } => {
             let span = *covers;
-            coverage_picker(ui, layout, frame, index, span);
+            coverage_picker(ui, layout, row.frame, index, span);
         }
     }
 }
@@ -642,28 +652,69 @@ fn enum_details(
     ui.label(RichText::new(format!("{} on the wire", repr.name())).weak());
     let digits = repr.size() * 2;
     let mut remove = None;
-    for (at, variant) in variants.iter_mut().enumerate() {
+    let mut renamed: Option<(usize, String)> = None;
+    for (at, variant) in variants.iter().enumerate() {
         ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut variant.name)
-                    .id_salt(("variant", index, at))
-                    .desired_width(ui.spacing().interact_size.x * 4.0),
-            );
-            ui.add(number(&mut variant.value, hex.then_some(digits)));
+            let mut name = variant.name.clone();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut name)
+                        .id_salt(("variant", index, at))
+                        .desired_width(ui.spacing().interact_size.x * 4.0),
+                )
+                .changed()
+            {
+                renamed = Some((at, name));
+            }
             if ui.button(icons::MINUS).clicked() {
                 remove = Some(at);
             }
         });
+    }
+    // The value boxes are drawn apart from the names so that changing one can
+    // reorder the list without the loop reading a row that has moved.
+    let mut values: Vec<u64> = variants.iter().map(|variant| variant.value).collect();
+    let mut changed = false;
+    for (at, value) in values.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(variants[at].name.clone()).weak());
+            changed |= ui.add(number(value, hex.then_some(digits))).changed();
+        });
+    }
+    if changed {
+        for (variant, value) in variants.iter_mut().zip(values) {
+            variant.value = value;
+        }
+        // A file lists variants by value, and so does the loader, so the editor
+        // has to as well. Held in any other order, the frame comes back
+        // reordered and can never be saved.
+        variants.sort_by_key(|variant| variant.value);
+    }
+
+    // Two variants of one name collapse into one entry, the file holding them
+    // in a table keyed by name, so a rename onto another is refused.
+    if let Some((at, name)) = renamed {
+        let free = !name.is_empty()
+            && !variants
+                .iter()
+                .enumerate()
+                .any(|(held, variant)| held != at && variant.name == name);
+        if free {
+            variants[at].name = name;
+        }
     }
     if let Some(at) = remove {
         variants.remove(at);
     }
     if ui.button(format!("{} Add value", icons::PLUS)).clicked() {
         let next = variants.iter().map(|held| held.value).max().unwrap_or(0) + 1;
-        variants.push(EnumVariant {
-            name: format!("VALUE{next}"),
-            value: next,
-        });
+        let name = (next..)
+            .take(variants.len() + 2)
+            .map(|suffix| format!("VALUE{suffix}"))
+            .find(|wanted| variants.iter().all(|held| held.name != *wanted))
+            .unwrap_or_else(|| format!("VALUE{next}"));
+        variants.push(EnumVariant { name, value: next });
+        variants.sort_by_key(|variant| variant.value);
     }
 }
 
