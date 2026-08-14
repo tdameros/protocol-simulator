@@ -38,13 +38,16 @@ pub fn rename_field(layout: &mut FrameDef, index: usize, name: &str) {
     let Some(old) = layout.declared.get(index).cloned() else {
         return;
     };
-    if name == old || name.is_empty() {
+    if name == old {
         return;
     }
     // Two fields of one name is not a frame the loader will take, and the
     // values a technician types are held against the name, so the second one
     // would quietly answer for both. Refused while it is being typed rather
     // than reported once it is too late.
+    //
+    // An empty one goes through: clearing the box before retyping is how a
+    // name gets changed, and the guard refuses the save until it has one.
     if layout.declared.iter().any(|held| held == name) || layout.field_index(name).is_some() {
         return;
     }

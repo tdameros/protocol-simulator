@@ -62,6 +62,9 @@ pub enum SchemaError {
     #[error("field {field}: two bits are both named {name}")]
     DuplicateBit { field: String, name: String },
 
+    #[error("a field needs a name")]
+    UnnamedField,
+
     #[error("type {name} has no fields")]
     EmptyType { name: String },
 
@@ -1100,6 +1103,12 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
 
     let mut seen: Vec<&str> = Vec::new();
     for field in &expanded {
+        // Everything holds a field by its name: the values a technician types,
+        // a checksum's range, a scenario waiting on it. A nameless one would
+        // answer to nothing.
+        if field.name.trim().is_empty() {
+            return Err(SchemaError::UnnamedField);
+        }
         if seen.contains(&field.name.as_str()) {
             return Err(SchemaError::DuplicateField {
                 name: field.name.clone(),

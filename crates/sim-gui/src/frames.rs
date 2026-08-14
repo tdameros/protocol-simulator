@@ -2753,4 +2753,29 @@ covers = { from = "data", to = "data" }
         assert_eq!(draft.frame.declared, ["start", "here", "crc"]);
         assert_eq!(covered(&draft), ("start".to_owned(), "here.y".to_owned()));
     }
+
+    #[test]
+    fn a_field_name_can_be_cleared_on_the_way_to_another_one() {
+        let mut draft = Draft {
+            origin: Some(Origin {
+                file: PathBuf::from("layered.toml"),
+                stated: schema::stated_as_types(LAYERED),
+                text: LAYERED.to_owned(),
+            }),
+            ..draft_of(LAYERED)
+        };
+
+        // Emptying the box is how a name gets replaced, so it goes through.
+        layout::rename_field(&mut draft.frame, 0, "");
+        assert_eq!(draft.frame.declared, ["", "here", "crc"]);
+
+        // And the save is refused while it stands, rather than writing a field
+        // that answers to nothing.
+        let problem = draft.problem(&TypeLibrary::default()).expect("refused");
+        assert!(problem.contains("needs a name"), "{problem}");
+
+        layout::rename_field(&mut draft.frame, 0, "start");
+        assert_eq!(draft.frame.declared, ["start", "here", "crc"]);
+        assert_eq!(draft.problem(&TypeLibrary::default()), None);
+    }
 }
