@@ -2027,38 +2027,6 @@ covers = { from = "data", to = "data" }
     }
 
     #[test]
-    fn turning_a_group_into_a_subtype_and_back_stays_savable() {
-        let (dir, mut library) = shared("types-shape");
-        library.type_selected = library
-            .type_entries
-            .iter()
-            .position(|entry| entry.definition.name() == "Rgb");
-        library.begin_type_edit();
-
-        // What the panel's shape toggle does, in the order a mouse would.
-        let draft = library.type_draft.as_mut().unwrap();
-        draft.definition.layout.fields.clear();
-        draft.definition.layout.declared.clear();
-        draft.definition.layout.stated.clear();
-        draft.definition.narrows = Some(Subtype {
-            base: "u8".to_owned(),
-            range: Some(ValueRange::Uint { min: 0, max: 7 }),
-        });
-
-        assert_eq!(library.type_draft_problem(), None);
-        // The frame using it goes from three bytes to one, and says so.
-        assert_eq!(
-            library.type_draft_impact(),
-            vec![("Lamp".to_owned(), Effect::Resized { was: 3, now: 1 })]
-        );
-
-        library.save_type_draft().unwrap();
-        let text = std::fs::read_to_string(dir.join(TYPES_DIR).join("shared.toml")).unwrap();
-        assert!(text.contains(r#"base = "u8""#), "{text}");
-        assert!(!text.contains(r#"name = "red""#), "{text}");
-    }
-
-    #[test]
     fn a_field_set_to_a_type_by_mistake_can_be_set_back() {
         let (_, mut library) = shared("state-undo");
         let types = library.types().clone();
@@ -2118,5 +2086,46 @@ covers = { from = "data", to = "data" }
         assert!(draft.frame.field_index("tint.green").is_some());
         assert_eq!(draft.frame.stated.keys().collect::<Vec<_>>(), ["tint"]);
         assert_eq!(library.draft_problem(), None);
+    }
+
+    /// The one thing a field of a narrowed scalar may still say for itself, and
+    /// the reason a subtype is not a group of one.
+    #[test]
+    fn a_field_of_a_narrowed_scalar_keeps_its_own_default() {
+        let dir = scratch("subtype-default");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(TYPES_DIR)).unwrap();
+        std::fs::write(
+            dir.join(TYPES_DIR).join("percent.toml"),
+            "[[type]]\nname = \"Percent\"\nbase = \"u8\"\nrange = { min = 0, max = 100 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("lamp.toml"),
+            "name = \"Lamp\"\n\n[[field]]\nname = \"brightness\"\ntype = \"Percent\"\ndefault = 80\n",
+        )
+        .unwrap();
+        let mut library = FrameLibrary::default();
+        library.load_from(dir.clone());
+
+        // One field under its own name, not `brightness.value`, carrying a
+        // default a group could not have given it.
+        let frame = &library.entries[0].frame;
+        assert_eq!(frame.declared, ["brightness"]);
+        assert_eq!(frame.fields[0].default, Some(Value::Uint(80)));
+        assert_eq!(
+            frame.fields[0].range,
+            Some(ValueRange::Uint { min: 0, max: 100 })
+        );
+
+        library.begin_edit();
+        let draft = library.draft.as_mut().unwrap();
+        draft.frame.fields[0].default = Some(Value::Uint(40));
+
+        assert_eq!(library.draft_problem(), None);
+        library.save_draft(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join("lamp.toml")).unwrap();
+        assert!(text.contains("default = 40"), "{text}");
+        assert!(text.contains(r#"type = "Percent""#), "{text}");
     }
 }

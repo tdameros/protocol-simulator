@@ -158,10 +158,7 @@ fn field_row(
     edit: &mut Option<Edit>,
 ) {
     let Row {
-        index,
-        declared,
-        hex,
-        ..
+        index, declared, ..
     } = *row;
     let stated = row.stated.clone();
     // A field the model still holds under its own name is one the editor may
@@ -224,46 +221,83 @@ fn field_row(
             kind_picker(ui, layout, frame, row, edit);
         })
         .body(|ui| {
-            if expanded {
-                for at in frame.expansion_of(declared) {
-                    ui.label(
-                        RichText::new(format!(
-                            "{}  {}",
-                            frame.fields[at].name,
-                            frame.fields[at].kind.type_name()
-                        ))
-                        .weak(),
-                    );
-                }
-                ui.label(RichText::new("Stated as a type, and edited where the type is.").weak());
-                return;
-            }
-            if let Some(kind) = &named_type {
-                repeats(ui, row, edit);
-                // What the type puts on the wire, which is the thing worth
-                // seeing here. Changing any of it means changing the type,
-                // above under Shared types, since every frame naming it would
-                // change with it.
-                for at in frame.expansion_of(declared) {
-                    ui.label(
-                        RichText::new(format!(
-                            "{}  {}",
-                            frame.fields[at].name,
-                            frame.fields[at].kind.type_name()
-                        ))
-                        .weak(),
-                    );
-                }
-                ui.label(
-                    RichText::new(format!(
-                        "Shared: editing {kind} changes every frame naming it."
-                    ))
-                    .weak(),
-                );
-                return;
-            }
-            details(ui, layout, frame, index, hex, false);
+            field_body(
+                ui,
+                layout,
+                frame,
+                row,
+                named_type.as_deref(),
+                expanded,
+                edit,
+            );
         });
+}
+
+/// What a row shows once it is opened, which depends on what the field is.
+fn field_body(
+    ui: &mut Ui,
+    layout: &mut FrameDef,
+    frame: &FrameDef,
+    row: &Row<'_>,
+    named_type: Option<&str>,
+    expanded: bool,
+    edit: &mut Option<Edit>,
+) {
+    let Row {
+        index,
+        declared,
+        hex,
+        ..
+    } = *row;
+    if expanded {
+        for at in frame.expansion_of(declared) {
+            ui.label(
+                RichText::new(format!(
+                    "{}  {}",
+                    frame.fields[at].name,
+                    frame.fields[at].kind.type_name()
+                ))
+                .weak(),
+            );
+        }
+        ui.label(RichText::new("Stated as a type, and edited where the type is.").weak());
+        return;
+    }
+    if let Some(kind) = &named_type {
+        repeats(ui, row, edit);
+        // A field of a narrowed scalar is still one scalar, under its
+        // own name, so what belongs to the field rather than to the
+        // type stays editable here: its description and its default.
+        if row
+            .shared
+            .iter()
+            .any(|held| held.name == *kind && !held.group)
+        {
+            details(ui, layout, frame, index, hex, true);
+        }
+        // What the type puts on the wire, which is the thing worth
+        // seeing here. Changing any of it means changing the type,
+        // above under Shared types, since every frame naming it would
+        // change with it.
+        for at in frame.expansion_of(declared) {
+            ui.label(
+                RichText::new(format!(
+                    "{}  {}",
+                    frame.fields[at].name,
+                    frame.fields[at].kind.type_name()
+                ))
+                .weak(),
+            );
+        }
+        ui.label(
+            RichText::new(format!(
+                "Shared: editing {kind} changes every frame naming it."
+            ))
+            .weak(),
+        );
+        return;
+    }
+    details(ui, layout, frame, index, hex, false);
 }
 
 fn kind_picker(

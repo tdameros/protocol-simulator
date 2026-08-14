@@ -1,10 +1,14 @@
 //! Editing the types every frame in a folder shares.
 //!
-//! A shared type is one of two things, and the file format will not have both:
-//! a group of fields, edited with the very editor a frame's fields are edited
-//! with, or a scalar narrowed to the values the protocol allows. Which of the
-//! two is a setting inside the type rather than a choice to be made before
-//! there is one, both being a `[[type]]` in the same folder.
+//! A shared type here is a structure: a group of fields written once and named
+//! wherever it repeats, edited with the very editor a frame's fields are edited
+//! with.
+//!
+//! The format has a second form, a scalar narrowed to the values the protocol
+//! allows, and one written by hand is still shown and edited here. The editor
+//! does not offer to make new ones: a field can be given bounds where it is
+//! used, which is one idea to learn instead of two, and the named form is a
+//! factorisation worth reaching for a file rather than a button.
 //!
 //! Changing a type reaches every frame naming it, so what it would do to them
 //! is shown beside Save rather than discovered at the next Reload.
@@ -71,12 +75,11 @@ pub fn library_bar(ui: &mut Ui, state: &mut AppState) {
                 state.frames.type_draft.is_none(),
                 egui::Button::new(format!("{} New", icons::FILE_PLUS)),
             )
-            .on_hover_text("A type every frame in this folder can name")
+            .on_hover_text("A group of fields every frame in this folder can name")
             .clicked()
         {
-            // Started as a group with nothing in it, which Save refuses until
-            // it is told what it is. A subtype would be savable straight away,
-            // and an empty one nobody meant to make is worse than a prompt.
+            // Empty, which Save refuses until it has been given a field. There
+            // is nothing else to decide first.
             state.frames.begin_new_type(TypeDef {
                 layout: FrameDef::flat("NewType", Vec::new()),
                 narrows: None,
@@ -124,7 +127,6 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
         ui.label("Type:");
         ui.text_edit_singleline(&mut draft.definition.layout.name);
     });
-    shape(ui, &mut draft.definition);
     let mut description = draft
         .definition
         .layout
@@ -190,37 +192,15 @@ pub fn editor(ui: &mut Ui, state: &mut AppState) {
     });
 }
 
-/// Which of the two things a type is.
-///
-/// The format will not have both at once, so switching empties the other side.
-/// Deliberate rather than clever: keeping the fields of a type that is no
-/// longer a group would write a file the loader refuses, and hiding them would
-/// leave the editor showing something the file does not say.
-fn shape(ui: &mut Ui, definition: &mut TypeDef) {
-    let subtype = definition.narrows.is_some();
-    ui.horizontal(|ui| {
-        ui.label("Holds:");
-        if ui.selectable_label(!subtype, "fields").clicked() && subtype {
-            definition.narrows = None;
-        }
-        if ui
-            .selectable_label(subtype, "one narrowed scalar")
-            .clicked()
-            && !subtype
-        {
-            definition.layout.fields.clear();
-            definition.layout.declared.clear();
-            definition.layout.stated.clear();
-            definition.narrows = Some(Subtype {
-                base: ScalarType::U8.name().to_owned(),
-                range: Some(ScalarType::U8.representable()),
-            });
-        }
-    });
-}
-
 /// The whole of a subtype: what it narrows, and to what.
 fn narrowing(ui: &mut Ui, narrows: &mut Subtype) {
+    ui.label(
+        RichText::new(
+            "A narrowed scalar, which is written by hand. A field can be given \
+             bounds of its own where it is used.",
+        )
+        .weak(),
+    );
     let scalar = ScalarType::parse(&narrows.base);
     ui.horizontal(|ui| {
         ui.label("Narrows:");
