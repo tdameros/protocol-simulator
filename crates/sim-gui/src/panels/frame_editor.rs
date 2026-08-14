@@ -20,16 +20,32 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
     library_bar(ui, state);
 
-    if state.frames.frames.is_empty() {
-        if state.frames.directory.is_some() && state.frames.failures.is_empty() {
-            ui.label("No .toml frame definition in that folder.");
-        }
-        show_failures(ui, state);
+    // The type first: it can be opened from a field of a frame being edited,
+    // and that frame has to be waiting underneath when the type is done with.
+    if state.frames.type_draft.is_some() {
+        super::type_edit::editor(ui, state);
+        return;
+    }
+    // Editing a copy, so what the list and the disk hold is untouched until
+    // Save says otherwise.
+    if state.frames.draft.is_some() {
+        draft_editor(ui, state);
         return;
     }
 
+    // Drawn even with nothing in the folder, both of them: New lives on these
+    // rows, and a folder emptied of its last frame has to leave a way to make
+    // another one.
+    super::type_edit::library_bar(ui, state);
     frame_picker(ui, state);
     show_failures(ui, state);
+
+    if state.frames.is_empty() {
+        if state.frames.directory.is_some() && state.frames.failures.is_empty() {
+            ui.label("No .toml frame definition in that folder.");
+        }
+        return;
+    }
     ui.separator();
 
     let Some(frame) = state.frames.selected_frame().cloned() else {
@@ -60,11 +76,17 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
 fn library_bar(ui: &mut Ui, state: &mut AppState) {
     ui.horizontal(|ui| {
+        // Both throw the draft away, so neither is offered while one is open:
+        // losing unsaved work to a stray click is not a trade worth making.
+        let idle = state.frames.draft.is_none() && state.frames.type_draft.is_none();
         if ui
-            .button(RichText::new(format!(
-                "{} Frames folder",
-                icons::FOLDER_OPEN
-            )))
+            .add_enabled(
+                idle,
+                egui::Button::new(RichText::new(format!(
+                    "{} Frames folder",
+                    icons::FOLDER_OPEN
+                ))),
+            )
             .clicked()
         {
             if let Some(directory) = rfd::FileDialog::new().pick_folder() {
@@ -73,7 +95,10 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
         }
         if state.frames.directory.is_some()
             && ui
-                .button(RichText::new(format!("{} Reload", icons::ARROWS_CLOCKWISE)))
+                .add_enabled(
+                    idle,
+                    egui::Button::new(RichText::new(format!("{} Reload", icons::ARROWS_CLOCKWISE))),
+                )
                 .on_hover_text("Re-read the .toml files from disk")
                 .clicked()
         {
@@ -85,26 +110,148 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
     } else {
         ui.label("Pick the folder holding your frame .toml files.");
     }
-    if !state.frames.shared_types.is_empty() {
-        ui.label(RichText::new(format!("types/: {}", state.frames.shared_types.join(", "))).weak());
+}
+
+/// New, Edit and Delete, beside the frame they act on rather than beside the
+/// folder, so that the row reads like the one for shared types below it.
+fn definition_buttons(ui: &mut Ui, state: &mut AppState) {
+    let idle = state.frames.draft.is_none() && state.frames.type_draft.is_none();
+    if ui
+        .add_enabled(
+            state.frames.directory.is_some() && idle,
+            egui::Button::new(format!("{} New", icons::FILE_PLUS)),
+        )
+        .on_hover_text("Start a frame from scratch")
+        .clicked()
+    {
+        let name = state.frames.unused_frame_name("New frame");
+        state.frames.begin_new(blank(&name));
+    }
+    let editable = state.frames.selected_entry().is_some() && idle;
+    if ui
+        .add_enabled(
+            editable,
+            egui::Button::new(format!("{} Edit", icons::PENCIL_SIMPLE)),
+        )
+        .on_hover_text("Edit this frame definition")
+        .clicked()
+    {
+        state.frames.begin_edit();
+    }
+    if ui
+        .add_enabled(editable, egui::Button::new(icons::TRASH))
+        .on_hover_text("Delete this frame, and the file holding it")
+        .clicked()
+    {
+        if let Err(error) = state.frames.delete_selected() {
+            state.last_error = Some(format!("{error:#}"));
+        }
+    }
+}
+
+/// What New starts from: one byte, the smallest thing that is still a frame.
+fn blank(name: &str) -> FrameDef {
+    FrameDef::flat(
+        name,
+        vec![FieldDef {
+            name: "id".to_owned(),
+            description: None,
+            kind: FieldKind::Scalar(ScalarType::U8),
+            endian: sim_core::frame::Endianness::default(),
+            default: None,
+            range: None,
+        }],
+    )
+}
+
+fn draft_editor(ui: &mut Ui, state: &mut AppState) {
+    let dirty = state.frames.draft_is_dirty();
+    let problem = state.frames.draft_problem();
+    let Some(draft) = &mut state.frames.draft else {
+        return;
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("Name:");
+        ui.text_edit_singleline(&mut draft.frame.name);
+    });
+    let mut endian = draft.frame.endian;
+    super::frame_edit::byte_order(ui, &mut endian, None);
+    // Through the layout rather than by assignment: the fields that were
+    // following the frame have to keep following it.
+    crate::layout::set_endian(&mut draft.frame, endian);
+    let mut description = draft.frame.description.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Description:");
+        if ui.text_edit_singleline(&mut description).changed() {
+            draft.frame.description = (!description.trim().is_empty()).then_some(description);
+        }
+    });
+
+    ui.separator();
+    ScrollArea::vertical()
+        .id_salt("draft_fields")
+        .max_height(ui.available_height() * 0.6)
+        .show(ui, |ui| super::frame_edit::fields(ui, state));
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                dirty && problem.is_none(),
+                egui::Button::new(format!("{} Save", icons::FLOPPY_DISK)),
+            )
+            .clicked()
+        {
+            save_draft(state);
+        }
+        if ui.button("Cancel").clicked() {
+            state.frames.cancel_edit();
+        }
+        // Said here rather than after the click: a half-made frame is a normal
+        // state to be in while building one.
+        if let Some(reason) = &problem {
+            ui.colored_label(ERROR, reason);
+        }
+    });
+}
+
+/// Writes the draft out, choosing a file for one that has never had a home.
+fn save_draft(state: &mut AppState) {
+    let Some(directory) = state.frames.directory.clone() else {
+        state.last_error = Some("No frames folder to save into.".to_owned());
+        return;
+    };
+    let name = state
+        .frames
+        .draft
+        .as_ref()
+        .map(|draft| draft.frame.name.clone())
+        .unwrap_or_default();
+
+    let into = crate::frames::suggested_file(&directory, &name);
+    if let Err(error) = state.frames.save_draft(&into) {
+        state.last_error = Some(format!("{error:#}"));
     }
 }
 
 fn frame_picker(ui: &mut Ui, state: &mut AppState) {
+    if state.frames.directory.is_none() {
+        return;
+    }
     let names: Vec<String> = state
         .frames
-        .frames
-        .iter()
+        .frames()
         .map(|frame| frame.name.clone())
         .collect();
     let selected_label = state
         .frames
         .selected
         .and_then(|index| names.get(index).cloned())
-        .unwrap_or_else(|| "choose...".to_owned());
+        .unwrap_or_else(|| "none".to_owned());
 
     ui.horizontal(|ui| {
-        ui.label("Frame:");
+        super::library_label(ui, "Frame:");
         ComboBox::from_id_salt("frame_pick")
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
@@ -119,9 +266,14 @@ fn frame_picker(ui: &mut Ui, state: &mut AppState) {
                     }
                 }
             });
-        if let Some(frame) = state.frames.selected_frame() {
-            ui.label(RichText::new(format!("{} bytes", frame.size())).weak());
-        }
+        definition_buttons(ui, state);
+
+        // What follows is about the values being typed in, so it is offered
+        // only when there is a frame to type them into.
+        let Some(frame) = state.frames.selected_frame().cloned() else {
+            return;
+        };
+        ui.label(RichText::new(format!("{} bytes", frame.size())).weak());
         if ui
             .selectable_label(state.hex_values, "0x")
             .on_hover_text("Show whole-number fields in hexadecimal. They still take decimal.")
@@ -134,9 +286,7 @@ fn frame_picker(ui: &mut Ui, state: &mut AppState) {
             .on_hover_text("Reset every field to its default")
             .clicked()
         {
-            if let Some(frame) = state.frames.selected_frame().cloned() {
-                state.frames.reset_values(&frame);
-            }
+            state.frames.reset_values(&frame);
         }
     });
 

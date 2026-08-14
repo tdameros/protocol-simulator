@@ -10,11 +10,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use toml_edit::Item;
+
+use crate::document;
 
 use super::checksum::{ChecksumSpec, CrcSpec};
 use super::value::Value;
 use super::{
-    BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType,
+    BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType, Stated,
     ValueRange,
 };
 
@@ -40,6 +43,12 @@ pub enum SchemaError {
     #[error("cannot serialise frame: {0}")]
     Serialise(#[from] toml::ser::Error),
 
+    #[error("invalid toml: {0}")]
+    Edit(toml_edit::TomlError),
+
+    #[error("cannot rewrite frame: {0}")]
+    Rewrite(toml_edit::ser::Error),
+
     #[error("field {field}: unknown type {kind}, expected one of {known}")]
     UnknownType {
         field: String,
@@ -49,6 +58,12 @@ pub enum SchemaError {
 
     #[error("duplicate type name {name}")]
     DuplicateType { name: String },
+
+    #[error("field {field}: two bits are both named {name}")]
+    DuplicateBit { field: String, name: String },
+
+    #[error("a field needs a name")]
+    UnnamedField,
 
     #[error("type {name} has no fields")]
     EmptyType { name: String },
@@ -143,7 +158,7 @@ pub enum SchemaError {
     BadSubtypeBase { name: String, base: String },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum RawEndian {
     Big,
@@ -196,7 +211,7 @@ struct RawCovers {
     to: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawField {
     name: String,
     #[serde(rename = "type")]
@@ -250,7 +265,7 @@ impl RawType {
 }
 
 /// A file holding nothing but shared type definitions.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct RawTypeFile {
     #[serde(default, rename = "type")]
     types: Vec<RawType>,
@@ -276,6 +291,60 @@ struct RawFrame {
 #[derive(Debug, Default, Clone)]
 pub struct TypeLibrary {
     types: BTreeMap<String, RawType>,
+}
+
+/// A type shared by every frame in a folder, as something editable.
+///
+/// A type is one of two things, and never both: a group of fields that expands
+/// wherever the type is named, or a scalar narrowed to the values the protocol
+/// actually allows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    /// What naming this type contributes, under the name it is given. Its own
+    /// name is the type's, and a subtype's is empty.
+    pub layout: FrameDef,
+    /// Set when the type narrows a scalar rather than grouping fields.
+    pub narrows: Option<Subtype>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Subtype {
+    /// A scalar, or another subtype to narrow further.
+    pub base: String,
+    pub range: Option<ValueRange>,
+}
+
+impl TypeDef {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.layout.name
+    }
+
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.layout.description.as_deref()
+    }
+}
+
+/// A range as it is to be shown, against the scalar the base resolves to.
+fn declared_range(
+    raw: Option<&RawRange>,
+    scalar: ScalarType,
+    name: &str,
+) -> Result<Option<ValueRange>, SchemaError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    // Read through a field, the one place that already knows how to turn the
+    // two written values into bounds of the right sort.
+    build_range(
+        &RawField {
+            name: name.to_owned(),
+            range: Some(raw.clone()),
+            ..RawField::default()
+        },
+        &FieldKind::Scalar(scalar),
+    )
 }
 
 impl TypeLibrary {
@@ -331,6 +400,65 @@ impl TypeLibrary {
     #[must_use]
     pub fn names(&self) -> Vec<&str> {
         self.types.keys().map(String::as_str).collect()
+    }
+
+    /// One type as something that can be shown and edited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the type is not valid on its own, which is the same
+    /// thing as a frame naming it failing to load.
+    pub fn definition(&self, name: &str) -> Result<Option<TypeDef>, SchemaError> {
+        let Some(raw) = self.types.get(name) else {
+            return Ok(None);
+        };
+        self.define(raw).map(Some)
+    }
+
+    /// Every type the library holds, in name order.
+    ///
+    /// # Errors
+    ///
+    /// As [`TypeLibrary::definition`].
+    pub fn definitions(&self) -> Result<Vec<TypeDef>, SchemaError> {
+        self.types.values().map(|raw| self.define(raw)).collect()
+    }
+
+    fn define(&self, raw: &RawType) -> Result<TypeDef, SchemaError> {
+        let narrows = if raw.is_subtype() {
+            let mut stack = Vec::new();
+            // Called for what it refuses rather than for what it returns: the
+            // range it hands back is the one inherited down the chain, and
+            // writing that back would stamp the parent's bounds into a child
+            // that declared none, cutting it loose from its parent.
+            let (base, _inherited) = resolve_subtype(raw, &self.types, &mut stack)?;
+            // Shown against the scalar it ends up being, since that is what
+            // decides whether the bounds are signed, unsigned or fractional.
+            let scalar = ScalarType::parse(&base).ok_or_else(|| SchemaError::BadSubtypeBase {
+                name: raw.name.clone(),
+                base: base.clone(),
+            })?;
+            Some(Subtype {
+                base: raw.base.clone().unwrap_or(base),
+                range: declared_range(raw.range.as_ref(), scalar, &raw.name)?,
+            })
+        } else {
+            None
+        };
+
+        // Built as a frame of its own, which is what naming it does anyway: the
+        // fields it expands to are the fields it contributes.
+        let layout = build(
+            RawFrame {
+                name: raw.name.clone(),
+                description: raw.description.clone(),
+                endian: None,
+                types: Vec::new(),
+                fields: raw.fields.clone(),
+            },
+            self,
+        )?;
+        Ok(TypeDef { layout, narrows })
     }
 
     #[must_use]
@@ -389,6 +517,477 @@ pub fn to_toml(frame: &FrameDef) -> Result<String, SchemaError> {
     Ok(toml::to_string_pretty(&lower(frame))?)
 }
 
+/// The fields naming a type contributes, under the name it is given.
+///
+/// The expansion rules live in one place and this is how an editor reaches
+/// them: reimplementing `zone.left.led[0].mode` on the other side of the crate
+/// would drift the day either side changed.
+///
+/// # Errors
+///
+/// Returns an error if the type is unknown, or the instance not valid.
+pub fn instantiate(
+    library: &TypeLibrary,
+    name: &str,
+    kind: &str,
+    stated: &Stated,
+    endian: Endianness,
+) -> Result<Vec<FieldDef>, SchemaError> {
+    let frame = build(
+        RawFrame {
+            name: String::new(),
+            description: None,
+            endian: Some(match endian {
+                Endianness::Big => RawEndian::Big,
+                Endianness::Little => RawEndian::Little,
+            }),
+            types: Vec::new(),
+            fields: vec![RawField {
+                name: name.to_owned(),
+                kind: kind.to_owned(),
+                repeat: stated.repeat,
+                instances: stated.instances.clone(),
+                ..RawField::default()
+            }],
+        },
+        library,
+    )?;
+    Ok(frame.fields)
+}
+
+/// Writes a frame back into the text it was loaded from.
+///
+/// Unlike [`to_toml`], which serialises the expanded layout and so loses both
+/// the comments and the factorisation, this copies the frame over the document
+/// key by key. What the file says stays where it was written.
+///
+/// Only the fields the file wrote are touched, and among those only the ones
+/// the model can express on its own: a field standing for a type instance or a
+/// repeat is left exactly as typed, because the expansion it produced cannot be
+/// folded back into it. Editing such a field means editing its type.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML, or the frame not
+/// serialisable.
+pub fn update_in(text: &str, frame: &FrameDef) -> Result<String, SchemaError> {
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(SchemaError::Edit)?;
+    let fresh = as_document(frame)?;
+
+    // `type` is kept because the expansion is downstream of it, and `endian`
+    // because how a file states byte order is its own business: the pass below
+    // touches it only where leaving it would mean the wrong bytes.
+    document::merge(
+        document.as_table_mut(),
+        fresh.as_table(),
+        &["endian", "type", "field"],
+    );
+    merge_fields(&mut document, frame, fresh.as_table());
+    state_endianness(&mut document, frame);
+    Ok(document::render(&document, text))
+}
+
+fn merge_fields(document: &mut toml_edit::DocumentMut, frame: &FrameDef, fresh: &toml_edit::Table) {
+    let mut next = document::last_position(document);
+    reconcile(document.as_table_mut(), fresh, &frame.declared, &mut next);
+}
+
+/// Writes a run of `[[field]]` sections over the ones already in `holder`.
+///
+/// Shared by a frame and by a type that groups fields, the two being the same
+/// run of sections under two different parents.
+fn reconcile(
+    holder: &mut toml_edit::Table,
+    fresh: &toml_edit::Table,
+    declared: &[String],
+    next: &mut isize,
+) -> bool {
+    let written: BTreeMap<String, toml_edit::Table> = sections(fresh, "field")
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.get("name").and_then(Item::as_str)?.to_owned();
+            Some((name, entry))
+        })
+        .collect();
+    let existing = sections(holder, "field");
+    let source = pair_up(&existing, declared, &written);
+
+    let mut rebuilt = toml_edit::ArrayOfTables::new();
+    for (name, from) in declared.iter().zip(&source) {
+        match from.and_then(|at| existing.get(at)) {
+            Some(entry) => {
+                let mut entry = entry.clone();
+                let keep = kept_from_the_file(&entry, written.get(name));
+                if let Some(replacement) = written.get(name) {
+                    document::merge(&mut entry, replacement, keep);
+                }
+                rebuilt.push(entry);
+            }
+            // Nothing in the file to keep, so this is either a field just added
+            // or one the model cannot describe, and only the first is writable.
+            None => {
+                if let Some(fresh) = written.get(name) {
+                    rebuilt.push(fresh.clone());
+                }
+            }
+        }
+    }
+
+    // Rewriting the positions moves the whole run of fields below everything
+    // else in the file, so it is done only when the order actually changed.
+    // Reusing a table keeps the position it was parsed at, and two entries that
+    // swapped places would otherwise be rendered in their old order.
+    let in_order = source
+        .iter()
+        .flatten()
+        .try_fold(None::<usize>, |last, &at| {
+            (last.is_none_or(|last| last < at)).then_some(Some(at))
+        })
+        .is_some()
+        && source.iter().all(Option::is_some);
+    if !in_order {
+        for entry in rebuilt.iter_mut() {
+            document::place_after(entry, next);
+        }
+    }
+    holder.insert("field", Item::ArrayOfTables(rebuilt));
+    !in_order
+}
+
+/// Which entry in the file each declared field should be written over.
+///
+/// Matched by name first, so an edit anywhere leaves every other field sitting
+/// exactly where it was written. What is left over is then matched in order,
+/// which is what turns a rename from "one field deleted and another appended at
+/// the end" into an edit that keeps the field's place and the comment above it.
+///
+/// The leftovers are only matched among fields of the same nature. A plain
+/// field taking over an entry that names a type would be written as that type,
+/// which is never what renaming a field means.
+fn pair_up(
+    existing: &[toml_edit::Table],
+    declared: &[String],
+    written: &BTreeMap<String, toml_edit::Table>,
+) -> Vec<Option<usize>> {
+    let mut taken = vec![false; existing.len()];
+    let mut source: Vec<Option<usize>> = declared
+        .iter()
+        .map(|wanted| {
+            let at = existing.iter().enumerate().position(|(at, entry)| {
+                !taken[at] && entry.get("name").and_then(Item::as_str) == Some(wanted.as_str())
+            })?;
+            taken[at] = true;
+            Some(at)
+        })
+        .collect();
+
+    let mut spare = (0..existing.len())
+        .filter(|at| !taken[*at])
+        .filter(|at| kept_from_the_file(&existing[*at], None).len() == 1);
+    for (slot, name) in source.iter_mut().zip(declared) {
+        if slot.is_none() && written.contains_key(name) {
+            *slot = spare.next();
+        }
+    }
+    source
+}
+
+/// Writes byte order wherever the file would otherwise be read as the wrong one.
+///
+/// Endianness is inherited, so most of it is written by saying nothing, and a
+/// writer that spelt it out everywhere would bury the two places it matters.
+/// Only a disagreement between what the file would be read as and what the
+/// frame now says is worth a line.
+fn state_endianness(document: &mut toml_edit::DocumentMut, frame: &FrameDef) {
+    let stated = |table: &toml_edit::Table| match table.get("endian").and_then(Item::as_str) {
+        Some("little") => Some(Endianness::Little),
+        Some("big") => Some(Endianness::Big),
+        _ => None,
+    };
+    let word = |endian: Endianness| match endian {
+        Endianness::Big => "big",
+        Endianness::Little => "little",
+    };
+
+    if stated(document.as_table()).unwrap_or_default() != frame.endian {
+        document["endian"] = toml_edit::value(word(frame.endian));
+    }
+
+    let Some(entries) = document
+        .get_mut("field")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return;
+    };
+    for entry in entries.iter_mut() {
+        let Some(field) = entry
+            .get("name")
+            .and_then(Item::as_str)
+            .and_then(|name| frame.field(name))
+        else {
+            continue;
+        };
+        // What this field would be read as today: its own word, or the frame's
+        // for want of one.
+        if stated(entry).unwrap_or(frame.endian) != field.endian {
+            entry["endian"] = toml_edit::value(word(field.endian));
+        }
+    }
+}
+
+/// What the model is not allowed to overwrite on a field the file already
+/// wrote.
+///
+/// Byte order is always the file's, being spent at load time. A field naming a
+/// type from the library gives up more: the range, the representation, the
+/// variants and the bits all came from that type, and writing them back would
+/// replace `type = "Percent"` with the byte and the bounds it stands for. What
+/// belongs to the field itself, its default and the range a checksum covers,
+/// stays editable.
+fn kept_from_the_file(
+    entry: &toml_edit::Table,
+    fresh: Option<&toml_edit::Table>,
+) -> &'static [&'static str] {
+    let named = |table: &toml_edit::Table| {
+        table
+            .get("type")
+            .and_then(Item::as_str)
+            .filter(|kind| !is_builtin_kind(kind))
+            .map(ToOwned::to_owned)
+    };
+    // Kept only while both still say the same type. A model saying a different
+    // one has been renamed, and a model saying a builtin has been told to write
+    // the field out in full, which is what deleting the type it named amounts
+    // to. Neither is an edit the file gets to veto.
+    let held = named(entry);
+    let says_the_same = match (&held, fresh.map(named)) {
+        (Some(_), None) => true,
+        (Some(held), Some(Some(wanted))) => *held == wanted,
+        _ => false,
+    };
+    if says_the_same {
+        &["endian", "type", "range", "repr", "variants", "bits"]
+    } else {
+        &["endian"]
+    }
+}
+
+/// How a checksum range names one of its ends.
+///
+/// A range written against a declared field means every byte that field
+/// expanded into, so naming it back is not only shorter, it keeps the range
+/// following the type: add an instance and the checksum still covers all of
+/// them. Naming the expanded field instead would pin the range where it stands
+/// today. The expanded name is used only when the end falls inside a type
+/// rather than on its edge.
+fn cover_name(frame: &FrameDef, index: usize, edge: Edge) -> String {
+    let field = &frame.fields[index];
+    let Some(declared) = frame.generated_by(&field.name) else {
+        return field.name.clone();
+    };
+    let mut expansion = frame
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, other)| frame.generated_by(&other.name) == Some(declared))
+        .map(|(at, _)| at);
+    let edge_of_expansion = match edge {
+        Edge::First => expansion.next(),
+        Edge::Last => expansion.next_back(),
+    };
+    if edge_of_expansion == Some(index) {
+        declared.to_owned()
+    } else {
+        field.name.clone()
+    }
+}
+
+/// A type as the file writes it.
+///
+/// Only the fields the file wrote, for the same reason a frame's writer keeps
+/// to those: a field that came out of another type cannot be folded back into
+/// the name that produced it.
+fn lower_type(type_def: &TypeDef) -> RawType {
+    let (base, range) = match &type_def.narrows {
+        Some(subtype) => (Some(subtype.base.clone()), subtype.range.map(lower_range)),
+        None => (None, None),
+    };
+    // The same reconstruction a frame gets. Filtering the wire fields by name
+    // instead would drop a field of the type that is itself a type: it expands
+    // to names of its own, matches none of them, and leaves the file.
+    let mut fields = declared_fields(&type_def.layout);
+    leave_inherited_endianness(&mut fields, type_def.layout.endian);
+    RawType {
+        name: type_def.layout.name.clone(),
+        description: type_def.layout.description.clone(),
+        base,
+        range,
+        fields,
+    }
+}
+
+fn lower_range(range: ValueRange) -> RawRange {
+    let (min, max) = match range {
+        ValueRange::Uint { min, max } => (
+            toml::Value::Integer(i64::try_from(min).unwrap_or(i64::MAX)),
+            toml::Value::Integer(i64::try_from(max).unwrap_or(i64::MAX)),
+        ),
+        ValueRange::Int { min, max } => (toml::Value::Integer(min), toml::Value::Integer(max)),
+        ValueRange::Float { min, max } => (toml::Value::Float(min), toml::Value::Float(max)),
+    };
+    RawRange { min, max }
+}
+
+/// The entries under `key`, however they were written.
+///
+/// Serialising a frame produces one array of inline tables where a person would
+/// have written a run of `[[field]]` sections. Both mean the same thing, and
+/// the writer has to read the first while editing the second.
+fn sections(table: &toml_edit::Table, key: &str) -> Vec<toml_edit::Table> {
+    match table.get(key) {
+        Some(Item::ArrayOfTables(entries)) => entries.iter().cloned().collect(),
+        Some(Item::Value(toml_edit::Value::Array(entries))) => entries
+            .iter()
+            .filter_map(toml_edit::Value::as_inline_table)
+            .map(|entry| entry.clone().into_table())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn as_document(frame: &FrameDef) -> Result<toml_edit::DocumentMut, SchemaError> {
+    let mut raw = lower(frame);
+    // A field inheriting the frame's order says nothing about it, as the file
+    // does. One that differs has to say so, or it would be read back as the
+    // frame's and quietly change what goes on the wire.
+    leave_inherited_endianness(&mut raw.fields, frame.endian);
+    toml_edit::ser::to_document(&raw).map_err(SchemaError::Rewrite)
+}
+
+/// The declared fields a file states through a named type, and which one.
+///
+/// The model cannot answer this: by the time a frame is loaded, `Percent` has
+/// become a `u8` with bounds and `Rgb` has become three fields, with nothing
+/// left pointing back at the name. The file still says it, so the file is
+/// asked. What is listed here is exactly what the writer refuses to reword.
+#[must_use]
+pub fn stated_as_types(text: &str) -> BTreeMap<String, String> {
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return BTreeMap::new();
+    };
+    stated_in(document.as_table())
+}
+
+fn stated_in(holder: &toml_edit::Table) -> BTreeMap<String, String> {
+    sections(holder, "field")
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name").and_then(Item::as_str)?;
+            let kind = entry.get("type").and_then(Item::as_str)?;
+            (!is_builtin_kind(kind)).then(|| (name.to_owned(), kind.to_owned()))
+        })
+        .collect()
+}
+
+/// Writes a type back into the file it came from, keeping every comment.
+///
+/// Unlike a frame, a types file holds as many types as someone cared to put in
+/// it, so the one to overwrite is found by the name it currently answers to.
+/// A type not in the file yet is appended.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML, or the type not
+/// serialisable.
+pub fn update_type_in(text: &str, name: &str, type_def: &TypeDef) -> Result<String, SchemaError> {
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(SchemaError::Edit)?;
+    // Serialised inside a file rather than alone, so that it comes out as the
+    // `[[type]]` entry the document is going to hold it as.
+    let fresh = toml_edit::ser::to_document(&RawTypeFile {
+        types: vec![lower_type(type_def)],
+    })
+    .map_err(SchemaError::Rewrite)?;
+    let Some(fresh) = sections(fresh.as_table(), "type").into_iter().next() else {
+        return Ok(document::render(&document, text));
+    };
+
+    if document.get("type").is_none() {
+        document.insert("type", Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    }
+    let mut next = document::last_position(&document);
+    let Some(entries) = document
+        .get_mut("type")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return Ok(document::render(&document, text));
+    };
+
+    let at = entries
+        .iter()
+        .position(|entry| entry.get("name").and_then(Item::as_str) == Some(name));
+    let mut moved = false;
+    if let Some(entry) = at.and_then(|at| entries.get_mut(at)) {
+        // `field` is merged apart, an array of tables being a run of sections
+        // rather than one value to be dropped in.
+        {
+            document::merge(entry, &fresh, &["field"]);
+            let declared: Vec<String> = sections(&fresh, "field")
+                .iter()
+                .filter_map(|held| Some(held.get("name").and_then(Item::as_str)?.to_owned()))
+                .collect();
+            moved = reconcile(entry, &fresh, &declared, &mut next);
+        }
+    } else {
+        let mut appended = fresh;
+        document::place_after(&mut appended, &mut next);
+        entries.push(appended);
+    }
+
+    // A `[[type.field]]` belongs to whichever `[[type]]` was written last, so
+    // sending one run of them past the end of the document hands them to
+    // another type. Moving any of them means renumbering every type in the
+    // file, which is what keeps each one's fields under its own heading.
+    if moved {
+        let mut next = document::last_position(&document);
+        if let Some(entries) = document
+            .get_mut("type")
+            .and_then(Item::as_array_of_tables_mut)
+        {
+            for entry in entries.iter_mut() {
+                document::place_after(entry, &mut next);
+            }
+        }
+    }
+    Ok(document::render(&document, text))
+}
+
+/// Takes a type out of a file.
+///
+/// # Errors
+///
+/// Returns an error if the text is not valid TOML.
+pub fn remove_type_from(text: &str, name: &str) -> Result<String, SchemaError> {
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(SchemaError::Edit)?;
+    if let Some(entries) = document
+        .get_mut("type")
+        .and_then(Item::as_array_of_tables_mut)
+    {
+        entries.retain(|entry| entry.get("name").and_then(Item::as_str) != Some(name));
+    }
+    Ok(document::render(&document, text))
+}
+
+/// A types file holding nothing but this one type.
+///
+/// # Errors
+///
+/// Returns an error if the type cannot be serialised.
+pub fn type_to_toml(type_def: &TypeDef) -> Result<String, SchemaError> {
+    Ok(toml::to_string_pretty(&RawTypeFile {
+        types: vec![lower_type(type_def)],
+    })?)
+}
+
 /// Loads a frame definition from disk.
 ///
 /// # Errors
@@ -441,10 +1040,38 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
         types.insert(local.name.clone(), local.clone());
     }
 
+    // Captured before expansion, which is the only moment the two are still
+    // distinguishable.
+    let written: Vec<String> = raw.fields.iter().map(|field| field.name.clone()).collect();
+    // Only what a name cannot carry: a plain builtin written once needs no
+    // record, being exactly the field it produces.
+    let stated: BTreeMap<String, Stated> = raw
+        .fields
+        .iter()
+        .filter(|field| {
+            !is_builtin_kind(&field.kind) || field.repeat.is_some() || field.instances.is_some()
+        })
+        .map(|field| {
+            (
+                field.name.clone(),
+                Stated {
+                    kind: field.kind.clone(),
+                    repeat: field.repeat,
+                    instances: field.instances.clone(),
+                },
+            )
+        })
+        .collect();
     let expanded = expand(&raw.fields, &types)?;
 
     let mut seen: Vec<&str> = Vec::new();
     for field in &expanded {
+        // Everything holds a field by its name: the values a technician types,
+        // a checksum's range, a scenario waiting on it. A nameless one would
+        // answer to nothing.
+        if field.name.trim().is_empty() {
+            return Err(SchemaError::UnnamedField);
+        }
         if seen.contains(&field.name.as_str()) {
             return Err(SchemaError::DuplicateField {
                 name: field.name.clone(),
@@ -477,14 +1104,17 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
     Ok(FrameDef {
         name: raw.name,
         description: raw.description,
+        endian: frame_endian,
+        stated,
         fields,
+        declared: written,
     })
 }
 
 /// Type names that are not scalars, kept in one place so [`is_builtin_kind`]
 /// and [`build_kind`] cannot drift apart.
 const BUILTIN_KINDS: &[&str] = &[
-    "bytes", "text", "enum", "bits", "xor8", "sum8", "sum16", "crc8", "crc16", "crc32",
+    "bytes", "text", "enum", "bits", "xor8", "sum8", "sum16", "sum32", "crc8", "crc16", "crc32",
 ];
 
 fn is_builtin_kind(kind: &str) -> bool {
@@ -883,6 +1513,18 @@ fn build_kind(field: &RawField, index: usize, names: &[String]) -> Result<FieldK
                     kind: field.kind.clone(),
                     missing: "bits",
                 })?;
+            // Values are held against a bitfield by name, so two bits sharing
+            // one would share a single value: setting either would set both,
+            // and the frame would go out with a number in a place nobody put
+            // it. Refused here rather than encoded wrong.
+            for (at, bit) in bits.iter().enumerate() {
+                if bits[..at].iter().any(|earlier| earlier.name == bit.name) {
+                    return Err(SchemaError::DuplicateBit {
+                        field: field.name.clone(),
+                        name: bit.name.clone(),
+                    });
+                }
+            }
             let total: u32 = bits.iter().map(|bit| bit.width).sum();
             let capacity = u32::try_from(repr.size() * 8).unwrap_or(u32::MAX);
             if total != capacity {
@@ -918,6 +1560,9 @@ fn build_checksum(
         "xor8" => ChecksumSpec::Xor8,
         "sum8" => ChecksumSpec::Sum { width_bytes: 1 },
         "sum16" => ChecksumSpec::Sum { width_bytes: 2 },
+        // The writer already produces this from a four-byte sum, so the reader
+        // has to take it back.
+        "sum32" => ChecksumSpec::Sum { width_bytes: 4 },
         "crc8" | "crc16" | "crc32" => {
             // `crc8` and `crc32` have one dominant variant, so the preset name
             // doubles as the type; `crc16` has too many to guess at.
@@ -1075,15 +1720,68 @@ fn lower(frame: &FrameDef) -> RawFrame {
     RawFrame {
         name: frame.name.clone(),
         description: frame.description.clone(),
-        endian: None,
-        // Types are resolved at load time, so what is written back is the
-        // expanded layout: identical on the wire, no longer factorised.
+        // Stated only when it is not what a file says by saying nothing, so a
+        // frame nobody gave an order to does not grow one.
+        endian: (frame.endian != Endianness::default()).then_some(match frame.endian {
+            Endianness::Big => RawEndian::Big,
+            Endianness::Little => RawEndian::Little,
+        }),
+        // A frame carries the names of the types it uses, not their
+        // definitions, so what it is written into has to hold them already.
         types: Vec::new(),
-        fields: frame
+        fields: declared_fields(frame),
+    }
+}
+
+/// The fields a file would write, which is not the fields on the wire.
+///
+/// A field that came out of a type is left out, and the declaration that
+/// produced it put back in its place. Writing the expansion instead would be
+/// correct on the wire and would throw away the factorisation someone took the
+/// trouble to write.
+fn declared_fields(frame: &FrameDef) -> Vec<RawField> {
+    let mut fields = Vec::with_capacity(frame.declared.len());
+    for name in &frame.declared {
+        // Written as itself, which is every plain field.
+        if let Some(field) = frame.field(name) {
+            fields.push(lower_field(field, frame));
+            continue;
+        }
+        let Some(stated) = frame.stated.get(name) else {
+            continue;
+        };
+        // A repeat of a builtin said things a name cannot carry: how long the
+        // bytes are, what the default is, what it is for. Every copy inherited
+        // them, so the first copy gives them back. A named type says none of
+        // that itself, everything of the sort belonging to the type.
+        let mut raw = match frame
             .fields
-            .iter()
-            .map(|field| lower_field(field, frame))
-            .collect(),
+            .get(frame.expansion_of(name).start)
+            .filter(|_| is_builtin_kind(&stated.kind))
+        {
+            Some(leaf) => lower_field(leaf, frame),
+            None => RawField::default(),
+        };
+        raw.name.clone_from(name);
+        raw.kind.clone_from(&stated.kind);
+        raw.repeat = stated.repeat;
+        raw.instances.clone_from(&stated.instances);
+        fields.push(raw);
+    }
+    fields
+}
+
+/// Drops the byte order from every field that is only following the frame.
+///
+/// Matched on the order itself rather than by walking two lists side by side:
+/// one holds a declaration where the other holds an expansion, and the two slip
+/// apart at the first type instance.
+fn leave_inherited_endianness(fields: &mut [RawField], endian: Endianness) {
+    let inherited: RawEndian = endian.into();
+    for field in fields {
+        if field.endian == Some(inherited) {
+            field.endian = None;
+        }
     }
 }
 
@@ -1146,12 +1844,23 @@ fn lower_field(field: &FieldDef, frame: &FrameDef) -> RawField {
                 }
             }
             raw.covers = Some(RawCovers {
-                from: frame.fields[covers.from].name.clone(),
-                to: frame.fields[covers.to].name.clone(),
+                from: cover_name(frame, covers.from, Edge::First),
+                to: cover_name(frame, covers.to, Edge::Last),
             });
         }
     }
 
+    // A plain field the file states as a named type keeps that word: writing
+    // `u8` in place of `Percent` would be the flattening this writer exists to
+    // avoid.
+    if let Some(stated) = frame.stated.get(&field.name) {
+        raw.kind.clone_from(&stated.kind);
+        raw.repeat = stated.repeat;
+        raw.instances.clone_from(&stated.instances);
+        // Both belong to the type, not to the field it was resolved into.
+        raw.range = None;
+        raw.repr = None;
+    }
     raw
 }
 
@@ -1877,8 +2586,37 @@ range = { min = -500, max = 500 }
 
     #[test]
     fn subtypes_survive_a_round_trip_through_toml() {
-        let frame = from_toml(SUBTYPES).unwrap();
-        let reparsed = from_toml(&to_toml(&frame).unwrap()).expect("rendered toml should parse");
+        // Written back through a library rather than alone: the type names are
+        // kept now, so what is written needs them to still be defined
+        // somewhere. Flattening them to `u8` plus bounds is exactly what this
+        // writer refuses to do.
+        let mut library = TypeLibrary::default();
+        library
+            .merge_toml(
+                r#"
+[[type]]
+name = "Percent"
+base = "u8"
+range = { min = 0, max = 99 }
+
+[[type]]
+name = "LowPercent"
+base = "Percent"
+range = { min = 0, max = 9 }
+"#,
+            )
+            .unwrap();
+        let shared = SUBTYPES
+            .replace("[[type]]\nname = \"Percent\"\nbase = \"u8\"\nrange = { min = 0, max = 99 }\n\n", "")
+            .replace(
+                "[[type]]\nname = \"LowPercent\"\nbase = \"Percent\"\nrange = { min = 0, max = 9 }\n\n",
+                "",
+            );
+        let frame = from_toml_with(&shared, &library).expect("subtypes should parse");
+
+        let written = to_toml(&frame).unwrap();
+        assert!(written.contains(r#"type = "Percent""#), "{written}");
+        let reparsed = from_toml_with(&written, &library).expect("rendered toml should parse");
         assert_eq!(frame, reparsed);
     }
 
@@ -2026,12 +2764,32 @@ repeat = 2
         }
     }
 
+    /// Writing a factorised frame back out flattens it: same bytes on the wire,
+    /// no types and no repeats left in the file.
+    ///
+    /// Spelled out rather than glossed over, because it is what stops an editor
+    /// from simply re-serialising whatever it is shown. `declared` is the only
+    /// thing that can tell the two apart, which is why it exists.
     #[test]
-    fn an_expanded_frame_still_round_trips_through_toml() {
+    fn writing_an_expanded_frame_keeps_the_factorisation_that_produced_it() {
         let frame = from_toml(LED_BANK).unwrap();
-        let reparsed = from_toml(&to_toml(&frame).unwrap()).expect("rendered toml should parse");
-        // The types are gone from the file, the layout is identical.
+        assert_eq!(frame.declared, ["header", "led", "crc"]);
+
+        let written = to_toml(&frame).unwrap();
+
+        // Three entries in, three entries out. Writing the fourteen fields the
+        // three produce would be the same bytes on the wire and would throw
+        // away the type that says why they are there.
+        assert!(written.contains(r#"type = "LedConfig""#), "{written}");
+        assert!(!written.contains("led[0].mode"), "{written}");
+
+        // A frame carries the names of its types, not their definitions, so
+        // reading it back needs them defined where it lands.
+        let mut library = TypeLibrary::default();
+        library.merge_toml(LED_BANK).unwrap();
+        let reparsed = from_toml_with(&written, &library).expect("rendered toml should parse");
         assert_eq!(frame, reparsed);
+        assert_eq!(reparsed.generated_by("led[0].mode"), Some("led"));
     }
 
     #[test]
@@ -2045,5 +2803,154 @@ repeat = 2
         assert_eq!(load(&path).unwrap(), frame);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A frame someone took the trouble to explain, which is the whole reason
+    /// the writer exists.
+    const COMMENTED: &str = r#"# What this frame is for.
+name = "Status"
+description = "two bytes"
+
+# The sync word never changes.
+[[field]]
+name = "sync"
+type = "u8"
+default = 170
+
+[[field]]
+name = "mode"
+type = "u8"   # picked by the operator
+default = 0
+"#;
+
+    #[test]
+    fn rewriting_a_frame_keeps_every_comment_the_file_had() {
+        let mut frame = from_toml(COMMENTED).expect("valid frame");
+        frame.fields[1].default = Some(Value::Uint(3));
+
+        let written = update_in(COMMENTED, &frame).expect("rewritten");
+
+        assert!(written.contains("# What this frame is for."));
+        assert!(written.contains("# The sync word never changes."));
+        assert!(written.contains("# picked by the operator"));
+        assert_eq!(
+            from_toml(&written).expect("still valid").fields[1].default,
+            Some(Value::Uint(3))
+        );
+    }
+
+    #[test]
+    fn rewriting_a_factorised_frame_does_not_flatten_it() {
+        let text = r#"
+name = "Packed"
+
+[[type]]
+name = "Point"
+[[type.field]]
+name = "x"
+type = "u8"
+[[type.field]]
+name = "y"
+type = "u8"
+
+[[field]]
+name = "here"
+type = "Point"
+
+[[field]]
+name = "tag"
+type = "u8"
+default = 1
+"#;
+        let frame = from_toml(text).expect("valid frame");
+        assert_eq!(frame.declared, ["here", "tag"]);
+        assert_eq!(frame.fields.len(), 3);
+
+        let written = update_in(text, &frame).expect("rewritten");
+
+        assert!(written.contains(r#"type = "Point""#));
+        assert!(!written.contains("here.x"));
+        assert_eq!(from_toml(&written).expect("still valid"), frame);
+    }
+
+    #[test]
+    fn a_field_added_to_the_model_is_appended_to_the_file() {
+        let frame = from_toml(COMMENTED).expect("valid frame");
+        let mut grown = frame.clone();
+        grown.fields.push(FieldDef {
+            name: "extra".to_owned(),
+            description: None,
+            kind: FieldKind::Scalar(ScalarType::U8),
+            endian: Endianness::Big,
+            default: None,
+            range: None,
+        });
+        grown.declared.push("extra".to_owned());
+
+        let written = update_in(COMMENTED, &grown).expect("rewritten");
+
+        assert!(written.contains("# The sync word never changes."));
+        let reread = from_toml(&written).expect("still valid");
+        assert_eq!(
+            reread
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["sync", "mode", "extra"]
+        );
+    }
+
+    #[test]
+    fn a_field_dropped_from_the_model_leaves_the_file() {
+        let mut frame = from_toml(COMMENTED).expect("valid frame");
+        frame.fields.remove(0);
+        frame.declared.remove(0);
+
+        let written = update_in(COMMENTED, &frame).expect("rewritten");
+
+        assert!(!written.contains(r#"name = "sync""#));
+        assert!(written.contains("# picked by the operator"));
+        assert_eq!(from_toml(&written).expect("still valid").fields.len(), 1);
+    }
+
+    #[test]
+    fn renaming_a_field_keeps_its_place_and_the_comment_above_it() {
+        let mut frame = from_toml(COMMENTED).expect("valid frame");
+        frame.fields[0].name = "preamble".to_owned();
+        frame.declared[0] = "preamble".to_owned();
+
+        let written = update_in(COMMENTED, &frame).expect("rewritten");
+
+        // Still the first field, still under the comment written about it.
+        assert!(written.contains("# The sync word never changes.\n[[field]]\nname = \"preamble\""));
+        assert_eq!(
+            from_toml(&written).expect("still valid").declared,
+            ["preamble", "mode"]
+        );
+    }
+
+    #[test]
+    fn a_field_inserted_in_the_middle_is_written_in_the_middle() {
+        let mut frame = from_toml(COMMENTED).expect("valid frame");
+        frame.fields.insert(
+            1,
+            FieldDef {
+                name: "length".to_owned(),
+                description: None,
+                kind: FieldKind::Scalar(ScalarType::U8),
+                endian: Endianness::Big,
+                default: None,
+                range: None,
+            },
+        );
+        frame.declared.insert(1, "length".to_owned());
+
+        let written = update_in(COMMENTED, &frame).expect("rewritten");
+
+        let reread = from_toml(&written).expect("still valid");
+        assert_eq!(reread.declared, ["sync", "length", "mode"]);
+        assert!(written.contains("# The sync word never changes."));
+        assert!(written.contains("# picked by the operator"));
     }
 }

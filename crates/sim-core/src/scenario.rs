@@ -16,6 +16,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use toml_edit::Item;
 
+use crate::document::{self, compact, fold, last_position, merge, place_after};
+
 use crate::connection::ConnectionId;
 use crate::frame::value::Value;
 use crate::pattern::PatternSpec;
@@ -468,8 +470,9 @@ pub fn update_in(text: &str, name: &str, scenario: &Scenario) -> Result<String, 
             name: name.to_owned(),
         })?;
 
-    merge(existing, &fresh);
-    Ok(document.to_string())
+    merge(existing, &fresh, &["step"]);
+    merge_steps(existing, &fresh);
+    Ok(document::render(&document, text))
 }
 
 /// Adds a scenario at the end of a file, or creates the file's array if it has
@@ -492,48 +495,7 @@ pub fn append_to(text: &str, scenario: &Scenario) -> Result<String, ScenarioErro
     place_after(&mut fresh, &mut next);
 
     array_of_scenarios(&mut document)?.push(fresh);
-    Ok(document.to_string())
-}
-
-/// The position of the last section in the document.
-fn last_position(document: &toml_edit::DocumentMut) -> isize {
-    fn scan(table: &toml_edit::Table, best: &mut isize) {
-        if let Some(position) = table.position() {
-            *best = (*best).max(position);
-        }
-        for (_, item) in table {
-            match item {
-                Item::Table(inner) => scan(inner, best),
-                Item::ArrayOfTables(entries) => {
-                    for entry in entries {
-                        scan(entry, best);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut best = 0;
-    scan(document.as_table(), &mut best);
-    best
-}
-
-/// Sends a table and everything nested inside it to the end of the document,
-/// in the order they are written.
-fn place_after(table: &mut toml_edit::Table, next: &mut isize) {
-    *next += 1;
-    table.set_position(Some(*next));
-    for (_, item) in table.iter_mut() {
-        match item {
-            Item::Table(inner) => place_after(inner, next),
-            Item::ArrayOfTables(entries) => {
-                for entry in entries.iter_mut() {
-                    place_after(entry, next);
-                }
-            }
-            _ => {}
-        }
-    }
+    Ok(document::render(&document, text))
 }
 
 /// Takes a scenario out of a file.
@@ -552,7 +514,7 @@ pub fn remove_from(text: &str, name: &str) -> Result<String, ScenarioError> {
             name: name.to_owned(),
         })?;
     entries.remove(found);
-    Ok(document.to_string())
+    Ok(document::render(&document, text))
 }
 
 fn parse_document(text: &str) -> Result<toml_edit::DocumentMut, ScenarioError> {
@@ -577,36 +539,6 @@ fn as_table(scenario: &Scenario) -> Result<toml_edit::Table, ScenarioError> {
         .and_then(Item::as_array_of_tables)
         .and_then(|entries| entries.get(0).cloned())
         .ok_or(ScenarioError::NotScenarios)
-}
-
-/// Copies `from` over `into`, key by key rather than wholesale.
-///
-/// Replacing the item under a key leaves the key itself in place, and a comment
-/// written above a setting belongs to the key, which is what makes this
-/// preserve them where a straight assignment would not.
-fn merge(into: &mut toml_edit::Table, from: &toml_edit::Table) {
-    let stale: Vec<String> = into
-        .iter()
-        .map(|(key, _)| key.to_owned())
-        .filter(|key| key != "step" && from.get(key).is_none())
-        .collect();
-    for key in stale {
-        into.remove(&key);
-    }
-
-    for (key, item) in from {
-        if key == "step" {
-            continue;
-        }
-        match into.get_mut(key) {
-            Some(slot) => *slot = item.clone(),
-            None => {
-                into.insert(key, item.clone());
-            }
-        }
-    }
-
-    merge_steps(into, from);
 }
 
 /// Steps are matched by position, there being nothing else to match them by.
@@ -643,53 +575,13 @@ fn merge_steps(into: &mut toml_edit::Table, from: &toml_edit::Table) {
         .unwrap_or(0);
     for (index, step) in wanted.iter().enumerate() {
         if let Some(slot) = existing.get_mut(index) {
-            merge_step(slot, step);
+            merge(slot, step, &[]);
         } else {
             let mut fresh = step.clone();
             place_after(&mut fresh, &mut next);
             existing.push(fresh);
         }
     }
-}
-
-fn merge_step(into: &mut toml_edit::Table, from: &toml_edit::Table) {
-    let stale: Vec<String> = into
-        .iter()
-        .map(|(key, _)| key.to_owned())
-        .filter(|key| from.get(key).is_none())
-        .collect();
-    for key in stale {
-        into.remove(&key);
-    }
-    for (key, item) in from {
-        match into.get_mut(key) {
-            Some(slot) => *slot = item.clone(),
-            None => {
-                into.insert(key, item.clone());
-            }
-        }
-    }
-}
-
-/// Puts an array back on one line. Two connection names do not need four.
-fn compact(table: &mut toml_edit::Table, key: &str) {
-    if let Some(array) = table.get_mut(key).and_then(toml_edit::Item::as_array_mut) {
-        array.fmt();
-    }
-}
-
-/// Turns `table[key]`, if it is a section, into a value on one line.
-fn fold(table: &mut toml_edit::Table, key: &str) {
-    let Some(section) = table.remove(key) else {
-        return;
-    };
-    let folded = match section {
-        toml_edit::Item::Table(inner) => {
-            toml_edit::Item::Value(toml_edit::Value::InlineTable(inner.into_inline_table()))
-        }
-        other => other,
-    };
-    table.insert(key, folded);
 }
 
 fn lower(scenario: &Scenario) -> RawScenario {
@@ -1678,5 +1570,27 @@ wait_for = { hex = "AA 5" }
         let scenarios = from_toml(&text).expect("should parse");
         assert_eq!(scenarios.len(), 2);
         assert_eq!(scenarios[1].name, "Telemetry 10 Hz");
+    }
+
+    /// `toml_edit` renders every line ending as a bare newline whatever it
+    /// read, so a file written on Windows would come back with every one of its
+    /// lines changed. The frame writer has the same guard, for the same reason.
+    #[test]
+    fn a_file_written_with_windows_line_endings_keeps_them() {
+        let text = COMMENTED.replace('\n', "\r\n");
+        let mut scenarios = from_toml(&text).expect("should parse");
+        scenarios[0].description = Some("edited".to_owned());
+
+        let written = update_in(&text, "Boot", &scenarios[0]).expect("rewritten");
+
+        assert!(written.contains("\r\n"), "{written}");
+        assert!(!written.contains("\n\n\n"), "a lone newline crept in");
+        assert!(written.contains("# Why this scenario exists at all."));
+        assert_eq!(
+            from_toml(&written).expect("still valid")[0]
+                .description
+                .as_deref(),
+            Some("edited")
+        );
     }
 }
