@@ -2732,4 +2732,25 @@ covers = { from = "data", to = "data" }
         // Save stays refused until the editor is closed and reopened.
         assert_eq!(library.draft_problem(), None);
     }
+
+    #[test]
+    fn a_field_cannot_be_renamed_onto_another_one() {
+        let mut draft = draft_of(LAYERED);
+        assert_eq!(draft.frame.declared, ["header", "here", "crc"]);
+
+        // Typed through on the way to something else, or meant: either way the
+        // loader refuses two fields of one name, and the values a technician
+        // types are held against it.
+        layout::rename_field(&mut draft.frame, 0, "crc");
+        assert_eq!(draft.frame.declared, ["header", "here", "crc"]);
+
+        // Nor onto a field that only exists because a type expanded.
+        layout::rename_field(&mut draft.frame, 0, "here.x");
+        assert_eq!(draft.frame.declared, ["header", "here", "crc"]);
+
+        // A name nothing else answers to goes through, expansion and all.
+        layout::rename_field(&mut draft.frame, 0, "start");
+        assert_eq!(draft.frame.declared, ["start", "here", "crc"]);
+        assert_eq!(covered(&draft), ("start".to_owned(), "here.y".to_owned()));
+    }
 }

@@ -233,7 +233,11 @@ fn field_row(
         index, declared, ..
     } = *row;
     let expanded = row.expanded;
-    let id = Id::new(("frame_field", index, declared));
+    // Keyed on the position, not the name. Every keystroke in the name box
+    // renames the field, and an id built from the name would be a different
+    // row each time: the fold would reset and the text box would lose the
+    // cursor it was being typed into.
+    let id = Id::new(("frame_field", index));
     CollapsingState::load_with_default_open(ui.ctx(), id, false)
         .show_header(ui, |ui| {
             if ui

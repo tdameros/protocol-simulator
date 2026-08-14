@@ -41,6 +41,13 @@ pub fn rename_field(layout: &mut FrameDef, index: usize, name: &str) {
     if name == old || name.is_empty() {
         return;
     }
+    // Two fields of one name is not a frame the loader will take, and the
+    // values a technician types are held against the name, so the second one
+    // would quietly answer for both. Refused while it is being typed rather
+    // than reported once it is too late.
+    if layout.declared.iter().any(|held| held == name) || layout.field_index(name).is_some() {
+        return;
+    }
     // Nothing moves, so the ranges stored as indices still hold, whether this
     // renames one field or the twenty a type expanded into.
     for at in layout.expansion_of(&old) {
