@@ -122,7 +122,8 @@ fn definition_buttons(ui: &mut Ui, state: &mut AppState) {
         .on_hover_text("Start a frame from scratch")
         .clicked()
     {
-        state.frames.begin_new(blank());
+        let name = state.frames.unused_frame_name("New frame");
+        state.frames.begin_new(blank(&name));
     }
     let editable = state.frames.selected_entry().is_some() && idle;
     if ui
@@ -147,9 +148,9 @@ fn definition_buttons(ui: &mut Ui, state: &mut AppState) {
 }
 
 /// What New starts from: one byte, the smallest thing that is still a frame.
-fn blank() -> FrameDef {
+fn blank(name: &str) -> FrameDef {
     FrameDef::flat(
-        "New frame",
+        name,
         vec![FieldDef {
             name: "id".to_owned(),
             description: None,

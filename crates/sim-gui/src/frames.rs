@@ -691,6 +691,35 @@ impl FrameLibrary {
         });
     }
 
+    /// A frame name nothing answers to yet, and whose file is free as well.
+    ///
+    /// Both, because a name that is free while its file is not would open an
+    /// editor that Save refuses on the first click.
+    #[must_use]
+    pub fn unused_frame_name(&self, wanted: &str) -> String {
+        let directory = self.directory.clone().unwrap_or_default();
+        unused(wanted, self.entries.len(), |name| {
+            let file = suggested_file(&directory, name);
+            self.entries
+                .iter()
+                .all(|entry| entry.frame.name != *name && entry.file != file)
+                && !file.exists()
+        })
+    }
+
+    /// The same for a shared type.
+    #[must_use]
+    pub fn unused_type_name(&self, wanted: &str) -> String {
+        let directory = self.directory.clone().unwrap_or_default();
+        unused(wanted, self.type_entries.len(), |name| {
+            let file = suggested_type_file(&directory, name);
+            self.type_entries
+                .iter()
+                .all(|entry| entry.definition.name() != name && entry.file != file)
+                && !file.exists()
+        })
+    }
+
     /// Starts a frame that does not exist yet.
     pub fn begin_new(&mut self, frame: FrameDef) {
         self.draft = Some(Draft {
@@ -913,6 +942,20 @@ fn disagreement(wanted: &FrameDef, got: &FrameDef) -> String {
         Some(field) => format!("{field} cannot be written the way this file states it"),
         None => "this frame cannot be written back the way the file states it".to_owned(),
     }
+}
+
+/// `wanted`, or `wanted 2`, `wanted 3` and so on until something is free.
+///
+/// Bounded by how many are already there: one of that many suffixes has to be
+/// free, since that is how many names there are to collide with.
+fn unused(wanted: &str, held: usize, free: impl Fn(&str) -> bool) -> String {
+    if free(wanted) {
+        return wanted.to_owned();
+    }
+    (2..=held + 2)
+        .map(|suffix| format!("{wanted} {suffix}"))
+        .find(|name| free(name))
+        .unwrap_or_else(|| wanted.to_owned())
 }
 
 /// The file a frame of this name would go in, had it none yet.
@@ -2270,5 +2313,47 @@ covers = { from = "data", to = "data" }
         let text = std::fs::read_to_string(dir.join("lamp.toml")).unwrap();
         assert!(text.contains("default = 40"), "{text}");
         assert!(text.contains(r#"type = "Percent""#), "{text}");
+    }
+
+    #[test]
+    fn a_second_new_frame_does_not_offer_a_name_already_taken() {
+        let (dir, mut library) = library_of("new-names", &[]);
+        assert_eq!(library.unused_frame_name("New frame"), "New frame");
+
+        // What New does, twice over, with a save in between.
+        for expected in ["New frame", "New frame 2", "New frame 3"] {
+            let name = library.unused_frame_name("New frame");
+            assert_eq!(name, expected);
+            library.begin_new(FrameDef::flat(name.clone(), vec![plain("id")]));
+            assert_eq!(library.draft_problem(), None, "{name} should be savable");
+            library
+                .save_draft(&suggested_file(&dir, &name))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+        }
+
+        assert_eq!(library.entries.len(), 3);
+    }
+
+    #[test]
+    fn a_name_is_skipped_when_only_its_file_is_taken() {
+        let (dir, library) = library_of("new-file-taken", &[("telemetry.toml", GOOD)]);
+        let _ = dir;
+        // `Telemetry` is the frame's name, so the name check alone would let
+        // `telemetry` through, and the file check catches it.
+        assert_eq!(library.unused_frame_name("telemetry"), "telemetry 2");
+    }
+
+    #[test]
+    fn a_second_new_type_does_not_offer_a_name_already_taken() {
+        let (_, mut library) = shared("new-type-names");
+        assert_eq!(library.unused_type_name("NewType"), "NewType");
+
+        library.begin_new_type(TypeDef {
+            layout: FrameDef::flat(library.unused_type_name("NewType"), vec![plain("id")]),
+            narrows: None,
+        });
+        library.save_type_draft().unwrap();
+
+        assert_eq!(library.unused_type_name("NewType"), "NewType 2");
     }
 }
