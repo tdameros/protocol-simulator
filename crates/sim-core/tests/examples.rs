@@ -531,3 +531,92 @@ fn a_file_written_with_windows_line_endings_keeps_them() {
         }
     }
 }
+
+/// A type whose own field is a type, which `led.toml` does not have: its
+/// `LedConfig` names a subtype, and a subtype stays one plain field.
+#[test]
+fn a_type_holding_a_type_survives_being_written_back() {
+    let text = r#"
+[[type]]
+name = "Rgb"
+
+[[type.field]]
+name = "red"
+type = "u8"
+
+[[type.field]]
+name = "green"
+type = "u8"
+
+[[type]]
+name = "Zone"
+
+[[type.field]]
+name = "accent"
+type = "Rgb"
+
+[[type.field]]
+name = "tag"
+type = "u8"
+"#;
+    let mut types = TypeLibrary::default();
+    types.merge_toml(text).expect("valid");
+    let zone = types.definition("Zone").expect("valid").expect("there");
+    assert_eq!(zone.layout.size(), 3);
+
+    let written = schema::update_type_in(text, "Zone", &zone).expect("rewritten");
+    assert_eq!(written, text, "an unchanged rewrite must change nothing");
+
+    let mut after = TypeLibrary::default();
+    after.merge_toml(&written).expect("still valid");
+    let back = after
+        .definition("Zone")
+        .expect("valid")
+        .expect("still there");
+    assert_eq!(back, zone);
+}
+
+/// A repeat carries what the declaration said, and a name alone cannot.
+#[test]
+fn a_repeated_builtin_keeps_what_its_declaration_said() {
+    let text = r#"
+name = "Padded"
+
+[[field]]
+name = "pad"
+type = "bytes"
+description = "Two blocks of four"
+len = 4
+repeat = 2
+"#;
+    let frame = schema::from_toml(text).expect("valid");
+    assert_eq!(frame.declared, ["pad"]);
+    assert_eq!(frame.size(), 8);
+
+    let written = schema::update_in(text, &frame).expect("rewritten");
+    assert_eq!(written, text, "an unchanged rewrite must change nothing");
+    assert_eq!(schema::from_toml(&written).expect("still valid"), frame);
+}
+
+#[test]
+fn a_four_byte_sum_can_be_read_back_as_well_as_written() {
+    let text = r#"
+name = "Summed"
+
+[[field]]
+name = "payload"
+type = "u32"
+
+[[field]]
+name = "total"
+type = "sum32"
+covers = { from = "payload", to = "payload" }
+"#;
+    // The writer has always produced `sum32` from a four-byte sum, so a frame
+    // built in the editor could be written and never read.
+    let frame = schema::from_toml(text).expect("valid");
+    assert_eq!(frame.size(), 8);
+    let written = schema::to_toml(&frame).expect("written");
+    assert!(written.contains("sum32"), "{written}");
+    assert_eq!(schema::from_toml(&written).expect("still valid"), frame);
+}

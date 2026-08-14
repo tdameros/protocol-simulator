@@ -120,9 +120,6 @@ pub struct Draft {
 pub struct Origin {
     pub file: PathBuf,
     pub text: String,
-    /// The declared fields the file states through a named type, worked out
-    /// once when editing starts rather than parsed again on every repaint.
-    pub stated: BTreeMap<String, String>,
 }
 
 impl FrameLibrary {
@@ -628,7 +625,19 @@ impl FrameLibrary {
             layout::retype(&mut held.frame, was, draft.definition.name());
         }
 
-        for (path, text) in &self.pending_for_type_draft(&draft) {
+        let pending = self.pending_for_type_draft(&draft);
+        // As for a deletion: nothing is written until every frame the rewrite
+        // reaches is known to come back with the same bytes. A rename touches
+        // files the guard on the draft itself never looks at.
+        let touched: Vec<(PathBuf, FrameDef)> = self
+            .entries
+            .iter()
+            .filter(|entry| pending.contains_key(&entry.file))
+            .map(|entry| (entry.file.clone(), entry.frame.clone()))
+            .collect();
+        self.check_wire_survives(&pending, &touched)?;
+
+        for (path, text) in &pending {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("cannot create {}", parent.display()))?;
@@ -869,7 +878,6 @@ impl FrameLibrary {
         let origin = std::fs::read_to_string(&entry.file)
             .ok()
             .map(|text| Origin {
-                stated: schema::stated_as_types(&text),
                 file: entry.file.clone(),
                 text,
             });
@@ -1787,7 +1795,6 @@ covers = { from = "header", to = "here" }
         let mut draft = Draft {
             origin: Some(Origin {
                 file: PathBuf::from("layered.toml"),
-                stated: schema::stated_as_types(LAYERED),
                 text: LAYERED.to_owned(),
             }),
             ..draft_of(LAYERED)
@@ -1871,7 +1878,6 @@ covers = { from = "header", to = "here" }
         let mut draft = Draft {
             origin: Some(Origin {
                 file: PathBuf::from("layered.toml"),
-                stated: schema::stated_as_types(LAYERED),
                 text: LAYERED.to_owned(),
             }),
             ..draft_of(LAYERED)
@@ -2313,7 +2319,6 @@ endian = "big"
         let mut draft = Draft {
             origin: Some(Origin {
                 file: PathBuf::from("little.toml"),
-                stated: schema::stated_as_types(LITTLE),
                 text: LITTLE.to_owned(),
             }),
             ..draft_of(LITTLE)
@@ -2332,7 +2337,6 @@ endian = "big"
         let mut draft = Draft {
             origin: Some(Origin {
                 file: PathBuf::from("little.toml"),
-                stated: schema::stated_as_types(LITTLE),
                 text: LITTLE.to_owned(),
             }),
             ..draft_of(LITTLE)
@@ -2372,10 +2376,16 @@ endian = "big"
         library.begin_edit();
         let draft = library.draft.as_ref().expect("editing");
 
-        // What the panel greys out, and what the writer refuses to reword.
+        // What the panel shows in place of a kind picker, and what the writer
+        // refuses to reword. Read from the model now that a frame remembers how
+        // the file states each of its fields.
         assert_eq!(
-            draft.origin.as_ref().map(|origin| origin.stated.clone()),
-            Some([("target".to_owned(), "Percent".to_owned())].into())
+            draft
+                .frame
+                .stated
+                .get("target")
+                .map(|held| held.kind.as_str()),
+            Some("Percent")
         );
     }
 
@@ -2890,7 +2900,6 @@ covers = { from = "data", to = "data" }
         let mut draft = Draft {
             origin: Some(Origin {
                 file: PathBuf::from("layered.toml"),
-                stated: schema::stated_as_types(LAYERED),
                 text: LAYERED.to_owned(),
             }),
             ..draft_of(LAYERED)

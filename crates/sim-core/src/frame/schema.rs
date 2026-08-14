@@ -158,7 +158,7 @@ pub enum SchemaError {
     BadSubtypeBase { name: String, base: String },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum RawEndian {
     Big,
@@ -812,26 +812,11 @@ fn lower_type(type_def: &TypeDef) -> RawType {
         Some(subtype) => (Some(subtype.base.clone()), subtype.range.map(lower_range)),
         None => (None, None),
     };
-    let mut fields: Vec<RawField> = type_def
-        .layout
-        .fields
-        .iter()
-        .filter(|field| type_def.layout.declared.contains(&field.name))
-        .map(|field| lower_field(field, &type_def.layout))
-        .collect();
-    // As for a frame: a field following the order it is given says nothing, one
-    // that overrides it has to say so or it comes back as the other.
-    for (field, held) in fields.iter_mut().zip(
-        type_def
-            .layout
-            .fields
-            .iter()
-            .filter(|held| type_def.layout.declared.contains(&held.name)),
-    ) {
-        if held.endian == type_def.layout.endian {
-            field.endian = None;
-        }
-    }
+    // The same reconstruction a frame gets. Filtering the wire fields by name
+    // instead would drop a field of the type that is itself a type: it expands
+    // to names of its own, matches none of them, and leaves the file.
+    let mut fields = declared_fields(&type_def.layout);
+    leave_inherited_endianness(&mut fields, type_def.layout.endian);
     RawType {
         name: type_def.layout.name.clone(),
         description: type_def.layout.description.clone(),
@@ -875,16 +860,7 @@ fn as_document(frame: &FrameDef) -> Result<toml_edit::DocumentMut, SchemaError> 
     // A field inheriting the frame's order says nothing about it, as the file
     // does. One that differs has to say so, or it would be read back as the
     // frame's and quietly change what goes on the wire.
-    for (field, held) in raw.fields.iter_mut().zip(
-        frame
-            .fields
-            .iter()
-            .filter(|held| frame.declared.contains(&held.name)),
-    ) {
-        if held.endian == frame.endian {
-            field.endian = None;
-        }
-    }
+    leave_inherited_endianness(&mut raw.fields, frame.endian);
     toml_edit::ser::to_document(&raw).map_err(SchemaError::Rewrite)
 }
 
@@ -900,19 +876,6 @@ pub fn stated_as_types(text: &str) -> BTreeMap<String, String> {
         return BTreeMap::new();
     };
     stated_in(document.as_table())
-}
-
-/// The same, for the fields of one type in a shared types file.
-#[must_use]
-pub fn type_stated_as_types(text: &str, name: &str) -> BTreeMap<String, String> {
-    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
-        return BTreeMap::new();
-    };
-    sections(document.as_table(), "type")
-        .iter()
-        .find(|entry| entry.get("name").and_then(Item::as_str) == Some(name))
-        .map(stated_in)
-        .unwrap_or_default()
 }
 
 fn stated_in(holder: &toml_edit::Table) -> BTreeMap<String, String> {
@@ -1151,7 +1114,7 @@ fn build(raw: RawFrame, library: &TypeLibrary) -> Result<FrameDef, SchemaError> 
 /// Type names that are not scalars, kept in one place so [`is_builtin_kind`]
 /// and [`build_kind`] cannot drift apart.
 const BUILTIN_KINDS: &[&str] = &[
-    "bytes", "text", "enum", "bits", "xor8", "sum8", "sum16", "crc8", "crc16", "crc32",
+    "bytes", "text", "enum", "bits", "xor8", "sum8", "sum16", "sum32", "crc8", "crc16", "crc32",
 ];
 
 fn is_builtin_kind(kind: &str) -> bool {
@@ -1597,6 +1560,9 @@ fn build_checksum(
         "xor8" => ChecksumSpec::Xor8,
         "sum8" => ChecksumSpec::Sum { width_bytes: 1 },
         "sum16" => ChecksumSpec::Sum { width_bytes: 2 },
+        // The writer already produces this from a four-byte sum, so the reader
+        // has to take it back.
+        "sum32" => ChecksumSpec::Sum { width_bytes: 4 },
         "crc8" | "crc16" | "crc32" => {
             // `crc8` and `crc32` have one dominant variant, so the preset name
             // doubles as the type; `crc16` has too many to guess at.
@@ -1774,31 +1740,49 @@ fn lower(frame: &FrameDef) -> RawFrame {
 /// correct on the wire and would throw away the factorisation someone took the
 /// trouble to write.
 fn declared_fields(frame: &FrameDef) -> Vec<RawField> {
-    let mut fields: Vec<RawField> = frame
-        .fields
-        .iter()
-        .filter(|field| frame.declared.contains(&field.name))
-        .map(|field| lower_field(field, frame))
-        .collect();
-    for (at, name) in frame.declared.iter().enumerate() {
+    let mut fields = Vec::with_capacity(frame.declared.len());
+    for name in &frame.declared {
+        // Written as itself, which is every plain field.
+        if let Some(field) = frame.field(name) {
+            fields.push(lower_field(field, frame));
+            continue;
+        }
         let Some(stated) = frame.stated.get(name) else {
             continue;
         };
-        if fields.iter().any(|held| held.name == *name) {
-            continue;
-        }
-        fields.insert(
-            at.min(fields.len()),
-            RawField {
-                name: name.clone(),
-                kind: stated.kind.clone(),
-                repeat: stated.repeat,
-                instances: stated.instances.clone(),
-                ..RawField::default()
-            },
-        );
+        // A repeat of a builtin said things a name cannot carry: how long the
+        // bytes are, what the default is, what it is for. Every copy inherited
+        // them, so the first copy gives them back. A named type says none of
+        // that itself, everything of the sort belonging to the type.
+        let mut raw = match frame
+            .fields
+            .get(frame.expansion_of(name).start)
+            .filter(|_| is_builtin_kind(&stated.kind))
+        {
+            Some(leaf) => lower_field(leaf, frame),
+            None => RawField::default(),
+        };
+        raw.name.clone_from(name);
+        raw.kind.clone_from(&stated.kind);
+        raw.repeat = stated.repeat;
+        raw.instances.clone_from(&stated.instances);
+        fields.push(raw);
     }
     fields
+}
+
+/// Drops the byte order from every field that is only following the frame.
+///
+/// Matched on the order itself rather than by walking two lists side by side:
+/// one holds a declaration where the other holds an expansion, and the two slip
+/// apart at the first type instance.
+fn leave_inherited_endianness(fields: &mut [RawField], endian: Endianness) {
+    let inherited: RawEndian = endian.into();
+    for field in fields {
+        if field.endian == Some(inherited) {
+            field.endian = None;
+        }
+    }
 }
 
 fn lower_field(field: &FieldDef, frame: &FrameDef) -> RawField {
