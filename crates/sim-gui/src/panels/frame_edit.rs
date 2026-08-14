@@ -347,22 +347,20 @@ fn field_body(
                 .weak(),
             );
         }
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "Shared: editing {kind} changes every frame naming it."
-                ))
-                .weak(),
-            );
-            // Reached from the field that names it, which is where the wish to
-            // change it comes up.
-            if ui
-                .button(format!("{} Edit {kind}", icons::PENCIL_SIMPLE))
-                .clicked()
-            {
-                *wanted = Some(TypeWanted::Edit((*kind).to_owned()));
-            }
-        });
+        // Above the warning rather than beside it: what to do comes first, the
+        // caution it carries second.
+        if ui
+            .button(format!("{} Edit {kind}", icons::PENCIL_SIMPLE))
+            .clicked()
+        {
+            *wanted = Some(TypeWanted::Edit((*kind).to_owned()));
+        }
+        ui.label(
+            RichText::new(format!(
+                "Shared: editing {kind} changes every frame naming it."
+            ))
+            .weak(),
+        );
         return;
     }
     details(ui, layout, frame, index, hex, false);
