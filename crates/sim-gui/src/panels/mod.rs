@@ -135,6 +135,19 @@ fn read_number(text: &str) -> Option<f64> {
     Some(if negative { -value } else { value })
 }
 
+/// The two words that open a library row, so the pickers below them line up.
+const LIBRARY_LABELS: [&str; 2] = ["Frame:", "Shared types:"];
+
+/// The label opening a library row, in a column wide enough for either of them.
+///
+/// Frames and shared types are picked and managed the same way, so the two rows
+/// are read as one thing. Two labels of different widths would put their
+/// pickers a few pixels apart, which is enough to make them look unrelated.
+pub fn library_label(ui: &mut Ui, text: &str) {
+    let width = widest(ui, &TextStyle::Body, &LIBRARY_LABELS);
+    field_label(ui, text, width);
+}
+
 /// A label filling a fixed column, for the left edge of a form.
 pub fn field_label(ui: &mut Ui, text: &str, width: f32) -> Response {
     column(ui, width, |ui| ui.label(text))

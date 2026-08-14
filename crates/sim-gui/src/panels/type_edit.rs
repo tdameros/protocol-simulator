@@ -45,7 +45,7 @@ pub fn library_bar(ui: &mut Ui, state: &mut AppState) {
         return;
     }
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Shared types:").weak());
+        super::library_label(ui, "Shared types:");
         let names: Vec<String> = state
             .frames
             .type_entries
