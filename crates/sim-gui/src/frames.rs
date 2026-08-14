@@ -810,7 +810,7 @@ impl FrameLibrary {
         std::fs::write(&file, &written)
             .with_context(|| format!("cannot write {}", file.display()))?;
 
-        self.take_in(&file, written, draft);
+        self.take_in(&file, draft);
         Ok(())
     }
 
@@ -843,27 +843,19 @@ impl FrameLibrary {
     }
 
     /// Folds a saved draft into the list, replacing what it came from.
-    fn take_in(&mut self, file: &Path, written: String, draft: Draft) {
+    fn take_in(&mut self, file: &Path, draft: Draft) {
         self.entries.retain(|entry| entry.file != file);
         self.entries.push(Entry {
             file: file.to_path_buf(),
-            frame: draft.frame.clone(),
+            frame: draft.frame,
         });
         self.entries.sort_by(|a, b| a.frame.name.cmp(&b.frame.name));
         self.selected = self.entries.iter().position(|entry| entry.file == file);
         // The values kept under the old shape may no longer fit the new one.
         self.conform_values();
-
-        // The draft now stands on what was just written, so saving twice in a
-        // row edits that rather than reverting to how the file used to read.
-        self.draft = Some(Draft {
-            origin: Some(Origin {
-                stated: schema::stated_as_types(&written),
-                file: file.to_path_buf(),
-                text: written,
-            }),
-            ..draft
-        });
+        // Saving is finishing. Leaving the editor open on a draft that now says
+        // exactly what the disk says only invites wondering whether it saved.
+        self.draft = None;
     }
 }
 
@@ -1244,15 +1236,18 @@ default = 50
     }
 
     #[test]
-    fn saving_twice_in_a_row_edits_the_same_file_rather_than_reverting() {
+    fn editing_twice_in_a_row_edits_the_same_file_rather_than_reverting() {
         let (dir, mut library) = library_of("twice", &[("telemetry.toml", GOOD)]);
-        library.begin_edit();
 
+        // Saving closes the editor, so a second edit reopens it, which is what
+        // keeps the second save from writing over the first from a stale copy.
         for value in [1u64, 0] {
+            library.begin_edit();
             let draft = library.draft.as_mut().unwrap();
             let mode = draft.frame.field_index("mode").unwrap();
             draft.frame.fields[mode].default = Some(Value::Uint(value));
             library.save_draft(&dir).unwrap();
+            assert!(library.draft.is_none(), "saving leaves the editor");
         }
 
         let text = std::fs::read_to_string(dir.join("telemetry.toml")).unwrap();
