@@ -313,3 +313,34 @@ pub fn state_as(
 pub fn stated_of(layout: &FrameDef, index: usize) -> Option<&Stated> {
     layout.stated.get(layout.declared.get(index)?)
 }
+
+/// Whether this field list declares anything written as the named type.
+#[must_use]
+pub fn uses_type(layout: &FrameDef, kind: &str) -> bool {
+    layout.stated.values().any(|stated| stated.kind == kind)
+}
+
+/// Writes out in full every declaration made through the named type.
+///
+/// The wire is untouched: the fields the type produced are already there, and
+/// this only stops calling them by the name that produced them. What is lost is
+/// the factorisation, which is the point when the type itself is going away.
+pub fn inline_type(layout: &mut FrameDef, kind: &str) {
+    let spent: Vec<String> = layout
+        .stated
+        .iter()
+        .filter(|(_, stated)| stated.kind == kind)
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in spent {
+        let Some(at) = layout.declared.iter().position(|held| *held == name) else {
+            continue;
+        };
+        let leaves: Vec<String> = layout
+            .expansion_of(&name)
+            .map(|index| layout.fields[index].name.clone())
+            .collect();
+        layout.declared.splice(at..=at, leaves);
+        layout.stated.remove(&name);
+    }
+}

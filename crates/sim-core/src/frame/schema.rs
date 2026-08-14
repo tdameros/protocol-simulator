@@ -614,7 +614,7 @@ fn reconcile(
         match from.and_then(|at| existing.get(at)) {
             Some(entry) => {
                 let mut entry = entry.clone();
-                let keep = kept_from_the_file(&entry);
+                let keep = kept_from_the_file(&entry, written.get(name));
                 if let Some(replacement) = written.get(name) {
                     document::merge(&mut entry, replacement, keep);
                 }
@@ -680,7 +680,7 @@ fn pair_up(
 
     let mut spare = (0..existing.len())
         .filter(|at| !taken[*at])
-        .filter(|at| kept_from_the_file(&existing[*at]).len() == 1);
+        .filter(|at| kept_from_the_file(&existing[*at], None).len() == 1);
     for (slot, name) in source.iter_mut().zip(declared) {
         if slot.is_none() && written.contains_key(name) {
             *slot = spare.next();
@@ -741,12 +741,20 @@ fn state_endianness(document: &mut toml_edit::DocumentMut, frame: &FrameDef) {
 /// replace `type = "Percent"` with the byte and the bounds it stands for. What
 /// belongs to the field itself, its default and the range a checksum covers,
 /// stays editable.
-fn kept_from_the_file(entry: &toml_edit::Table) -> &'static [&'static str] {
-    let names_a_type = entry
-        .get("type")
-        .and_then(Item::as_str)
-        .is_some_and(|kind| !is_builtin_kind(kind));
-    if names_a_type {
+fn kept_from_the_file(
+    entry: &toml_edit::Table,
+    fresh: Option<&toml_edit::Table>,
+) -> &'static [&'static str] {
+    let names_a_type = |table: &toml_edit::Table| {
+        table
+            .get("type")
+            .and_then(Item::as_str)
+            .is_some_and(|kind| !is_builtin_kind(kind))
+    };
+    // Kept only while both still say a type. A model that has stopped saying
+    // one has been told to write the field out in full, which is what deleting
+    // the type it named amounts to.
+    if names_a_type(entry) && fresh.is_none_or(names_a_type) {
         &["endian", "type", "range", "repr", "variants", "bits"]
     } else {
         &["endian"]

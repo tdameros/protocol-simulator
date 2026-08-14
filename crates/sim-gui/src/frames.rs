@@ -6,6 +6,8 @@ use sim_core::frame::schema::{self, TypeDef, TypeLibrary};
 use sim_core::frame::value::{seed_values, FieldValues};
 use sim_core::frame::FrameDef;
 
+use crate::layout;
+
 /// Subdirectory holding the type definitions every frame in the folder can use.
 const TYPES_DIR: &str = "types";
 
@@ -547,33 +549,124 @@ impl FrameLibrary {
         Ok(())
     }
 
-    /// Deletes the selected shared type from its file.
+    /// Deletes the selected shared type, writing out in full everything that
+    /// named it.
+    ///
+    /// The name disappears; the bytes do not. Every frame and every other type
+    /// that used it keeps the fields it produced, written in place of the
+    /// declaration that produced them. Refused as a whole if any of those
+    /// rewrites would not read back as the same wire layout, rather than
+    /// leaving half a folder rewritten.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read or written.
+    /// Returns an error if a file cannot be read or written, or if the wire
+    /// would change.
     pub fn delete_selected_type(&mut self) -> Result<()> {
         let Some(entry) = self.selected_type().cloned() else {
             return Ok(());
         };
-        let text = std::fs::read_to_string(&entry.file)
-            .with_context(|| format!("cannot read {}", entry.file.display()))?;
-        let written = schema::remove_type_from(&text, entry.definition.name())
-            .with_context(|| format!("cannot remove {}", entry.definition.name()))?;
+        let name = entry.definition.name().to_owned();
+        let mut pending: BTreeMap<PathBuf, String> = BTreeMap::new();
 
-        // A types file holding no types is not a file worth keeping, and with
-        // one type per file that is the usual outcome rather than the odd one.
+        // Types first: one may name another, and a frame using the middle one
+        // must not notice the bottom one going away.
+        for held in &self.type_entries {
+            if held.definition.name() == name || !layout::uses_type(&held.definition.layout, &name)
+            {
+                continue;
+            }
+            let mut spent = held.definition.clone();
+            layout::inline_type(&mut spent.layout, &name);
+            let text = Self::pending_text(&mut pending, &held.file)?;
+            let written = schema::update_type_in(&text, held.definition.name(), &spent)
+                .with_context(|| format!("cannot rewrite {}", held.definition.name()))?;
+            pending.insert(held.file.clone(), written);
+        }
+
+        let text = Self::pending_text(&mut pending, &entry.file)?;
+        let stripped = schema::remove_type_from(&text, &name)
+            .with_context(|| format!("cannot remove {name}"))?;
+        pending.insert(entry.file.clone(), stripped);
+
+        let mut touched: Vec<(PathBuf, FrameDef)> = Vec::new();
+        for held in &self.entries {
+            if !layout::uses_type(&held.frame, &name) {
+                continue;
+            }
+            let mut spent = held.frame.clone();
+            layout::inline_type(&mut spent, &name);
+            let text = Self::pending_text(&mut pending, &held.file)?;
+            let written = schema::update_in(&text, &spent)
+                .with_context(|| format!("cannot rewrite {}", held.frame.name))?;
+            pending.insert(held.file.clone(), written);
+            touched.push((held.file.clone(), held.frame.clone()));
+        }
+
+        self.check_wire_survives(&pending, &touched)?;
+
+        for (path, text) in &pending {
+            std::fs::write(path, text)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+        }
+        // A types file with nothing left in it is not worth keeping.
         let mut left = TypeLibrary::default();
-        let holds_nothing = left.merge_toml(&written).is_ok() && left.is_empty();
-        if holds_nothing {
+        if pending
+            .get(&entry.file)
+            .is_some_and(|text| left.merge_toml(text).is_ok() && left.is_empty())
+        {
             std::fs::remove_file(&entry.file)
                 .with_context(|| format!("cannot remove {}", entry.file.display()))?;
-        } else {
-            std::fs::write(&entry.file, written)
-                .with_context(|| format!("cannot write {}", entry.file.display()))?;
         }
 
         self.reload();
+        Ok(())
+    }
+
+    /// The text of a file as the pending rewrites have it, read from disk the
+    /// first time it is asked for.
+    fn pending_text(pending: &mut BTreeMap<PathBuf, String>, path: &Path) -> Result<String> {
+        if let Some(text) = pending.get(path) {
+            return Ok(text.clone());
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        pending.insert(path.to_path_buf(), text.clone());
+        Ok(text)
+    }
+
+    /// Checks that every frame about to be rewritten still encodes the same
+    /// bytes, which is the whole promise of writing a type out rather than
+    /// deleting what it produced.
+    fn check_wire_survives(
+        &self,
+        pending: &BTreeMap<PathBuf, String>,
+        touched: &[(PathBuf, FrameDef)],
+    ) -> Result<()> {
+        let mut candidate = TypeLibrary::default();
+        let directory = self
+            .directory
+            .as_ref()
+            .map(|held| held.join(TYPES_DIR))
+            .unwrap_or_default();
+        for path in schema::toml_files(&directory).unwrap_or_default() {
+            let text = match pending.get(&path) {
+                Some(text) => text.clone(),
+                None => std::fs::read_to_string(&path).unwrap_or_default(),
+            };
+            let _ = candidate.merge_toml(&text);
+        }
+
+        for (path, was) in touched {
+            let Some(text) = pending.get(path) else {
+                continue;
+            };
+            let now = schema::from_toml_with(text, &candidate)
+                .with_context(|| format!("{} would not load", was.name))?;
+            if now.fields != was.fields {
+                bail!("{} would not send the same bytes", was.name);
+            }
+        }
         Ok(())
     }
 
@@ -1634,20 +1727,75 @@ type = "Rgb"
     }
 
     #[test]
-    fn a_type_a_frame_still_needs_cannot_be_deleted_without_the_frame_saying_so() {
-        let (_, mut library) = shared("types-delete");
-        library.type_selected = Some(1);
+    fn deleting_a_type_writes_it_out_in_the_frames_that_used_it() {
+        let (dir, mut library) = shared("types-delete");
+        let was = library.entries[0].frame.fields.clone();
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Rgb");
+
         library.delete_selected_type().unwrap();
 
-        // The type is gone, and the frame that named it now says why it will
-        // not load rather than loading as something else.
-        assert!(library.entries.is_empty());
-        assert_eq!(library.failures.len(), 1);
-        assert!(
-            library.failures[0].1.contains("Rgb"),
-            "{:?}",
-            library.failures
+        // The name is gone; the bytes are not.
+        assert!(library.failures.is_empty(), "{:?}", library.failures);
+        assert_eq!(library.entries.len(), 1);
+        assert_eq!(library.entries[0].frame.fields, was);
+        assert_eq!(
+            library.entries[0].frame.declared,
+            ["colour.red", "colour.green", "colour.blue"]
         );
+        assert!(library
+            .type_entries
+            .iter()
+            .all(|entry| entry.definition.name() != "Rgb"));
+
+        let text = std::fs::read_to_string(dir.join("lamp.toml")).unwrap();
+        assert!(!text.contains(r#"type = "Rgb""#), "{text}");
+        assert!(text.contains(r#"name = "colour.green""#), "{text}");
+    }
+
+    #[test]
+    fn deleting_a_type_another_type_uses_writes_it_out_there_too() {
+        let (dir, mut library) = shared("types-delete-nested");
+        std::fs::write(
+            dir.join(TYPES_DIR).join("lamp-type.toml"),
+            "[[type]]\nname = \"Lamp\"\n\n[[type.field]]\nname = \"level\"\ntype = \"Percent\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("panel.toml"),
+            "name = \"Panel\"\n\n[[field]]\nname = \"main\"\ntype = \"Lamp\"\n",
+        )
+        .unwrap();
+        library.reload();
+        let was = library
+            .entries
+            .iter()
+            .find(|entry| entry.frame.name == "Panel")
+            .expect("loaded")
+            .frame
+            .fields
+            .clone();
+
+        library.type_selected = library
+            .type_entries
+            .iter()
+            .position(|entry| entry.definition.name() == "Percent");
+        library.delete_selected_type().unwrap();
+
+        // `Panel` never mentioned `Percent`; `Lamp` did, and a frame using
+        // `Lamp` must not notice.
+        assert!(library.failures.is_empty(), "{:?}", library.failures);
+        let panel = library
+            .entries
+            .iter()
+            .find(|entry| entry.frame.name == "Panel")
+            .expect("still loads");
+        assert_eq!(panel.frame.fields, was);
+        let held = std::fs::read_to_string(dir.join(TYPES_DIR).join("lamp-type.toml")).unwrap();
+        assert!(!held.contains(r#"type = "Percent""#), "{held}");
+        assert!(held.contains("max = 100"), "{held}");
     }
 
     #[test]
