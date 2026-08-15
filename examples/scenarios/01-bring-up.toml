@@ -1,0 +1,40 @@
+# Bringing a drive up from cold, the way the commissioning procedure says to.
+#
+# Run it against a board with the Scenarios tab, or read it as the reference for
+# what the sequence is meant to be.
+
+[[scenario]]
+name = "Bring-up"
+description = "Identify, clear faults, then start turning"
+# One connection here. A scenario may list several, and every step without an
+# `on` of its own runs on all of them.
+on = "drive"
+
+# Ask who we are talking to. Nothing is overridden, so the frame goes out with
+# its defaults.
+[[scenario.step]]
+send = "Identity"
+
+# Wait until it reports IDLE. Fields left out may be anything, so this waits for
+# the state and not for one exact frame: the fault word is free to be whatever
+# the last run left behind.
+[[scenario.step]]
+wait_for = { frame = "Status", match = { state = 0 }, timeout_ms = 2000 }
+
+# Write the protection thresholds before anything can turn.
+[[scenario.step]]
+send = "Limits"
+with = { trip_temperature = 105, warn_temperature = 80, current_limit = 9000 }
+
+# Give it a moment to store them.
+[[scenario.step]]
+wait_ms = 100
+
+# A slow ramp to a quarter speed.
+[[scenario.step]]
+send = "Command"
+with = { target_rpm = 1500, ramp_ms = 2000 }
+
+# It must be RUNNING within the ramp time plus a margin.
+[[scenario.step]]
+wait_for = { frame = "Status", match = { state = 2 }, timeout_ms = 3000 }

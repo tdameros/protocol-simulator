@@ -1,0 +1,30 @@
+# The smallest message the drive answers to, sent ten times a second to say the
+# host is still there. Miss three and the drive coasts to a stop.
+#
+# `name` is what the simulator lists in the Frames tab and what a scenario
+# refers to. `endian` sets the byte order for every field below.
+
+name = "Heartbeat"
+description = "Host is alive, 5 bytes"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+# `default` pre-fills the field, so you only type what actually varies.
+default = 0xAA55
+
+[[field]]
+name = "id"
+type = "u8"
+default = 0x01
+
+[[field]]
+name = "seq"
+type = "u8"
+description = "Wraps at 255, echoed in the next Status"
+
+[[field]]
+name = "crc"
+type = "crc8"
+covers = { from = "sync", to = "seq" }

@@ -131,14 +131,15 @@ fn a_frame_knows_which_of_its_fields_the_file_wrote() {
     let dir = examples_dir();
     let types = TypeLibrary::load_dir(&dir.join("types")).expect("shared types should load");
 
-    // Four entries in the file, twenty-one on the wire.
-    let templates = schema::load_with(&dir.join("06-templates.toml"), &types).expect("should load");
+    // Three entries in the file, sixteen on the wire.
+    let templates =
+        schema::load_with(&dir.join("06-motor-bank.toml"), &types).expect("should load");
     assert_eq!(
         templates.declared,
-        ["header", "zone_count", "zone", "crc"],
+        ["head", "motor", "crc"],
         "the names the file writes, in the order it writes them"
     );
-    assert_eq!(templates.fields.len(), 21);
+    assert_eq!(templates.fields.len(), 16);
     assert!(templates.fields.len() > templates.declared.len());
 
     // Everything on the wire is either written down or attributable to
@@ -153,23 +154,19 @@ fn a_frame_knows_which_of_its_fields_the_file_wrote() {
             field.name
         );
     }
-    // Two levels of type and a repeat, all attributed to the one field the file
-    // writes.
+    // A type and a repeat, both attributed to the one field the file writes.
+    assert_eq!(templates.generated_by("motor[0].rpm"), Some("motor"));
     assert_eq!(
-        templates.generated_by("zone.left.led[0].mode"),
-        Some("zone")
+        templates.generated_by("motor[3].temperature"),
+        Some("motor")
     );
-    assert_eq!(
-        templates.generated_by("zone.right.accent.blue"),
-        Some("zone")
-    );
+    assert_eq!(templates.generated_by("head.sync"), Some("head"));
     // Fields the file writes are nobody's expansion, and `zone_count` in
     // particular must not be mistaken for something `zone` produced.
-    assert_eq!(templates.generated_by("zone_count"), None);
     assert_eq!(templates.generated_by("crc"), None);
 
     // A frame with no types and no repeats declares exactly what it carries.
-    let flat = schema::load_with(&dir.join("02-scalars.toml"), &types).expect("should load");
+    let flat = schema::load_with(&dir.join("02-command.toml"), &types).expect("should load");
     let names: Vec<&str> = flat
         .fields
         .iter()
@@ -257,19 +254,21 @@ fn rewriting_an_example_frame_unchanged_leaves_the_file_alone() {
 fn editing_a_subtyped_field_changes_the_value_and_not_the_type() {
     let dir = examples_dir();
     let types = TypeLibrary::load_dir(&dir.join("types")).expect("shared types should load");
-    let path = dir.join("07-subtypes.toml");
+    let path = dir.join("07-limits.toml");
     let text = std::fs::read_to_string(&path).expect("readable");
 
     let mut frame = schema::from_toml_with(&text, &types).expect("valid");
-    let target = frame.field_index("target").expect("target field");
-    frame.fields[target].default = Some(Value::Uint(75));
+    let target = frame
+        .field_index("trip_temperature")
+        .expect("the thresholds field");
+    frame.fields[target].default = Some(Value::Int(100));
 
     let written = schema::update_in(&text, &frame).expect("rewritten");
 
-    assert!(written.contains(r#"type = "Percent""#));
-    assert!(written.contains("default = 75"));
+    assert!(written.contains(r#"type = "Celsius""#));
+    assert!(written.contains("default = 100"));
     let reread = schema::from_toml_with(&written, &types).expect("still valid");
-    assert_eq!(reread.fields[target].default, Some(Value::Uint(75)));
+    assert_eq!(reread.fields[target].default, Some(Value::Int(100)));
     assert_eq!(reread.fields[target].range, frame.fields[target].range);
 }
 
@@ -280,6 +279,11 @@ fn rewriting_a_shared_type_unchanged_leaves_the_file_alone() {
     for path in schema::toml_files(&dir).expect("types folder should be readable") {
         let text = std::fs::read_to_string(&path).expect("readable");
         for definition in types.definitions().expect("every type is valid") {
+            // Only the types this file actually holds: asked to rewrite one it
+            // has never heard of, the writer rightly appends it.
+            if !text.contains(&format!("name = \"{}\"", definition.name())) {
+                continue;
+            }
             let written =
                 schema::update_type_in(&text, definition.name(), &definition).expect("rewritten");
             assert_eq!(
@@ -297,27 +301,24 @@ fn rewriting_a_shared_type_unchanged_leaves_the_file_alone() {
 fn a_shared_type_is_read_as_the_two_things_a_type_can_be() {
     let types = TypeLibrary::load_dir(&examples_dir().join("types")).expect("types");
 
-    let percent = types.definition("Percent").expect("valid").expect("there");
+    let celsius = types.definition("Celsius").expect("valid").expect("there");
     assert_eq!(
-        percent
+        celsius
             .narrows
             .as_ref()
             .map(|narrows| narrows.base.as_str()),
-        Some("u8")
+        Some("i8")
     );
     assert_eq!(
-        percent.narrows.and_then(|narrows| narrows.range),
-        Some(ValueRange::Uint { min: 0, max: 100 })
+        celsius.narrows.and_then(|narrows| narrows.range),
+        Some(ValueRange::Int { min: -40, max: 125 })
     );
-    assert!(percent.layout.fields.is_empty());
+    assert!(celsius.layout.fields.is_empty());
 
-    let led = types
-        .definition("LedConfig")
-        .expect("valid")
-        .expect("there");
-    assert!(led.narrows.is_none());
-    assert_eq!(led.layout.declared, ["mode", "brightness", "period_ms"]);
-    assert_eq!(led.layout.size(), 4);
+    let header = types.definition("Header").expect("valid").expect("there");
+    assert!(header.narrows.is_none());
+    assert_eq!(header.layout.declared, ["sync", "id", "seq"]);
+    assert_eq!(header.layout.size(), 4);
 }
 
 /// A subtype narrowing another one, which the shipped examples do not have and
@@ -519,6 +520,9 @@ fn a_file_written_with_windows_line_endings_keeps_them() {
     for path in schema::toml_files(&types_dir).expect("types folder should be readable") {
         let text = with_windows_line_endings(&std::fs::read_to_string(&path).expect("readable"));
         for definition in types.definitions().expect("every type is valid") {
+            if !text.contains(&format!("name = \"{}\"", definition.name())) {
+                continue;
+            }
             let written =
                 schema::update_type_in(&text, definition.name(), &definition).expect("rewritten");
             assert_eq!(

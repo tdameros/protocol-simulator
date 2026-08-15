@@ -1,0 +1,27 @@
+# Physical units, as the drive reports and accepts them.
+#
+# Each one is a scalar narrowed to what the hardware can actually do, so the
+# editor refuses a value the drive would reject and a received frame outside the
+# range is flagged rather than believed.
+
+[[type]]
+name = "Celsius"
+base = "i8"
+range = { min = -40, max = 125 }
+
+[[type]]
+name = "Permille"
+description = "Nought to full scale in thousandths"
+base = "u16"
+range = { min = 0, max = 1000 }
+
+[[type]]
+name = "Milliamps"
+base = "u16"
+range = { min = 0, max = 20000 }
+
+[[type]]
+name = "Rpm"
+description = "Negative is reverse"
+base = "i16"
+range = { min = -6000, max = 6000 }

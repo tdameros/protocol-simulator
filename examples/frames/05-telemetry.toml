@@ -1,67 +1,55 @@
-# A realistic downlink frame, combining everything the format offers.
-#
-# This is the shape most projects end up with: a sync word, a header, a typed
-# payload, and a CRC over the lot.
+# The frame the bench actually watches, sent at 10 Hz while the drive runs.
+# Everything the previous files introduced, plus the shared header and the units
+# from `types/`.
 
 name = "Telemetry"
-description = "Realistic downlink telemetry, 40 bytes"
+description = "Running values, 16 bytes"
 endian = "big"
 
+# Four bytes of header, written once in types/header.toml and named here.
 [[field]]
-name = "sync"
-type = "u16"
-default = 0xAA55
-description = "Frame start marker, constant"
+name = "head"
+type = "Header"
 
 [[field]]
-name = "device_id"
-type = "u8"
-default = 1
+name = "rpm"
+type = "Rpm"
 
 [[field]]
-name = "label"
-type = "text"
-len = 8
-description = "Fixed width, NUL padded on send and trimmed on receive"
-
-[[field]]
-name = "timestamp"
-type = "u32"
-description = "Milliseconds since power-on"
-
-[[field]]
-name = "mode"
-type = "enum"
-repr = "u8"
-variants = { IDLE = 0, RUNNING = 1, DEGRADED = 2, FAULT = 3 }
-
-[[field]]
-name = "flags"
-type = "bits"
-repr = "u8"
-bits = [
-  { name = "armed",     width = 1 },
-  { name = "heater_on", width = 1 },
-  { name = "link_up",   width = 1 },
-  { name = "spare",     width = 5 },
-]
+name = "current"
+type = "Milliamps"
 
 [[field]]
 name = "temperature"
-type = "i16"
-description = "Tenths of a degree Celsius"
+type = "Celsius"
 
 [[field]]
-name = "bus_voltage"
-type = "f32"
+name = "load"
+type = "Permille"
+description = "Torque as a fraction of the rated maximum"
 
 [[field]]
-name = "payload"
-type = "bytes"
-len = 15
+name = "state"
+type = "enum"
+repr = "u8"
+variants = { IDLE = 0, STARTING = 1, RUNNING = 2, STOPPING = 3, FAULT = 4 }
 
+[[field]]
+name = "faults"
+type = "bits"
+repr = "u16"
+bits = [
+  { name = "overtemperature", width = 1 },
+  { name = "overcurrent",     width = 1 },
+  { name = "undervoltage",    width = 1 },
+  { name = "stall",           width = 1 },
+  { name = "spare",           width = 12 },
+]
+
+# Naming `head` covers all four of its bytes. The range follows the type, so
+# adding a field to the header keeps the checksum over the whole of it.
 [[field]]
 name = "crc"
 type = "crc16"
 algo = "crc16-ccitt"
-covers = { from = "sync", to = "payload" }
+covers = { from = "head", to = "faults" }
