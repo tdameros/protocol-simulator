@@ -1,0 +1,42 @@
+# What the host sends to make the shaft turn. Every scalar width the protocol
+# uses appears here, including one field that disagrees with the frame about
+# byte order.
+
+name = "Command"
+description = "Speed setpoint and ramp, 12 bytes"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+
+[[field]]
+name = "id"
+type = "u8"
+default = 0x10
+
+[[field]]
+name = "target_rpm"
+type = "i16"
+description = "Negative is reverse"
+
+[[field]]
+name = "ramp_ms"
+type = "u16"
+description = "Time to reach the setpoint from a standstill"
+default = 500
+
+[[field]]
+name = "timeout_ms"
+type = "u32"
+description = "Coast if no Command arrives within this"
+default = 300
+# The drive's parameter block is little-endian, and this field is copied into
+# it byte for byte. A field may disagree with its frame.
+endian = "little"
+
+[[field]]
+name = "crc"
+type = "crc8"
+covers = { from = "sync", to = "timeout_ms" }

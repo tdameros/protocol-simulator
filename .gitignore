@@ -3,3 +3,6 @@
 
 # Scratch projects saved from the app while working on it.
 /projects
+
+# Finder leaves these behind on macOS.
+.DS_Store

@@ -1,0 +1,54 @@
+# The protection thresholds, written into the drive at commissioning and read
+# back to prove they took.
+#
+# Every field here is a scalar restricted to the values the protocol allows. The
+# wire format is unchanged, this frame is 12 bytes either way, but the editor
+# will not let you dial a threshold the drive would reject, and a value read
+# back outside the range is flagged.
+#
+# A subtype is a `[[type]]` with a `base` instead of fields, and it may narrow
+# another subtype. `Celsius` and `Permille` live in types/units.toml.
+
+name = "Limits"
+description = "Protection thresholds, 12 bytes"
+endian = "big"
+
+# Only this frame cares about it, so it is declared here.
+[[type]]
+name = "WarnTemperature"
+base = "Celsius"
+range = { min = 0, max = 90 }
+
+[[field]]
+name = "head"
+type = "Header"
+
+[[field]]
+name = "trip_temperature"
+type = "Celsius"
+default = 110
+description = "Cut the output above this"
+
+[[field]]
+name = "warn_temperature"
+type = "WarnTemperature"
+default = 85
+description = "Raise the flag above this, keep running"
+
+[[field]]
+name = "current_limit"
+type = "Milliamps"
+default = 12000
+# A field may narrow further still, as long as it stays inside its subtype.
+range = { min = 1000, max = 15000 }
+
+[[field]]
+name = "load_limit"
+type = "Permille"
+default = 900
+
+[[field]]
+name = "crc"
+type = "crc16"
+algo = "crc16-ccitt"
+covers = { from = "head", to = "load_limit" }

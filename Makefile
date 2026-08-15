@@ -55,6 +55,14 @@ doc: ## Build and open the workspace documentation
 clean: ## Remove build artifacts
 	cargo clean
 
+third-party: ## Regenerate the notices of every crate we link against
+	cargo about generate about.hbs -o THIRD-PARTY.md
+
+third-party-check: ## Fail if THIRD-PARTY.md is behind the dependency tree
+	@cargo about generate about.hbs -o /tmp/third-party-check.md
+	@diff -q THIRD-PARTY.md /tmp/third-party-check.md >/dev/null \
+		|| { echo "THIRD-PARTY.md is out of date, run: make third-party"; exit 1; }
+
 ci: fmt-check clippy test ## Run all quality gates (format, lint, tests)
 
 bundle-macos: ## Build the universal macOS .app locally (needs ~3 GB of disk)

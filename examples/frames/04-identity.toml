@@ -1,0 +1,45 @@
+# Asked for once at bring-up and written into the test report. Text and raw
+# bytes, the two field types that carry something other than a number.
+
+name = "Identity"
+description = "Who this drive is, 25 bytes"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+
+[[field]]
+name = "id"
+type = "u8"
+default = 0x02
+
+[[field]]
+name = "serial"
+type = "text"
+len = 12
+description = "Padded with NUL, trimmed on the way back"
+
+[[field]]
+name = "mac"
+type = "bytes"
+len = 6
+description = "Ethernet address of the gateway port"
+
+[[field]]
+name = "fw_major"
+type = "u8"
+
+[[field]]
+name = "fw_minor"
+type = "u8"
+
+[[field]]
+name = "fw_patch"
+type = "u8"
+
+[[field]]
+name = "crc"
+type = "crc8"
+covers = { from = "sync", to = "fw_patch" }

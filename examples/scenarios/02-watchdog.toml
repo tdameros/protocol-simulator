@@ -1,0 +1,28 @@
+# The drive coasts to a stop if it hears nothing for 300 ms, so a bench that
+# leaves it running needs a heartbeat in the background.
+#
+# Two scenarios in one file, because they belong together: one keeps the link
+# alive, the other reads back what the drive is doing.
+
+[[scenario]]
+name = "Heartbeat 10 Hz"
+description = "Keeps the drive from timing out"
+on = "drive"
+# Forever, until the row is stopped.
+repeat = { every_ms = 100 }
+
+[[scenario.step]]
+send = "Heartbeat"
+# A counter steps every pass and wraps where the field does, so the drive sees
+# a sequence rather than the same byte a hundred times a second.
+counters = { seq = { wrap = 255 } }
+
+[[scenario]]
+name = "Poll telemetry"
+description = "Twenty readings, one every 50 ms"
+on = "drive"
+repeat = { every_ms = 50, times = 20 }
+
+[[scenario.step]]
+send = "Telemetry"
+counters = { "head.seq" = { wrap = 255 } }

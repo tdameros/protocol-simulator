@@ -25,7 +25,11 @@ for arch in aarch64 x86_64; do
 done
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+# Every licence we link against asks for its notice to travel with the binary,
+# and Resources is where a bundle keeps that sort of thing.
+cp THIRD-PARTY.md "$APP/Contents/Resources/"
 
 # One file that runs on both kinds of Mac, so there is a single download.
 lipo -create -output "$APP/Contents/MacOS/$BIN" \

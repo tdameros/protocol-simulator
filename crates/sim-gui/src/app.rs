@@ -27,7 +27,9 @@ enum Pending {
 }
 
 pub struct SimApp {
-    state: AppState,
+    /// Reachable from the crate so the documentation's screenshots can put a
+    /// bench in front of the window before drawing it.
+    pub(crate) state: AppState,
     engine: EngineHandle,
     dock_state: DockState<Tab>,
     /// Where the current project lives, once it has anywhere to live.

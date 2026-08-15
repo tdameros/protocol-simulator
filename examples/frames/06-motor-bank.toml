@@ -1,0 +1,49 @@
+# Four drives on one bus, reporting together. A structure that repeats is
+# written once and instantiated, which is what `[[type]]` is for.
+#
+# `MotorReading` is declared here because only this frame needs it. `Header` and
+# the units come from `types/`, shared by the whole folder.
+#
+# Instantiating expands the type's fields under the instance name:
+#   repeat = 4                    ->  motor[0].rpm, motor[1].rpm, ...
+#   instances = ["left", "right"] ->  axle.left.rpm, axle.right.rpm
+#   neither                       ->  head.sync
+#
+# Nothing about the type survives into the bytes. This frame is the same 26
+# bytes you would get by writing all fifteen fields out by hand, which is the
+# point.
+
+name = "MotorBank"
+description = "Four drives in one message, 26 bytes"
+endian = "big"
+
+[[type]]
+name = "MotorReading"
+description = "What one drive contributes"
+
+[[type.field]]
+name = "rpm"
+type = "Rpm"
+
+[[type.field]]
+name = "current"
+type = "Milliamps"
+
+[[type.field]]
+name = "temperature"
+type = "Celsius"
+
+[[field]]
+name = "head"
+type = "Header"
+
+[[field]]
+name = "motor"
+type = "MotorReading"
+repeat = 4
+
+[[field]]
+name = "crc"
+type = "crc16"
+algo = "crc16-ccitt"
+covers = { from = "head", to = "motor" }

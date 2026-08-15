@@ -11,6 +11,9 @@ pub mod type_edit;
 #[path = "panels_tests.rs"]
 mod panels_tests;
 
+#[cfg(all(test, feature = "shots"))]
+mod shots;
+
 use egui::{Color32, Layout, Response, TextStyle, Ui, WidgetText};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::TabViewer;

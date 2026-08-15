@@ -2,6 +2,7 @@
 name = "sim-gui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 # The crate is named for its place in the workspace; the file people download
 # is named for what it is.
@@ -23,6 +24,11 @@ tokio-serial = "5.5.0"
 if-addrs = "0.15.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+
+[features]
+# Renders the documentation's screenshots from the real panels. Off by default:
+# it pulls a GPU backend the ordinary test run has no use for.
+shots = ["egui_kittest/snapshot", "egui_kittest/wgpu", "egui_kittest/eframe"]
 
 [dev-dependencies]
 # Drives the panels without a window, so what a click does is testable.

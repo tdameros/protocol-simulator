@@ -1840,7 +1840,13 @@ fn lower_field(field: &FieldDef, frame: &FrameDef) -> RawField {
                 ChecksumSpec::Sum { width_bytes } => raw.kind = format!("sum{}", width_bytes * 8),
                 ChecksumSpec::Crc(crc) => {
                     raw.kind = format!("crc{}", crc.width_bits);
-                    raw.algo = crc.preset_name().map(ToOwned::to_owned);
+                    // Left out when it says no more than the type does: a file
+                    // writing `type = "crc8"` and nothing else must come back
+                    // the same, not with an `algo` it never had.
+                    raw.algo = crc
+                        .preset_name()
+                        .filter(|preset| *preset != raw.kind)
+                        .map(ToOwned::to_owned);
                 }
             }
             raw.covers = Some(RawCovers {

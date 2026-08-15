@@ -12,6 +12,9 @@ Built against glibc 2.35, so it runs anywhere with that or newer: Ubuntu
 uses the X11 or Wayland libraries your desktop already provides; there is
 nothing to install.
 
+`THIRD-PARTY.md` beside the archive lists every crate compiled in and the full
+text of its licence. The Linux and macOS downloads carry a copy inside.
+
 ## Windows (x86_64)
 
 Download `protocol-simulator-windows-x86_64.exe` and run it. The C runtime is

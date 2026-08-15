@@ -1,0 +1,23 @@
+# The four bytes every message on this bus starts with.
+#
+# Written once here so that a new message type is three lines of header plus
+# whatever it carries, and so that changing the sync word changes it everywhere.
+
+[[type]]
+name = "Header"
+description = "Sync word, message id and sequence number"
+
+[[type.field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+
+[[type.field]]
+name = "id"
+type = "u8"
+description = "Message type, see the protocol table"
+
+[[type.field]]
+name = "seq"
+type = "u8"
+description = "Wraps at 255, echoed back in the reply"

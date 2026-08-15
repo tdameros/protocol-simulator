@@ -1,0 +1,53 @@
+# What the drive reports back. Named values and packed flags, the two things
+# that make a raw hex dump unreadable and that the editor turns into a dropdown
+# and a column of checkboxes.
+
+name = "Status"
+description = "Drive state and fault flags, 7 bytes"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+
+[[field]]
+name = "id"
+type = "u8"
+default = 0x11
+
+[[field]]
+name = "state"
+type = "enum"
+repr = "u8"
+# The editor shows the names and sends the numbers. Order in the file does not
+# matter, variants are listed by value.
+variants = { IDLE = 0, STARTING = 1, RUNNING = 2, STOPPING = 3, FAULT = 4 }
+
+[[field]]
+name = "faults"
+type = "bits"
+repr = "u16"
+# Packed most significant bit first, so `overtemperature` is bit 15 and `spare`
+# takes the eight that are left. The editor works the positions out from the
+# widths and shows them beside each name, so the panel reads against the
+# datasheet without counting.
+#
+# The widths must add up to exactly the size of `repr`, or the file is refused
+# at load time rather than producing a quietly wrong frame.
+bits = [
+  { name = "overtemperature", width = 1 },
+  { name = "overcurrent",     width = 1 },
+  { name = "undervoltage",    width = 1 },
+  { name = "stall",           width = 1 },
+  { name = "encoder_lost",    width = 1 },
+  { name = "bus_timeout",     width = 1 },
+  { name = "estop",           width = 1 },
+  { name = "selftest_failed", width = 1 },
+  { name = "spare",           width = 8 },
+]
+
+[[field]]
+name = "crc"
+type = "crc8"
+covers = { from = "sync", to = "faults" }
