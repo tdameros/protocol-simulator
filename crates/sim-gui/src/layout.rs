@@ -51,6 +51,7 @@ pub fn rename_field(layout: &mut FrameDef, index: usize, name: &str) {
     if layout.declared.iter().any(|held| held == name) || layout.field_index(name).is_some() {
         return;
     }
+
     // Nothing moves, so the ranges stored as indices still hold, whether this
     // renames one field or the twenty a type expanded into.
     for at in layout.expansion_of(&old) {
