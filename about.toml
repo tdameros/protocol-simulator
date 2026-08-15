@@ -1,0 +1,35 @@
+# The licences this project accepts in anything it links against.
+#
+# Adding one here is a statement that its terms are acceptable, not a way to
+# silence the check, so each is listed on purpose. MIT and Apache come first
+# because a crate offering a choice resolves to the first match, and those two
+# are what the rest of the ecosystem expects to see.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+
+    # Permissive, notice required. The usual suspects around parsing and IO.
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+
+    # Permissive, no notice required in a binary. Boost, and a public domain
+    # dedication.
+    "BSL-1.0",
+    "CC0-1.0",
+
+    # The Unicode data licence, carried by the character tables.
+    "Unicode-3.0",
+
+    # Weak copyleft, at the file. Reaches `serialport` and nothing of ours: a
+    # binary carries the notice and the source stays on crates.io. Modifying
+    # one of its files, were we ever to vendor it, would mean publishing that
+    # file.
+    "MPL-2.0",
+
+    # The fonts egui bundles. Both allow embedding in an application. Neither
+    # allows selling the font on its own, which is not something this does.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]

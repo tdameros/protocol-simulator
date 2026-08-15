@@ -128,9 +128,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo build --release --locked -p sim-gui
-          # tar rather than a bare file: it carries the executable bit, which a
-          # browser download would otherwise strip.
-          tar -C target/release -czf "${{ matrix.artifact }}" "$BIN"
+          cp THIRD-PARTY.md target/release/
+          # tar rather than a bare file, because it carries the executable bit
+          # that a browser download would otherwise strip.
+          tar -C target/release -czf "${{ matrix.artifact }}" "$BIN" THIRD-PARTY.md
 
       - name: Build and package (Windows)
         if: runner.os == 'Windows'
@@ -172,6 +173,12 @@ jobs:
 
       - name: Write the release notes
         run: sed "s/__VERSION__/$TAG/g" packaging/release-notes.md >notes.md
+
+      # Alongside the archives as well as inside them. The Windows artifact is
+      # a bare executable with nowhere to put it, and every licence here asks
+      # for its notice to travel with the binary.
+      - name: Carry the third party notices
+        run: cp THIRD-PARTY.md dist/
 
       # No tag was pushed to get here, so this call creates it, on the exact
       # commit the artifacts above were built from. A draft is the exception:
