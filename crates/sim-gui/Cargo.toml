@@ -25,6 +25,11 @@ if-addrs = "0.15.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 
+[features]
+# Renders the documentation's screenshots from the real panels. Off by default:
+# it pulls a GPU backend the ordinary test run has no use for.
+shots = ["egui_kittest/snapshot", "egui_kittest/wgpu", "egui_kittest/eframe"]
+
 [dev-dependencies]
 # Drives the panels without a window, so what a click does is testable.
 egui_kittest = "0.35"
