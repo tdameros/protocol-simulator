@@ -1727,3 +1727,40 @@ covers = { from = "a", to = "b" }
     assert_eq!(draft.frame.declared, ["a", "b", "crc"]);
     assert_eq!(draft.problem(&TypeLibrary::default()), None);
 }
+
+#[test]
+fn a_frame_waiting_under_a_type_survives_it_being_deleted() {
+    let (_, mut library) = shared("draft-under-delete");
+    let types = library.types().clone();
+    library.begin_new(FrameDef::flat("Built", vec![plain("colour")]));
+    let stated = Stated {
+        kind: "Rgb".to_owned(),
+        repeat: None,
+        instances: None,
+    };
+    {
+        let draft = library.draft.as_mut().unwrap();
+        let expansion =
+            schema::instantiate(&types, "colour", "Rgb", &stated, draft.frame.endian).unwrap();
+        layout::state_as(&mut draft.frame, 0, Some(&stated), expansion);
+    }
+    let was = library.draft.as_ref().unwrap().frame.fields.clone();
+
+    // Off to the type from one of the frame's own fields, and delete it there.
+    library.type_selected = library
+        .type_entries
+        .iter()
+        .position(|entry| entry.definition.name() == "Rgb");
+    library.delete_selected_type().unwrap();
+
+    // The frame is still open, still three bytes, and no longer naming a type
+    // nothing defines.
+    let draft = library.draft.as_ref().expect("the frame is still waiting");
+    assert_eq!(draft.frame.fields, was);
+    assert!(draft.frame.stated.is_empty());
+    assert_eq!(
+        draft.frame.declared,
+        ["colour.red", "colour.green", "colour.blue"]
+    );
+    assert_eq!(library.draft_problem(), None);
+}

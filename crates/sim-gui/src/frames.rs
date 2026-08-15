@@ -823,7 +823,13 @@ impl FrameLibrary {
                 .with_context(|| format!("cannot remove {}", entry.file.display()))?;
         }
 
-        self.reload();
+        // A frame may be open underneath, having reached the type from one of
+        // its own fields. It still names what has just gone, so it is written
+        // out there too rather than left pointing at nothing.
+        if let Some(draft) = &mut self.draft {
+            layout::inline_type(&mut draft.frame, &name);
+        }
+        self.reload_keeping_the_frame_draft();
         Ok(())
     }
 
