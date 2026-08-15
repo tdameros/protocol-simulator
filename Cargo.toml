@@ -8,6 +8,10 @@ members = ["crates/sim-core", "crates/sim-gui"]
 # derived from it, so nothing can drift out of step with anything else.
 version = "0.3.0"
 edition = "2021"
+# Either, at the user's option, which is the Rust ecosystem's convention and
+# what egui and tokio themselves use. MIT for its brevity, Apache for the
+# patent grant a legal department will ask about.
+license = "MIT OR Apache-2.0"
 
 # What gets downloaded, so size matters more than build time here.
 [profile.release]
