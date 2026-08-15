@@ -23,3 +23,7 @@ tokio-serial = "5.5.0"
 if-addrs = "0.15.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+
+[dev-dependencies]
+# Drives the panels without a window, so what a click does is testable.
+egui_kittest = "0.35"

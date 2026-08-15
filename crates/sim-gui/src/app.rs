@@ -216,6 +216,16 @@ impl SimApp {
     }
 
     fn apply_events(&mut self) {
+        // Said once per pass rather than at each of the ten places a command is
+        // given: a refused Send is a frame that never went out, and silence
+        // there reads as a test that passed.
+        let dropped = self.engine.take_dropped();
+        if dropped > 0 {
+            self.state.last_error = Some(format!(
+                "the engine is too busy: {dropped} command(s) were not carried out"
+            ));
+        }
+
         for event in self.engine.drain_events() {
             match event {
                 Event::ConnectionStatus { id, status } => {

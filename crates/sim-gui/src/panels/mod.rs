@@ -7,6 +7,10 @@ pub mod scenario_edit;
 pub mod scenario_list;
 pub mod type_edit;
 
+#[cfg(test)]
+#[path = "panels_tests.rs"]
+mod panels_tests;
+
 use egui::{Color32, Layout, Response, TextStyle, Ui, WidgetText};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::TabViewer;

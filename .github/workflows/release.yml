@@ -81,7 +81,8 @@ jobs:
           #
           # 22.04, three images behind, is a further deliberate step: it fixes
           # the glibc floor at 2.35, which is what lets the binary run on Debian
-          # 12 and RHEL 9 as well.
+          # 12 and Fedora 36 as well. Not RHEL 9, which ships 2.34: going that
+          # low would mean an older image again, or building in a container.
           - os: ubuntu-22.04
             artifact: protocol-simulator-linux-x86_64.tar.gz
             rustflags: ""

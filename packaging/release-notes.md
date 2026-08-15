@@ -7,9 +7,10 @@ tar xzf protocol-simulator-linux-x86_64.tar.gz
 ./protocol-simulator            # optionally: ./protocol-simulator my-project.toml
 ```
 
-Built against glibc 2.35, so it runs on Ubuntu 22.04+, Debian 12+, Fedora 36+
-and RHEL 9+. It uses the X11 or Wayland libraries your desktop already provides;
-there is nothing to install.
+Built against glibc 2.35, so it runs anywhere with that or newer: Ubuntu
+22.04+, Debian 12+, Fedora 36+. RHEL 9 is below the floor, shipping 2.34. It
+uses the X11 or Wayland libraries your desktop already provides; there is
+nothing to install.
 
 ## Windows (x86_64)
 

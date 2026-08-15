@@ -2,11 +2,21 @@ use sim_core::frame::FrameDef;
 use sim_core::scenario::Scenario;
 use sim_core::{Command, ConnectionId, Engine, Event, RetryPolicy, TransportConfig};
 
+use std::cell::Cell;
+
 use tokio::sync::mpsc;
 
 pub struct EngineHandle {
     command_tx: mpsc::Sender<Command>,
     event_rx: mpsc::Receiver<Event>,
+    /// Commands the engine could not be given, counted rather than handed back.
+    ///
+    /// The channel is bounded, so a busy engine can refuse one, and a refused
+    /// Send is a frame that never went out. Ten call sites would each have to
+    /// remember to look at a returned error, and the eleventh would not;
+    /// counting them here means the one place that reports it cannot be
+    /// bypassed by a new caller.
+    dropped: Cell<usize>,
 }
 
 impl EngineHandle {
@@ -15,6 +25,7 @@ impl EngineHandle {
         Self {
             command_tx,
             event_rx,
+            dropped: Cell::new(0),
         }
     }
 
@@ -52,8 +63,15 @@ impl EngineHandle {
         events
     }
 
+    /// How many commands never reached the engine since this was last asked.
+    pub fn take_dropped(&self) -> usize {
+        self.dropped.replace(0)
+    }
+
     fn send(&self, command: Command) {
-        let _ = self.command_tx.try_send(command);
+        if self.command_tx.try_send(command).is_err() {
+            self.dropped.set(self.dropped.get() + 1);
+        }
     }
 }
 
