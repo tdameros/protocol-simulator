@@ -6,7 +6,7 @@ members = ["crates/sim-core", "crates/sim-gui"]
 # The one place a version is written. Both crates inherit it, the release
 # workflow reads it back with `cargo metadata`, and the tag it publishes is
 # derived from it, so nothing can drift out of step with anything else.
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Either, at the user's option, which is the Rust ecosystem's convention and
 # what egui and tokio themselves use. MIT for its brevity, Apache for the

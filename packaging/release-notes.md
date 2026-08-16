@@ -1,5 +1,19 @@
 Protocol Simulator __VERSION__: one executable per platform, nothing to install.
 
+## Upgrading from 0.3
+
+**A frame file with no `endian` line now means little-endian.** It used to mean
+big-endian. Any definition that relied on the default sends its multi-byte
+fields the other way round after this update.
+
+Check your own files for the line and add it where it was implicit:
+
+```sh
+grep -L '^endian' your-frames/*.toml
+```
+
+The shipped examples all state it, so they are unaffected.
+
 ## Linux (x86_64)
 
 ```sh
@@ -101,7 +115,31 @@ on taking decimal whichever way they are showing.
 
 ## Frame definitions
 
-The `examples/frames` folder in the source tree holds documented examples, from
-a three-byte frame up to reusable types and constrained scalars. Point the
-**Frames folder** button at a copy of it, or pass the folder on the command
-line. A project remembers the folder, relative to itself.
+The **Frames** tab now creates and edits them, so a technician never has to open
+a file. New, Edit and Delete sit beside the frame picker, and the editor covers
+everything the format can say: the scalars, `bytes` and `text`, enums, bitfields
+with their positions, and checksums with the range they protect picked from a
+list rather than typed.
+
+Shared types are editable too, folded under the folder path. A field's type
+picker lists them after the builtins and offers to make one on the spot.
+Renaming a type rewrites every frame naming it, and deleting one writes it out
+in full wherever it was used, so the bytes never move. What a change would do to
+each frame is listed before it is saved.
+
+Saving writes back into the file the frame came from, key by key. Comments,
+blank lines, key order and line endings survive it, and a factorisation is never
+flattened: a frame written as three declarations that expand to sixteen fields
+is written back as three.
+
+The `examples/frames` folder holds one worked protocol, a motor drive, with a
+file per feature from a five-byte heartbeat up to shared types and constrained
+scalars. Point the **Frames folder** button at a copy of it, or pass the folder
+on the command line.
+
+## Documentation and licensing
+
+`docs/` holds a reference page per part of the app, with screenshots rendered
+from the panels themselves. The project is now licensed under MIT or Apache-2.0
+at your option, and `THIRD-PARTY.md` carries the notices of all 428 crates
+compiled in.
