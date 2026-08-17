@@ -227,3 +227,41 @@ fn a_field_cannot_be_typed_onto_the_name_of_another() {
         "one box and the text inside it, not two fields"
     );
 }
+
+fn scenarios_panel(world: World) -> Harness<'static, World> {
+    Harness::new_ui_state(
+        |ui, world| {
+            let engine = EngineHandle::default();
+            let _ = &world.engine;
+            super::scenario_list::show(ui, &mut world.state, &engine);
+        },
+        world,
+    )
+}
+
+/// New used to set a draft that nothing drew: the panel returned early on an
+/// empty list, before the editor block, so the first scenario a folder ever got
+/// was unreachable.
+#[test]
+fn a_first_scenario_can_be_made_in_an_empty_folder() {
+    let dir = std::env::temp_dir().join(format!("sim-panel-{}-scenarios", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut world = World::new();
+    world.state.scenarios.load_from(dir);
+    assert!(world.state.scenarios.entries.is_empty());
+
+    let mut harness = scenarios_panel(world);
+    harness.run();
+    harness.get_by_label_contains("New").click();
+    harness.run();
+
+    assert!(
+        harness.state().state.scenarios.draft.is_some(),
+        "the click starts one"
+    );
+    assert!(
+        harness.query_by_label_contains("Save").is_some(),
+        "and the editor it opens is on screen"
+    );
+}

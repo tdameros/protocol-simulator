@@ -20,15 +20,20 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
         ui.colored_label(ERROR, format!("{file}: {reason}"));
     }
 
-    if state.scenarios.entries.is_empty() {
-        if state.scenarios.directory.is_some() && state.scenarios.failures.is_empty() {
-            ui.label("No .toml scenario in that folder.");
+    // Before the emptiness check below, and not after it: the first scenario a
+    // folder gets is written into a draft while the list is still empty, and
+    // returning early would leave New setting a draft nothing ever draws.
+    if state.scenarios.draft.is_none() {
+        if state.scenarios.entries.is_empty() {
+            if state.scenarios.directory.is_some() && state.scenarios.failures.is_empty() {
+                ui.label("No .toml scenario in that folder.");
+            }
+            return;
         }
-        return;
-    }
 
-    ui.separator();
-    scenario_list(ui, state, engine);
+        ui.separator();
+        scenario_list(ui, state, engine);
+    }
     ui.separator();
 
     // Editing a copy, so what the list and the disk hold is untouched until
