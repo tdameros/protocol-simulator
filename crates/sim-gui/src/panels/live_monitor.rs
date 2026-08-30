@@ -381,7 +381,7 @@ fn frame_row(
         ui.cursor().min,
         egui::vec2(ui.available_width(), columns.row),
     );
-    let background = ui.interact(rect, ui.id().with(entry.seq), egui::Sense::click());
+    let background = ui.interact(rect, ui.id().with(entry.seq), egui::Sense::CLICK);
     if on_show {
         ui.painter().rect_filled(
             rect,
