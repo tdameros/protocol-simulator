@@ -273,7 +273,7 @@ fn traffic_monitor() {
         // against the wrong row height. Forgetting it lets the second pass,
         // the one that is drawn, size the pane the way a running app does.
         ui.ctx().data_mut(|data| {
-            data.remove::<egui::PanelState>(egui::Id::new(("frame_detail", monitor)))
+            data.remove::<egui::PanelState>(egui::Id::new(("frame_detail", monitor)));
         });
         super::live_monitor::show(ui, &mut world.state, monitor);
     });

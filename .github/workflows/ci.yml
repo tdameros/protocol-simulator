@@ -53,4 +53,10 @@ jobs:
 
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The release profile is a different compilation. egui puts its debug
+      # painting behind `debug_assertions`, so code reading it builds in the
+      # steps above and not in the artifacts. A check rather than a build,
+      # since release.yml does the full one, but it is what makes the claim
+      # above about the artifacts true.
+      - run: cargo check --workspace --all-targets --release --locked
       - run: cargo test --workspace --locked
