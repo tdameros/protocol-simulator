@@ -4,7 +4,7 @@ use chrono::{DateTime, Local};
 use egui::{Color32, Label, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::panels::{column, field_label, number, widest};
+use crate::panels::{column, field_label, number, printable, spaced_hex, widest};
 use crate::state::{
     AppState, Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState,
     TrafficFilter,
@@ -317,11 +317,11 @@ fn frame_row(
     let drawn = ui.horizontal(|ui| {
         ui.menu_button(icons::DOTS_THREE, |ui| {
             if ui.button("Copy hex").clicked() {
-                ui.ctx().copy_text(format_hex(&entry.bytes));
+                ui.ctx().copy_text(spaced_hex(&entry.bytes));
                 ui.close();
             }
             if ui.button("Send to Hex Inject").clicked() {
-                *hex_input = format_hex(&entry.bytes);
+                *hex_input = spaced_hex(&entry.bytes);
                 ui.close();
             }
             if ui
@@ -359,9 +359,9 @@ fn frame_row(
                 ui.add(Label::new(RichText::new(source.to_string()).weak()).truncate());
             }
         });
-        ui.label(RichText::new(format_hex(&entry.bytes)).text_style(TextStyle::Monospace));
+        ui.label(RichText::new(spaced_hex(&entry.bytes)).text_style(TextStyle::Monospace));
         ui.label(
-            RichText::new(format_ascii(&entry.bytes))
+            RichText::new(printable(&entry.bytes))
                 .text_style(TextStyle::Monospace)
                 .weak(),
         );
@@ -420,27 +420,6 @@ fn format_delta(delta: Option<Duration>) -> String {
     } else {
         format!("+{:6.2}s", delta.as_secs_f64())
     }
-}
-
-fn format_hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn format_ascii(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|&byte| {
-            if byte.is_ascii_graphic() || byte == b' ' {
-                byte as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

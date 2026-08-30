@@ -7,7 +7,7 @@ use egui::{Color32, ComboBox, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
 use crate::engine_handle::EngineHandle;
-use crate::panels::number;
+use crate::panels::{bit_positions, number, spaced_hex};
 use crate::state::AppState;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
@@ -53,7 +53,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     };
 
     if let Some(bytes) = handed_over {
-        let typed = to_hex_spaced(&bytes);
+        let typed = spaced_hex(&bytes);
         state.frame_hex_note = apply_hex(state, &frame, &typed);
         state.frame_hex = typed;
     }
@@ -586,32 +586,6 @@ fn enum_widget(ui: &mut Ui, id: &str, variants: &[EnumVariant], entry: &mut Valu
         });
 }
 
-/// Where each sub-field sits in the word, written as a datasheet writes it.
-///
-/// The file lists them in packing order from the top of the word, which is what
-/// the codec relies on, so the positions fall straight out of the widths. Shown
-/// because nothing else on screen says whether the first row is the top bit or
-/// the bottom one, and that is the first thing anyone checks against a
-/// datasheet.
-///
-/// A width that does not fit what is left gives `None` rather than a wrong
-/// number. The schema refuses such a frame at load, so this is a guard, not a
-/// case anyone should see.
-fn bit_positions(repr: ScalarType, bits: &[BitDef]) -> Vec<Option<String>> {
-    let mut remaining = u32::try_from(repr.size()).unwrap_or(0) * 8;
-    bits.iter()
-        .map(|bit| {
-            remaining = remaining.checked_sub(bit.width)?;
-            let high = remaining + bit.width - 1;
-            Some(if bit.width == 1 {
-                high.to_string()
-            } else {
-                format!("{high}:{remaining}")
-            })
-        })
-        .collect()
-}
-
 fn bits_widget(
     ui: &mut Ui,
     id: &str,
@@ -746,7 +720,7 @@ fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: Optio
     let id = egui::Id::new(("frame_hex", &frame.name));
     // With nothing to mirror, the typed text stays put rather than being wiped.
     if let (false, Some(bytes)) = (ui.memory(|memory| memory.has_focus(id)), bytes) {
-        state.frame_hex = to_hex_spaced(bytes);
+        state.frame_hex = spaced_hex(bytes);
     }
 
     let response = ui.add(
@@ -833,17 +807,6 @@ fn max_unsigned(scalar: ScalarType) -> u64 {
 fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut out, byte| {
-        let _ = write!(out, "{byte:02X}");
-        out
-    })
-}
-
-fn to_hex_spaced(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        if !out.is_empty() {
-            out.push(' ');
-        }
         let _ = write!(out, "{byte:02X}");
         out
     })
