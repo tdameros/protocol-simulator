@@ -24,6 +24,14 @@ pub fn apply(ctx: &Context, theme: Theme) {
     ctx.set_theme(theme);
 
     ctx.all_styles_mut(|style| {
+        // The traffic list draws its rows into a fixed set of bands and scrolls
+        // the frames through them, so the widget at a given rectangle is a
+        // different frame after the list resizes. egui reads that as a widget
+        // whose id is not stable and, in a debug build, outlines every such
+        // rectangle in red and logs a warning. It cannot tell a virtualised
+        // list from a real defect. The check that catches a real duplicate,
+        // `Options::warn_on_id_clash`, is a different one and stays on.
+        style.debug.warn_if_rect_changes_id = false;
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = BUTTON_PADDING;
         style.spacing.window_margin = egui::Margin::same(10);
@@ -85,4 +93,25 @@ fn palette(theme: Theme) -> Visuals {
     }
 
     visuals
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Resizing the traffic list slides its rows through the bands they are
+    /// drawn in, which a debug build of egui outlines in red across the whole
+    /// panel. The warning that catches two widgets sharing an id is not that
+    /// one and has to survive.
+    #[test]
+    fn a_scrolling_list_is_not_reported_as_an_unstable_id() {
+        let ctx = Context::default();
+        apply(&ctx, Theme::Dark);
+
+        assert!(!ctx.global_style().debug.warn_if_rect_changes_id);
+        assert!(
+            ctx.options(|options| options.warn_on_id_clash),
+            "a duplicate id is still worth being told about"
+        );
+    }
 }
