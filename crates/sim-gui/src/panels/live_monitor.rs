@@ -123,6 +123,12 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
     let showing = monitor.selected;
     let mut clicked = None;
     ScrollArea::vertical()
+        // Named, so that the scroll position is the tab's own and does not move
+        // with the number of widgets drawn before it. And held to the full
+        // width, or the scrollbar that appears when the fields pane takes its
+        // room lands wherever the widest row happens to end.
+        .id_salt("traffic_rows")
+        .auto_shrink([false; 2])
         .stick_to_bottom(monitor.follow)
         .show_rows(ui, columns.row, rows.len(), |ui, range| {
             // A selectable label senses clicks so it can be dragged over, which
