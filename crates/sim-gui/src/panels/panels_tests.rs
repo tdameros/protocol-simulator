@@ -442,3 +442,57 @@ fn a_row_no_definition_fits_says_so() {
         .query_by_label_contains("No frame definition is 9 bytes")
         .is_some());
 }
+
+/// A double click used to land on two different frames: the first click opened
+/// the pane, which took its room out of the list, and a list following the
+/// newest frame scrolled the row out from under the pointer before the second
+/// click arrived.
+#[test]
+fn a_double_click_stays_on_the_row_it_started_on() {
+    let (_, mut world) = folder("doubled", &[("status.toml", STATUS)]);
+    let bytes = status_bytes(&world, 2);
+    let id = world.state.open_monitor();
+    // Enough of them that the list scrolls once the pane takes half the tab.
+    for _ in 0..40 {
+        world.state.push_log(crate::state::LogEntry {
+            seq: 0,
+            id: sim_core::ConnectionId("drive".to_owned()),
+            direction: crate::state::Direction::Received,
+            bytes: bytes.clone(),
+            source: None,
+            timestamp: std::time::SystemTime::now(),
+        });
+    }
+    assert!(
+        world.state.monitors[&id].follow,
+        "the list starts following"
+    );
+
+    let mut harness = monitor_panel(world, id);
+    harness.run();
+
+    let pos = harness
+        .query_all_by_label_contains("11 02")
+        .map(|node| node.rect().center())
+        .find(|pos| (200.0..300.0).contains(&pos.y))
+        .expect("a row in the middle of the list");
+    for _ in 0..2 {
+        harness.event(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+        harness.step();
+    }
+    harness.step();
+
+    assert_eq!(
+        harness.state().state.monitors[&id].selected,
+        None,
+        "the second click reached the same row and put the fields away"
+    );
+}

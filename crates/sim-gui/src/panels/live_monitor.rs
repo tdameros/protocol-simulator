@@ -98,18 +98,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
     // Before the list, which is what leaves the list the rest of the room: a
     // bottom panel declared afterwards would be laid out over it.
     if let Some(entry) = selected {
-        let mut open = true;
-        let reading = frame_detail::read(frames, entry, &mut monitor.decode_as);
-        // As much as the fields need, and never more than half the tab: the
-        // list is what the pane is read against.
-        let wanted = reading.wanted_height(ui).min(ui.available_height() * 0.5);
-        egui::Panel::bottom(egui::Id::new(("frame_detail", id)))
-            .resizable(true)
-            .default_size(wanted)
-            .show(ui, |ui| {
-                open = frame_detail::show(ui, &reading, entry, &mut monitor.decode_as, hex_values);
-            });
-        if !open {
+        if !fields_pane(ui, id, monitor, frames, entry, hex_values) {
             monitor.selected = None;
         }
     }
@@ -163,6 +152,13 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
     // gesture both opens and closes them.
     if let Some(seq) = clicked {
         monitor.selected = (showing != Some(seq)).then_some(seq);
+        // Reading a row and following the newest frame are opposite things. The
+        // list would otherwise scroll out from under the row being read, which
+        // it does the moment the pane opens and takes its room, so the second
+        // click of a double click would land on a different frame.
+        if monitor.selected.is_some() {
+            monitor.follow = false;
+        }
     }
 }
 
@@ -365,6 +361,31 @@ fn length_bound(ui: &mut Ui, bound: &mut Option<usize>, hint: &str) {
     {
         *bound = (value > 0).then_some(value);
     }
+}
+
+/// The fields of the row on show, in a pane the list is read against.
+///
+/// Returns false once the pane has been closed.
+fn fields_pane(
+    ui: &mut Ui,
+    id: MonitorId,
+    monitor: &mut MonitorState,
+    frames: &crate::frames::FrameLibrary,
+    entry: &LogEntry,
+    hex_values: bool,
+) -> bool {
+    let reading = frame_detail::read(frames, entry, &mut monitor.decode_as);
+    // As much as the fields need, and never more than half the tab: the list is
+    // what the pane is read against.
+    let wanted = reading.wanted_height(ui).min(ui.available_height() * 0.5);
+    let mut open = true;
+    egui::Panel::bottom(egui::Id::new(("frame_detail", id)))
+        .resizable(true)
+        .default_size(wanted)
+        .show(ui, |ui| {
+            open = frame_detail::show(ui, &reading, entry, &mut monitor.decode_as, hex_values);
+        });
+    open
 }
 
 /// Draws one row, and says whether it was clicked.

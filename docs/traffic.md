@@ -50,6 +50,9 @@ bytes should have carried. A field outside the range its type allows says so.
 
 Whole numbers follow the `0x` switch in the Frames tab.
 
+Reading a row switches Follow off. A list that keeps scrolling to the newest
+frame moves the row being read out from under the pointer.
+
 A row is one read from the transport. A UDP datagram is one frame. TCP and
 serial hand over whatever had arrived, so a row may hold part of a frame or
 more than one, and only a row holding exactly one can be read as fields.
