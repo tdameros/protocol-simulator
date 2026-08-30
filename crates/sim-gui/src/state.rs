@@ -331,6 +331,14 @@ pub struct MonitorState {
     pub paused_at: Option<u64>,
     /// Hides everything logged before this view was last cleared.
     pub since: u64,
+    /// The row whose fields are on show, by sequence number.
+    pub selected: Option<u64>,
+    /// Frame the selected row is being read through.
+    ///
+    /// Kept across selections so that stepping down a list of the same message
+    /// does not cost a trip to the dropdown on every row. It is dropped as soon
+    /// as it stops fitting, which a row of another length does immediately.
+    pub decode_as: Option<String>,
 }
 
 impl MonitorState {
@@ -349,6 +357,8 @@ impl MonitorState {
             follow: true,
             paused_at: None,
             since,
+            selected: None,
+            decode_as: None,
         }
     }
 

@@ -4,7 +4,7 @@ use chrono::{DateTime, Local};
 use egui::{Color32, Label, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::panels::{column, field_label, number, printable, spaced_hex, widest};
+use crate::panels::{column, field_label, frame_detail, number, printable, spaced_hex, widest};
 use crate::state::{
     AppState, Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState,
     TrafficFilter,
@@ -13,6 +13,8 @@ use crate::state::{
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const SENT: Color32 = Color32::from_rgb(70, 130, 200);
 const RECEIVED: Color32 = Color32::from_rgb(40, 160, 90);
+/// Rounding on the band behind the row whose fields are on show.
+const CORNER: egui::CornerRadius = egui::CornerRadius::same(2);
 /// Window the frame and byte rates are measured over.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
@@ -42,8 +44,11 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
         hex_input,
         pending_frame_hex,
         monitor_requested,
+        frames,
+        hex_values,
         ..
     } = state;
+    let hex_values = *hex_values;
     let Some(monitor) = monitors.get_mut(&id) else {
         return;
     };
@@ -83,15 +88,48 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
         return;
     }
 
+    // Resolved against what is on screen: a row the filter now hides, or one
+    // the buffer has dropped, is not a selection any more.
+    let selected = monitor
+        .selected
+        .and_then(|seq| rows.iter().copied().find(|entry| entry.seq == seq));
+    monitor.selected = selected.map(|entry| entry.seq);
+
+    // Before the list, which is what leaves the list the rest of the room: a
+    // bottom panel declared afterwards would be laid out over it.
+    if let Some(entry) = selected {
+        let mut open = true;
+        let reading = frame_detail::read(frames, entry, &mut monitor.decode_as);
+        // As much as the fields need, and never more than half the tab: the
+        // list is what the pane is read against.
+        let wanted = reading.wanted_height(ui).min(ui.available_height() * 0.5);
+        egui::Panel::bottom(egui::Id::new(("frame_detail", id)))
+            .resizable(true)
+            .default_size(wanted)
+            .show(ui, |ui| {
+                open = frame_detail::show(ui, &reading, entry, &mut monitor.decode_as, hex_values);
+            });
+        if !open {
+            monitor.selected = None;
+        }
+    }
+
     // Measured from the whole filtered list, which is already in hand, rather
     // than from the slice on screen.
     let columns = RowColumns::measure(ui, rows.iter().any(|entry| entry.source.is_some()));
 
     // show_rows draws only the visible slice. Painting every entry would make
     // the panel crawl once a periodic frame has filled the buffer.
+    let showing = monitor.selected;
+    let mut clicked = None;
     ScrollArea::vertical()
         .stick_to_bottom(monitor.follow)
         .show_rows(ui, columns.row, rows.len(), |ui, range| {
+            // A selectable label senses clicks so it can be dragged over, which
+            // would leave every row's text swallowing the click meant for the
+            // row. The bytes are copied from the row menu, not by dragging
+            // across a list that scrolls under the pointer.
+            ui.style_mut().interaction.selectable_labels = false;
             for index in range {
                 let entry = rows[index];
                 let delta = index.checked_sub(1).and_then(|previous| {
@@ -100,9 +138,26 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
                         .duration_since(rows[previous].timestamp)
                         .ok()
                 });
-                frame_row(ui, entry, delta, columns, hex_input, pending_frame_hex);
+                let on_show = showing == Some(entry.seq);
+                if frame_row(
+                    ui,
+                    entry,
+                    delta,
+                    columns,
+                    on_show,
+                    hex_input,
+                    pending_frame_hex,
+                ) {
+                    clicked = Some(entry.seq);
+                }
             }
         });
+
+    // Clicking the row already on show puts the fields away, so the same
+    // gesture both opens and closes them.
+    if let Some(seq) = clicked {
+        monitor.selected = (showing != Some(seq)).then_some(seq);
+    }
 }
 
 /// What each column of a traffic row is allowed to take.
@@ -306,14 +361,38 @@ fn length_bound(ui: &mut Ui, bound: &mut Option<usize>, hint: &str) {
     }
 }
 
+/// Draws one row, and says whether it was clicked.
 fn frame_row(
     ui: &mut Ui,
     entry: &LogEntry,
     delta: Option<Duration>,
     columns: RowColumns,
+    on_show: bool,
     hex_input: &mut String,
     pending_frame_hex: &mut Option<Vec<u8>>,
-) {
+) -> bool {
+    // Claimed before the row draws anything, which is what leaves the menu
+    // button on top of it: egui gives a click to the last widget registered
+    // over the pointer, so a background taken afterwards would swallow it.
+    //
+    // Keyed by sequence number rather than by position, since the list scrolls
+    // under a fixed set of row slots.
+    let rect = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), columns.row),
+    );
+    let background = ui.interact(rect, ui.id().with(entry.seq), egui::Sense::click());
+    if on_show {
+        ui.painter().rect_filled(
+            rect,
+            CORNER,
+            ui.visuals().selection.bg_fill.gamma_multiply(0.4),
+        );
+    } else if background.hovered() {
+        ui.painter()
+            .rect_filled(rect, CORNER, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+
     let drawn = ui.horizontal(|ui| {
         ui.menu_button(icons::DOTS_THREE, |ui| {
             if ui.button("Copy hex").clicked() {
@@ -378,6 +457,8 @@ fn frame_row(
         drawn.response.rect.height().round() <= columns.row.round(),
         "a traffic row outgrew the height declared to show_rows"
     );
+
+    background.clicked()
 }
 
 /// How much is on screen, and how fast it is arriving.
