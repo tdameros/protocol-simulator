@@ -39,7 +39,10 @@ Bytes pasted into the preview box are decoded into the fields of the frame
 currently picked. A checksum that does not match is reported rather than
 recomputed.
 
-The traffic monitor sends bytes here with **Open in Frames** on a row.
+The traffic monitor sends bytes here with **Open in Frames** on a row, which
+loads them as values ready to be edited and sent back. To read a captured frame
+without loading it, click the row and see [its fields](traffic.md#fields)
+there.
 
 ## Values
 

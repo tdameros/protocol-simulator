@@ -28,14 +28,41 @@ paused state. A monitor hides everything logged before it was opened.
 `??` in a filter pattern matches any byte, so `AA 55 ?? 01` leaves the third
 byte free.
 
+## Fields
+
+Click a row to read its bytes as fields. Click it again to put them away.
+
+The pane offers every definition of exactly the row's length and nothing else.
+A single candidate is taken without asking. Several wait to be told which, and
+the answer holds for the next row of the same length.
+
+| Column | Holds |
+| --- | --- |
+| Name | the field, as the definition names it |
+| Span | the bytes it covers, `from..to` |
+| Bytes | those bytes |
+| Value | what they decode to |
+
+An enum shows the name of its variant, or `unknown` for a value no variant
+claims. A bitfield adds a row per sub-field carrying its position in the word,
+written as a datasheet writes it. A checksum reads `ok`, or the value the
+bytes should have carried. A field outside the range its type allows says so.
+
+Whole numbers follow the `0x` switch in the Frames tab.
+
+Reading a row switches Follow off. A list that keeps scrolling to the newest
+frame moves the row being read out from under the pointer.
+
+A row is one read from the transport. A UDP datagram is one frame. TCP and
+serial hand over whatever had arrived, so a row may hold part of a frame or
+more than one, and only a row holding exactly one can be read as fields.
+
 ## Row actions
 
 | Action | Does |
 | --- | --- |
-| Open in Frames | decodes the bytes into the fields of the frame picked there |
+| Open in Frames | loads the bytes into the frame picked there, ready to send back |
 | Send to Hex Inject | copies the bytes into the injection box |
-
-A checksum that does not match on decode is reported, not recomputed.
 
 ## Hex injection
 

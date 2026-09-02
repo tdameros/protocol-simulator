@@ -314,9 +314,13 @@ impl MonitorSpec {
                 .unwrap_or_default(),
             show_filter: self.show_filter,
             follow: self.follow,
-            // Runtime position in a stream that starts empty, not a setting.
+            // Runtime positions in a stream that starts empty, not settings.
+            // A selection names a frame the buffer no longer holds, and the
+            // frame it was being read through means nothing without it.
             paused_at: None,
             since: 0,
+            selected: None,
+            decode_as: None,
         }
     }
 }

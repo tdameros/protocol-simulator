@@ -1,4 +1,5 @@
 pub mod connections;
+pub mod frame_detail;
 pub mod frame_edit;
 mod frame_editor;
 pub mod hex_inject;
@@ -17,6 +18,7 @@ mod shots;
 use egui::{Color32, Layout, Response, TextStyle, Ui, WidgetText};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::TabViewer;
+use sim_core::frame::{BitDef, ScalarType};
 
 use crate::engine_handle::EngineHandle;
 use crate::state::{AppState, MonitorId};
@@ -208,6 +210,55 @@ impl TabViewer for AppTabViewer<'_> {
         }
         OnCloseResponse::Close
     }
+}
+
+/// Bytes as the panels write them: two upper-case digits, one space between.
+pub fn spaced_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The same bytes as text, with anything unprintable shown as a dot.
+pub fn printable(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&byte| {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
+/// Where each sub-field sits in the word, written as a datasheet writes it.
+///
+/// The file lists them in packing order from the top of the word, which is what
+/// the codec relies on, so the positions fall straight out of the widths. Shown
+/// because nothing else on screen says whether the first row is the top bit or
+/// the bottom one, and that is the first thing anyone checks against a
+/// datasheet.
+///
+/// A width that does not fit what is left gives `None` rather than a wrong
+/// number. The schema refuses such a frame at load, so this is a guard, not a
+/// case anyone should see.
+pub fn bit_positions(repr: ScalarType, bits: &[BitDef]) -> Vec<Option<String>> {
+    let mut remaining = u32::try_from(repr.size()).unwrap_or(0) * 8;
+    bits.iter()
+        .map(|bit| {
+            remaining = remaining.checked_sub(bit.width)?;
+            let high = remaining + bit.width - 1;
+            Some(if bit.width == 1 {
+                high.to_string()
+            } else {
+                format!("{high}:{remaining}")
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

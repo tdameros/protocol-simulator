@@ -38,7 +38,7 @@ file as a project.
 | [Sending frames](docs/frames.md) | the Frames panel, encoding and decoding |
 | [Building frames](docs/frame-editor.md) | the editor, shared types, what it refuses |
 | [Scenarios](docs/scenarios.md) | steps, matching, repeats |
-| [Watching traffic](docs/traffic.md) | the monitor, filters, hex injection |
+| [Watching traffic](docs/traffic.md) | the monitor, filters, decoding a captured frame |
 | [Projects](docs/projects.md) | the project file and what it holds |
 | [Frame file format](examples/frames/README.md) | reference, one example per feature |
 

@@ -6,7 +6,7 @@ VERSION = $(shell cargo metadata --format-version 1 --no-deps | \
 	jq -r '.packages[] | select(.name == "$(GUI_PKG)") | .version')
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-release run run-release check test test-core \
+.PHONY: help build build-release run run-release check check-release test test-core \
         clippy clippy-fix fmt fmt-check doc clean ci toolchain watch bundle-macos
 
 help: ## Show this help
@@ -26,6 +26,13 @@ run-release: ## Run the GUI (release profile)
 
 check: ## Type-check without producing binaries
 	cargo check --workspace --all-targets
+
+# The release profile is a different compilation: egui puts its debug painting
+# behind `debug_assertions`, so code that reads it builds here and not there.
+# The release workflow is the only thing that used to find out, one tag too
+# late.
+check-release: ## Type-check the release profile, which compiles different code
+	cargo check --workspace --all-targets --release
 
 test: ## Run every test in the workspace
 	cargo test --workspace
@@ -63,7 +70,7 @@ third-party-check: ## Fail if THIRD-PARTY.md is behind the dependency tree
 	@diff -q THIRD-PARTY.md /tmp/third-party-check.md >/dev/null \
 		|| { echo "THIRD-PARTY.md is out of date, run: make third-party"; exit 1; }
 
-ci: fmt-check clippy test ## Run all quality gates (format, lint, tests)
+ci: fmt-check clippy check-release test ## Run all quality gates (format, lint, tests)
 
 bundle-macos: ## Build the universal macOS .app locally (needs ~3 GB of disk)
 	rustup target add aarch64-apple-darwin x86_64-apple-darwin

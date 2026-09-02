@@ -40,6 +40,7 @@ impl UdpTransport {
     /// the group on `interface` fails.
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "async is what forces callers into a runtime, which from_std requires"
     )]
     pub async fn join_multicast(

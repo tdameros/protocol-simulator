@@ -13,6 +13,8 @@ use egui_kittest::Harness;
 
 use std::time::SystemTime;
 
+use sim_core::frame::codec;
+use sim_core::frame::value::{FieldValues, Value};
 use sim_core::{ConnectionId, ConnectionStatus, TransportConfig};
 
 use crate::engine_handle::EngineHandle;
@@ -193,29 +195,61 @@ fn scenarios_panel() {
     });
 }
 
-/// Traffic as it arrives, which is the panel a bench is watched through.
+/// The bytes of a real example frame, checksum and all.
+fn encoded(world: &World, frame: &str, values: &[(&str, Value)]) -> Vec<u8> {
+    let held = world
+        .state
+        .frames
+        .frames()
+        .find(|held| held.name == frame)
+        .expect("the example folder holds it");
+    let mut supplied = FieldValues::new();
+    for (name, value) in values {
+        supplied.insert((*name).to_owned(), value.clone());
+    }
+    codec::encode(held, &supplied).expect("the example frame should encode")
+}
+
+/// Traffic as it arrives, which is the panel a bench is watched through, with
+/// the fields of one row on show underneath it.
 #[test]
 fn traffic_monitor() {
-    let mut world = World {
-        state: AppState::default(),
-        engine: EngineHandle::default(),
-    };
+    let mut world = world_on(&examples());
+    // Every flag clear: a bit the map does not name packs as zero.
+    let quiet = Value::Bits(std::collections::BTreeMap::new());
+    let tripped = Value::Bits([("bus_timeout".to_owned(), 1)].into_iter().collect());
+    let mut exchange = Vec::new();
+    for (index, (state, faults)) in [
+        (2, &quiet),
+        (2, &quiet),
+        (2, &quiet),
+        (2, &quiet),
+        (2, &quiet),
+        (2, &quiet),
+        (2, &tripped),
+        (4, &tripped),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seq = 0x2C + u64::try_from(index).unwrap_or(0);
+        exchange.push((
+            Direction::Sent,
+            encoded(&world, "Heartbeat", &[("seq", Value::Uint(seq))]),
+        ));
+        exchange.push((
+            Direction::Received,
+            encoded(
+                &world,
+                "Status",
+                &[("state", Value::Uint(state)), ("faults", faults.clone())],
+            ),
+        ));
+    }
     let id = ConnectionId("uart".to_owned());
-    let sent = [
-        (Direction::Sent, vec![0xAA, 0x55, 0x01, 0x00, 0x2E, 0x1C]),
-        (
-            Direction::Received,
-            vec![0xAA, 0x55, 0x81, 0x03, 0x7B, 0x44],
-        ),
-        (Direction::Sent, vec![0xAA, 0x55, 0x02, 0x64, 0x11, 0x9F]),
-        (
-            Direction::Received,
-            vec![0xAA, 0x55, 0x82, 0x00, 0xC3, 0x08],
-        ),
-    ];
     // Opened first: a monitor hides everything logged before it existed.
     let monitor = world.state.open_monitor();
-    for (direction, bytes) in sent {
+    for (direction, bytes) in exchange {
         world.state.push_log(LogEntry {
             seq: 0,
             id: id.clone(),
@@ -225,7 +259,22 @@ fn traffic_monitor() {
             timestamp: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000),
         });
     }
-    shoot("traffic", (760.0, 230.0), world, move |ui, world| {
+    // The last reply, the one carrying the fault, since a picture of the pane
+    // is only worth the frame it is reading.
+    world
+        .state
+        .monitors
+        .get_mut(&monitor)
+        .expect("the monitor was just opened")
+        .selected = Some(15);
+    shoot("traffic", (760.0, 1100.0), world, move |ui, world| {
+        // The pane keeps the size it was first given, and the first pass runs
+        // before the fonts are loaded, so what it asked for then was measured
+        // against the wrong row height. Forgetting it lets the second pass,
+        // the one that is drawn, size the pane the way a running app does.
+        ui.ctx().data_mut(|data| {
+            data.remove::<egui::PanelState>(egui::Id::new(("frame_detail", monitor)));
+        });
         super::live_monitor::show(ui, &mut world.state, monitor);
     });
 }

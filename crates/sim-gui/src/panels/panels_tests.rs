@@ -265,3 +265,234 @@ fn a_first_scenario_can_be_made_in_an_empty_folder() {
         "and the editor it opens is on screen"
     );
 }
+
+/// Three bytes, one named value and a checksum over the rest.
+const STATUS: &str = r#"
+name = "Status"
+endian = "big"
+
+[[field]]
+name = "id"
+type = "u8"
+default = 0x11
+
+[[field]]
+name = "state"
+type = "enum"
+repr = "u8"
+variants = { IDLE = 0, RUNNING = 2 }
+
+[[field]]
+name = "crc"
+type = "crc8"
+covers = { from = "id", to = "state" }
+"#;
+
+/// Three bytes as well, so that a row of that length has a choice to make.
+const LIMITS: &str = r#"
+name = "Limits"
+
+[[field]]
+name = "low"
+type = "u8"
+
+[[field]]
+name = "high"
+type = "u16"
+"#;
+
+fn monitor_panel(world: World, id: crate::state::MonitorId) -> Harness<'static, World> {
+    Harness::new_ui_state(
+        move |ui, world| super::live_monitor::show(ui, &mut world.state, id),
+        world,
+    )
+}
+
+/// A received frame in the buffer, and the tab watching it.
+fn received(world: &mut World, bytes: Vec<u8>) -> crate::state::MonitorId {
+    let id = world.state.open_monitor();
+    world.state.push_log(crate::state::LogEntry {
+        seq: 0,
+        id: sim_core::ConnectionId("drive".to_owned()),
+        direction: crate::state::Direction::Received,
+        bytes,
+        source: None,
+        timestamp: std::time::SystemTime::now(),
+    });
+    id
+}
+
+/// What the drive would really have sent, checksum and all.
+fn status_bytes(world: &World, state: u64) -> Vec<u8> {
+    let frame = world
+        .state
+        .frames
+        .frames()
+        .find(|frame| frame.name == "Status")
+        .expect("the folder holds it");
+    let mut values = sim_core::frame::value::FieldValues::new();
+    values.insert(
+        "state".to_owned(),
+        sim_core::frame::value::Value::Uint(state),
+    );
+    sim_core::frame::codec::encode(frame, &values).unwrap()
+}
+
+#[test]
+fn a_row_shows_its_fields_when_it_is_clicked() {
+    let (_, mut world) = folder("decode", &[("status.toml", STATUS)]);
+    let bytes = status_bytes(&world, 2);
+    let id = received(&mut world, bytes);
+    let mut harness = monitor_panel(world, id);
+    harness.run();
+
+    assert!(
+        harness.query_by_label_contains("RUNNING").is_none(),
+        "nothing is decoded until a row is asked about"
+    );
+
+    harness.get_by_label_contains("11 02").click();
+    harness.run();
+
+    assert_eq!(
+        harness.state().state.monitors[&id].selected,
+        Some(0),
+        "the click reached the row rather than a widget sitting over it"
+    );
+    assert!(
+        harness.query_by_label_contains("RUNNING").is_some(),
+        "the named value is on screen, not the number behind it"
+    );
+    assert!(
+        harness.query_by_label_contains("state").is_some(),
+        "under the name the definition gives it"
+    );
+}
+
+/// The reason for reading a capture field by field in the first place: the
+/// frame arrived, and something in it is wrong.
+#[test]
+fn a_checksum_that_does_not_match_is_named_on_its_field() {
+    let (_, mut world) = folder("corrupt", &[("status.toml", STATUS)]);
+    let mut bytes = status_bytes(&world, 2);
+    *bytes.last_mut().unwrap() ^= 0xFF;
+    let id = received(&mut world, bytes);
+    let mut harness = monitor_panel(world, id);
+    harness.run();
+    harness.get_by_label_contains("11 02").click();
+    harness.run();
+
+    assert!(
+        harness.query_by_label_contains("expected").is_some(),
+        "the checksum the bytes should have carried is on the row that carries it"
+    );
+}
+
+/// The same gesture puts them away, so nothing has to be aimed at to close the
+/// pane.
+#[test]
+fn clicking_the_row_again_puts_the_fields_away() {
+    let (_, mut world) = folder("untoggle", &[("status.toml", STATUS)]);
+    let bytes = status_bytes(&world, 2);
+    let id = received(&mut world, bytes);
+    let mut harness = monitor_panel(world, id);
+    harness.run();
+
+    harness.get_by_label_contains("11 02").click();
+    harness.run();
+    harness.get_by_label_contains("11 02").click();
+    harness.run();
+
+    assert_eq!(harness.state().state.monitors[&id].selected, None);
+    assert!(harness.query_by_label_contains("RUNNING").is_none());
+}
+
+/// A row is read through a definition of exactly its length. Two of them fit,
+/// so the choice is the operator's and nothing is decoded meanwhile.
+#[test]
+fn a_row_that_two_definitions_fit_waits_to_be_told_which() {
+    let (_, mut world) = folder(
+        "ambiguous",
+        &[("status.toml", STATUS), ("limits.toml", LIMITS)],
+    );
+    let bytes = status_bytes(&world, 2);
+    let id = received(&mut world, bytes);
+    let mut harness = monitor_panel(world, id);
+    harness.run();
+    harness.get_by_label_contains("11 02").click();
+    harness.run();
+
+    assert_eq!(harness.state().state.monitors[&id].decode_as, None);
+    assert!(harness.query_by_label_contains("Pick the frame").is_some());
+    assert!(harness.query_by_label_contains("RUNNING").is_none());
+}
+
+/// A length nothing in the folder has says so, rather than showing the fields
+/// of whichever frame happened to be selected elsewhere.
+#[test]
+fn a_row_no_definition_fits_says_so() {
+    let (_, mut world) = folder("unfitting", &[("status.toml", STATUS)]);
+    let id = received(&mut world, vec![0xAA; 9]);
+    let mut harness = monitor_panel(world, id);
+    harness.run();
+    harness.get_by_label_contains("AA AA").click();
+    harness.run();
+
+    assert!(harness
+        .query_by_label_contains("No frame definition is 9 bytes")
+        .is_some());
+}
+
+/// A double click used to land on two different frames: the first click opened
+/// the pane, which took its room out of the list, and a list following the
+/// newest frame scrolled the row out from under the pointer before the second
+/// click arrived.
+#[test]
+fn a_double_click_stays_on_the_row_it_started_on() {
+    let (_, mut world) = folder("doubled", &[("status.toml", STATUS)]);
+    let bytes = status_bytes(&world, 2);
+    let id = world.state.open_monitor();
+    // Enough of them that the list scrolls once the pane takes half the tab.
+    for _ in 0..40 {
+        world.state.push_log(crate::state::LogEntry {
+            seq: 0,
+            id: sim_core::ConnectionId("drive".to_owned()),
+            direction: crate::state::Direction::Received,
+            bytes: bytes.clone(),
+            source: None,
+            timestamp: std::time::SystemTime::now(),
+        });
+    }
+    assert!(
+        world.state.monitors[&id].follow,
+        "the list starts following"
+    );
+
+    let mut harness = monitor_panel(world, id);
+    harness.run();
+
+    let pos = harness
+        .query_all_by_label_contains("11 02")
+        .map(|node| node.rect().center())
+        .find(|pos| (200.0..300.0).contains(&pos.y))
+        .expect("a row in the middle of the list");
+    for _ in 0..2 {
+        harness.event(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+        harness.step();
+    }
+    harness.step();
+
+    assert_eq!(
+        harness.state().state.monitors[&id].selected,
+        None,
+        "the second click reached the same row and put the fields away"
+    );
+}
