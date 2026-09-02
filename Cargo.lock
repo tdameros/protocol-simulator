@@ -3198,9 +3198,21 @@ dependencies = [
  "rfd",
  "serde",
  "sim-core",
+ "sim-session",
  "tokio",
  "tokio-serial",
  "toml",
+]
+
+[[package]]
+name = "sim-session"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "sim-core",
+ "tokio",
+ "tokio-serial",
 ]
 
 [[package]]

@@ -12,9 +12,9 @@ use sim_core::frame::codec::{self, Decoded};
 use sim_core::frame::value::Value;
 use sim_core::frame::{BitDef, FieldDef, FieldKind, FrameDef, ScalarType};
 
-use crate::frames::FrameLibrary;
 use crate::panels::{bit_positions, printable, spaced_hex};
-use crate::state::LogEntry;
+use sim_session::frames::FrameLibrary;
+use sim_session::state::LogEntry;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const WARNING: Color32 = Color32::from_rgb(200, 120, 40);

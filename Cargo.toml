@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim-core", "crates/sim-gui"]
+members = ["crates/sim-core", "crates/sim-session", "crates/sim-gui"]
 
 [workspace.package]
-# The one place a version is written. Both crates inherit it, the release
+# The one place a version is written. Every crate inherits it, the release
 # workflow reads it back with `cargo metadata`, and the tag it publishes is
 # derived from it, so nothing can drift out of step with anything else.
 version = "0.4.1"

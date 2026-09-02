@@ -5,7 +5,7 @@ use egui::{Color32, Label, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
 use crate::panels::{column, field_label, frame_detail, number, printable, spaced_hex, widest};
-use crate::state::{
+use sim_session::state::{
     AppState, Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState,
     TrafficFilter,
 };
@@ -370,7 +370,7 @@ fn fields_pane(
     ui: &mut Ui,
     id: MonitorId,
     monitor: &mut MonitorState,
-    frames: &crate::frames::FrameLibrary,
+    frames: &sim_session::frames::FrameLibrary,
     entry: &LogEntry,
     hex_values: bool,
 ) -> bool {

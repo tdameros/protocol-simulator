@@ -18,9 +18,9 @@ use egui_phosphor::regular as icons;
 use sim_core::frame::schema::{Subtype, TypeDef};
 use sim_core::frame::{FrameDef, ScalarType, ValueRange};
 
-use crate::frames::Effect;
 use crate::panels::number;
-use crate::state::AppState;
+use sim_session::frames::Effect;
+use sim_session::state::AppState;
 
 const ERROR: egui::Color32 = egui::Color32::from_rgb(200, 60, 60);
 const WARNING: egui::Color32 = egui::Color32::from_rgb(200, 120, 40);

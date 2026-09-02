@@ -5,9 +5,9 @@ use sim_core::{ConnectionStatus, RetryPolicy};
 use egui::{Color32, ComboBox, Grid, RichText, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
 use crate::panels::{field_label, widest};
-use crate::state::{ConnectionEntry, NewConnectionForm, TransportKindChoice};
+use sim_session::engine_handle::EngineHandle;
+use sim_session::state::{ConnectionEntry, NewConnectionForm, TransportKindChoice};
 
 /// Every label the form can show, whichever transport is picked.
 ///
@@ -31,7 +31,7 @@ const FORM_LABELS: &[&str] = &[
     "Flow control:",
 ];
 
-pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHandle) {
+pub fn show(ui: &mut Ui, state: &mut sim_session::state::AppState, engine: &EngineHandle) {
     ui.heading("New connection");
     new_connection_form(ui, &mut state.new_connection);
 

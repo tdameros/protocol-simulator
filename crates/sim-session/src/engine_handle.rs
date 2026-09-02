@@ -20,6 +20,7 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    #[must_use]
     pub fn new() -> Self {
         let (command_tx, event_rx) = Engine::spawn();
         Self {

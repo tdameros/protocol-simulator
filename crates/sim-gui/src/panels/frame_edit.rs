@@ -14,10 +14,11 @@ use sim_core::frame::{
     BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType, Stated,
     ValueRange,
 };
+use sim_session::frames::Shared;
 
-use crate::layout;
 use crate::panels::number;
-use crate::state::AppState;
+use sim_session::layout;
+use sim_session::state::AppState;
 
 /// Room for a field name, in the width of the box that edits one.
 const NAME_WIDTH: f32 = 120.0;
@@ -45,15 +46,6 @@ pub enum TypeWanted {
     Edit(String),
     /// Made for the declared field that asked, and given to it once saved.
     New(usize),
-}
-
-/// A type the folder shares, as the picker offers it.
-#[derive(Clone)]
-pub struct Shared {
-    pub name: String,
-    /// A group puts several fields on the wire; a subtype stays one scalar.
-    pub group: bool,
-    pub size: usize,
 }
 
 /// What one pass over the editor decided to do, applied once the drawing is

@@ -6,7 +6,7 @@
 //! because it was ticked, so most of what the loader knows how to refuse cannot
 //! be built in the first place.
 //!
-//! The drawing lives here and the meaning lives in [`crate::scenarios`], which
+//! The drawing lives here and the meaning lives in [`sim_session::scenarios`], which
 //! is what makes the meaning testable without a window.
 
 use std::time::Duration;
@@ -21,8 +21,8 @@ use sim_core::{Anchor, ConnectionId, HexPattern};
 use crate::panels::frame_editor::value_widget;
 use crate::panels::hex_inject::parse_hex;
 use crate::panels::{column, field_label, widest};
-use crate::scenarios::{self, ActionKind};
-use crate::state::AppState;
+use sim_session::scenarios::{self, ActionKind};
+use sim_session::state::AppState;
 
 /// A change to the list of steps, which cannot happen while it is being drawn.
 enum Edit {

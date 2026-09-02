@@ -12,8 +12,8 @@
 use egui_kittest::kittest::{By, NodeT, Queryable};
 use egui_kittest::Harness;
 
-use crate::engine_handle::EngineHandle;
-use crate::state::AppState;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::state::AppState;
 
 /// What a panel needs around it, held together so the harness can own it.
 struct World {
@@ -301,7 +301,7 @@ name = "high"
 type = "u16"
 "#;
 
-fn monitor_panel(world: World, id: crate::state::MonitorId) -> Harness<'static, World> {
+fn monitor_panel(world: World, id: sim_session::state::MonitorId) -> Harness<'static, World> {
     Harness::new_ui_state(
         move |ui, world| super::live_monitor::show(ui, &mut world.state, id),
         world,
@@ -309,12 +309,12 @@ fn monitor_panel(world: World, id: crate::state::MonitorId) -> Harness<'static, 
 }
 
 /// A received frame in the buffer, and the tab watching it.
-fn received(world: &mut World, bytes: Vec<u8>) -> crate::state::MonitorId {
+fn received(world: &mut World, bytes: Vec<u8>) -> sim_session::state::MonitorId {
     let id = world.state.open_monitor();
-    world.state.push_log(crate::state::LogEntry {
+    world.state.push_log(sim_session::state::LogEntry {
         seq: 0,
         id: sim_core::ConnectionId("drive".to_owned()),
-        direction: crate::state::Direction::Received,
+        direction: sim_session::state::Direction::Received,
         bytes,
         source: None,
         timestamp: std::time::SystemTime::now(),
@@ -454,10 +454,10 @@ fn a_double_click_stays_on_the_row_it_started_on() {
     let id = world.state.open_monitor();
     // Enough of them that the list scrolls once the pane takes half the tab.
     for _ in 0..40 {
-        world.state.push_log(crate::state::LogEntry {
+        world.state.push_log(sim_session::state::LogEntry {
             seq: 0,
             id: sim_core::ConnectionId("drive".to_owned()),
-            direction: crate::state::Direction::Received,
+            direction: sim_session::state::Direction::Received,
             bytes: bytes.clone(),
             source: None,
             timestamp: std::time::SystemTime::now(),

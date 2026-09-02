@@ -21,6 +21,15 @@ pub struct Entry {
     pub frame: FrameDef,
 }
 
+/// A type the folder shares, as a picker offers it.
+#[derive(Clone)]
+pub struct Shared {
+    pub name: String,
+    /// A group puts several fields on the wire; a subtype stays one scalar.
+    pub group: bool,
+    pub size: usize,
+}
+
 /// Frame definitions loaded from a directory, plus the values being edited.
 ///
 /// The TOML files stay the source of truth. The editor writes back into them
@@ -355,11 +364,11 @@ impl FrameLibrary {
     /// `without` leaves one out, for the type editor: a type naming itself is
     /// the one thing the loader refuses outright.
     #[must_use]
-    pub fn shared_choices(&self, without: Option<&str>) -> Vec<crate::panels::frame_edit::Shared> {
+    pub fn shared_choices(&self, without: Option<&str>) -> Vec<Shared> {
         self.type_entries
             .iter()
             .filter(|entry| Some(entry.definition.name()) != without)
-            .map(|entry| crate::panels::frame_edit::Shared {
+            .map(|entry| Shared {
                 name: entry.definition.name().to_owned(),
                 group: entry.definition.narrows.is_none(),
                 size: entry.definition.layout.size(),

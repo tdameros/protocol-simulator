@@ -1,0 +1,12 @@
+[package]
+name = "sim-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+sim-core = { path = "../sim-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["sync"] }
+tokio-serial = "5.5.0"

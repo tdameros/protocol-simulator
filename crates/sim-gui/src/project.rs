@@ -22,7 +22,7 @@ use sim_core::frame::value::FieldValues;
 use sim_core::{ConnectionId, ConnectionStatus, RetryPolicy, TransportConfig};
 
 use crate::panels::Tab;
-use crate::state::{
+use sim_session::state::{
     AppState, ConnectionEntry, DirectionFilter, HexAnchor, MonitorId, MonitorState, TrafficFilter,
 };
 

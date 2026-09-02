@@ -6,9 +6,9 @@ use sim_core::scenario::{Action, Expect, Scenario, Step};
 use egui::{Color32, Grid, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
 use crate::panels::{scenario_edit, widest};
-use crate::state::AppState;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::state::AppState;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const RUNNING: Color32 = Color32::from_rgb(40, 160, 90);
@@ -44,7 +44,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
             .scenarios
             .draft
             .as_ref()
-            .and_then(crate::scenarios::Draft::problem);
+            .and_then(sim_session::scenarios::Draft::problem);
         scenario_edit::header(ui, state);
         ui.separator();
         ScrollArea::vertical()
@@ -92,7 +92,7 @@ fn save(state: &mut AppState) {
         .map(|draft| draft.scenario.name.clone())
         .unwrap_or_default();
 
-    let into = crate::scenarios::suggested_file(&directory, &name);
+    let into = sim_session::scenarios::suggested_file(&directory, &name);
     if let Err(error) = state.scenarios.save_draft(&into) {
         state.last_error = Some(format!("{error:#}"));
     }
@@ -446,7 +446,7 @@ mod tests {
         let mut state = AppState::default();
         state.connections = vec![(
             sim_core::ConnectionId::from("bus"),
-            crate::state::ConnectionEntry {
+            sim_session::state::ConnectionEntry {
                 config: sim_core::TransportConfig::Udp {
                     bind: "127.0.0.1:9000".parse().expect("address"),
                     remote: "127.0.0.1:9001".parse().expect("address"),

@@ -20,8 +20,8 @@ use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::TabViewer;
 use sim_core::frame::{BitDef, ScalarType};
 
-use crate::engine_handle::EngineHandle;
-use crate::state::{AppState, MonitorId};
+use sim_session::engine_handle::EngineHandle;
+use sim_session::state::{AppState, MonitorId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tab {

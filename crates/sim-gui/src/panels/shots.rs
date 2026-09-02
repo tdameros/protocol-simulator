@@ -17,9 +17,9 @@ use sim_core::frame::codec;
 use sim_core::frame::value::{FieldValues, Value};
 use sim_core::{ConnectionId, ConnectionStatus, TransportConfig};
 
-use crate::engine_handle::EngineHandle;
-use crate::state::{AppState, ConnectionEntry, Direction, LogEntry};
 use crate::theme;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::state::{AppState, ConnectionEntry, Direction, LogEntry};
 
 /// Where the documentation looks for them, from the workspace root rather than
 /// from wherever the test happens to be run.

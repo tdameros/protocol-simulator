@@ -7,12 +7,12 @@ use egui::{Color32, Context, CornerRadius, Modal, Theme, ViewportCommand};
 use egui_dock::{DockArea, DockState, Style};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
 use crate::panels::{AppTabViewer, Tab};
 use crate::prefs::Preferences;
 use crate::project::{self, Project, DEFAULT_FILE_NAME};
-use crate::state::{AppState, Direction, LogEntry};
 use crate::theme;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::state::{AppState, Direction, LogEntry};
 
 const APP_NAME: &str = "Protocol Simulator";
 
@@ -270,7 +270,7 @@ impl SimApp {
                 Event::ScenarioStep { name, step, pass } => {
                     self.state
                         .running
-                        .insert(name, crate::state::ScenarioRun { step, pass });
+                        .insert(name, sim_session::state::ScenarioRun { step, pass });
                 }
                 Event::ScenarioFinished { name, outcome } => {
                     self.state.running.remove(&name);

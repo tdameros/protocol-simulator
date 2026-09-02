@@ -135,6 +135,7 @@ impl AppState {
         self.monitors = monitors;
     }
 
+    #[must_use]
     pub fn status_of(&self, id: &ConnectionId) -> Option<ConnectionStatus> {
         self.connections
             .iter()
@@ -386,6 +387,7 @@ pub enum TransportKindChoice {
 impl TransportKindChoice {
     pub const ALL: [Self; 4] = [Self::Udp, Self::TcpClient, Self::TcpServer, Self::Serial];
 
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Udp => "UDP",
@@ -443,6 +445,7 @@ impl NewConnectionForm {
     ///
     /// Drives the form layout: a multicast destination hides the bind field (the
     /// port is dictated by the group) and reveals the interface picker.
+    #[must_use]
     pub fn udp_multicast_group(&self) -> Option<SocketAddrV4> {
         match self.udp_remote.trim().parse::<SocketAddr>() {
             Ok(SocketAddr::V4(addr)) if addr.ip().is_multicast() => Some(addr),

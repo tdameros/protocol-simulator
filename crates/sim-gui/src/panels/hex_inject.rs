@@ -3,8 +3,8 @@ use sim_core::{ConnectionId, ConnectionStatus};
 use egui::{Color32, ComboBox, RichText, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
-use crate::state::AppState;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::state::AppState;
 
 pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     ui.heading("Raw hex injection");

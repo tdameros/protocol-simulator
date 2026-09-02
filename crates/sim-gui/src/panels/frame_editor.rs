@@ -6,9 +6,9 @@ use sim_core::ConnectionStatus;
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
 use crate::panels::{bit_positions, number, spaced_hex};
-use crate::state::AppState;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::state::AppState;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const WARNING: Color32 = Color32::from_rgb(200, 120, 40);
@@ -179,7 +179,7 @@ fn draft_editor(ui: &mut Ui, state: &mut AppState) {
     super::frame_edit::byte_order(ui, &mut endian, None);
     // Through the layout rather than by assignment: the fields that were
     // following the frame have to keep following it.
-    crate::layout::set_endian(&mut draft.frame, endian);
+    sim_session::layout::set_endian(&mut draft.frame, endian);
     let mut description = draft.frame.description.clone().unwrap_or_default();
     ui.horizontal(|ui| {
         ui.label("Description:");
@@ -229,7 +229,7 @@ fn save_draft(state: &mut AppState) {
         .map(|draft| draft.frame.name.clone())
         .unwrap_or_default();
 
-    let into = crate::frames::suggested_file(&directory, &name);
+    let into = sim_session::frames::suggested_file(&directory, &name);
     if let Err(error) = state.frames.save_draft(&into) {
         state.last_error = Some(format!("{error:#}"));
     }

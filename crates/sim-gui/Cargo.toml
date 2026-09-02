@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 sim-core = { path = "../sim-core" }
+sim-session = { path = "../sim-session" }
 eframe = { version = "0.35", features = ["persistence"] }
 egui = "0.35"
 egui-phosphor = "0.13.0"

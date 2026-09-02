@@ -6,14 +6,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod engine_handle;
-mod frames;
-mod layout;
 mod panels;
 mod prefs;
 mod project;
-mod scenarios;
-mod state;
 mod theme;
 
 use std::path::PathBuf;
