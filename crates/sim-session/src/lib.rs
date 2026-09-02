@@ -20,6 +20,7 @@ pub mod kinds;
 pub mod layout;
 pub mod scenarios;
 pub mod state;
+pub mod traffic;
 
 pub use engine_handle::EngineHandle;
 pub use state::Session;

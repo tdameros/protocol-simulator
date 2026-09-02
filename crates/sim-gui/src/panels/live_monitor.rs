@@ -1,24 +1,20 @@
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use chrono::{DateTime, Local};
 use egui::{Color32, Label, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
 use crate::panels::{column, field_label, frame_detail, number, widest};
-use sim_session::hex;
 use sim_session::state::{
     Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState, Session,
     TrafficFilter,
 };
+use sim_session::{hex, traffic};
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const SENT: Color32 = Color32::from_rgb(70, 130, 200);
 const RECEIVED: Color32 = Color32::from_rgb(40, 160, 90);
 /// Rounding on the band behind the row whose fields are on show.
 const CORNER: egui::CornerRadius = egui::CornerRadius::same(2);
-/// Window the frame and byte rates are measured over.
-const RATE_WINDOW: Duration = Duration::from_secs(1);
-
 /// Every label the filter can show, measured as a set so the controls keep the
 /// same left edge from one row to the next.
 const FILTER_LABELS: &[&str] = &[
@@ -76,7 +72,7 @@ pub fn show(ui: &mut Ui, state: &mut Session, id: MonitorId) {
     }
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new(summary(&rows, log.len())).weak());
+        ui.label(RichText::new(traffic::summary(&rows, log.len())).weak());
     });
     ui.separator();
 
@@ -442,10 +438,10 @@ fn frame_row(
         });
 
         column(ui, columns.timestamp, |ui| {
-            ui.label(RichText::new(format_timestamp(entry.timestamp)).weak());
+            ui.label(RichText::new(traffic::timestamp(entry.timestamp)).weak());
         });
         column(ui, columns.delta, |ui| {
-            ui.label(RichText::new(format_delta(delta)).weak().monospace());
+            ui.label(RichText::new(traffic::delta(delta)).weak().monospace());
         });
 
         // Phosphor glyphs rather than "→"/"←": the arrows are missing from
@@ -487,74 +483,4 @@ fn frame_row(
     );
 
     background.clicked()
-}
-
-/// How much is on screen, and how fast it is arriving.
-fn summary(rows: &[&LogEntry], total: usize) -> String {
-    let now = SystemTime::now();
-    let recent: Vec<&&LogEntry> = rows
-        .iter()
-        .rev()
-        .take_while(|entry| {
-            now.duration_since(entry.timestamp)
-                .is_ok_and(|age| age < RATE_WINDOW)
-        })
-        .collect();
-    let bytes: usize = recent.iter().map(|entry| entry.bytes.len()).sum();
-
-    format!(
-        "{} of {total} shown  ·  {} frame/s  ·  {bytes} B/s",
-        rows.len(),
-        recent.len()
-    )
-}
-
-/// Wall-clock time in the machine's timezone, so frames line up with scope
-/// captures and equipment logs rather than with UTC.
-fn format_timestamp(timestamp: SystemTime) -> String {
-    DateTime::<Local>::from(timestamp)
-        .format("%H:%M:%S%.3f")
-        .to_string()
-}
-
-/// Time since the previous frame *on screen*, which is what makes a filtered
-/// view of one periodic message readable.
-fn format_delta(delta: Option<Duration>) -> String {
-    let Some(delta) = delta else {
-        return "        ".to_owned();
-    };
-    let millis = delta.as_secs_f64() * 1000.0;
-    if millis < 1000.0 {
-        format!("+{millis:6.1}m")
-    } else {
-        format!("+{:6.2}s", delta.as_secs_f64())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_delta_column_keeps_a_fixed_width() {
-        // Ragged columns make a scrolling list unreadable, so every rendering
-        // has to occupy the same room, including the empty first row.
-        let widths = [
-            format_delta(None).len(),
-            format_delta(Some(Duration::from_micros(500))).len(),
-            format_delta(Some(Duration::from_millis(20))).len(),
-            format_delta(Some(Duration::from_millis(999))).len(),
-            format_delta(Some(Duration::from_secs(12))).len(),
-        ];
-        assert!(
-            widths.iter().all(|width| *width == widths[0]),
-            "got {widths:?}"
-        );
-    }
-
-    #[test]
-    fn a_delta_switches_unit_at_a_second() {
-        assert!(format_delta(Some(Duration::from_millis(999))).ends_with('m'));
-        assert!(format_delta(Some(Duration::from_secs(1))).ends_with('s'));
-    }
 }

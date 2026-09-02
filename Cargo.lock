@@ -3928,7 +3928,6 @@ name = "sim-gui"
 version = "0.4.1"
 dependencies = [
  "anyhow",
- "chrono",
  "eframe",
  "egui",
  "egui-phosphor",
@@ -3949,6 +3948,7 @@ name = "sim-session"
 version = "0.4.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "serde",
  "sim-core",
  "tokio",
