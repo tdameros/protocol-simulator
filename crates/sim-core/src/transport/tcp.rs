@@ -63,6 +63,7 @@ impl TcpTransport {
     /// Returns an error if `listen` cannot be bound.
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "async is what forces callers into a runtime, which from_std requires"
     )]
     pub async fn listen(listen: SocketAddr) -> Result<Self, TransportError> {
