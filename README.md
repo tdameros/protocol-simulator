@@ -54,7 +54,13 @@ channels carrying `Command` and `Event`.
 `sim-gui` draws the panels with `egui` and `egui_dock`. It owns no protocol
 logic.
 
+[docs/architecture.md](docs/architecture.md) has the module map, the engine
+contract and the seams.
+
 ## Development
+
+[CLAUDE.md](CLAUDE.md) has the conventions and
+[docs/testing.md](docs/testing.md) has the test layout.
 
 ```sh
 make ci                 # fmt, clippy -D warnings, tests
