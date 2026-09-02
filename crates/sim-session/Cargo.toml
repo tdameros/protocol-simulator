@@ -8,6 +8,7 @@ license.workspace = true
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 sim-core = { path = "../sim-core" }
+if-addrs = "0.15.0"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["sync"] }
 tokio-serial = "5.5.0"

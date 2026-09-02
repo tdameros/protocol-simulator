@@ -18,6 +18,7 @@ pub mod frames;
 pub mod hex;
 pub mod kinds;
 pub mod layout;
+pub mod links;
 pub mod scenarios;
 pub mod state;
 pub mod traffic;

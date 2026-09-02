@@ -3933,7 +3933,6 @@ dependencies = [
  "egui-phosphor",
  "egui_dock",
  "egui_kittest",
- "if-addrs",
  "rfd",
  "serde",
  "sim-core",
@@ -3949,6 +3948,7 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",
+ "if-addrs",
  "serde",
  "sim-core",
  "tokio",
