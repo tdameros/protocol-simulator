@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim-core", "crates/sim-session", "crates/sim-gui"]
+members = ["crates/sim-core", "crates/sim-session", "crates/sim-gui", "crates/sim-tui"]
 
 [workspace.package]
 # The one place a version is written. Every crate inherits it, the release

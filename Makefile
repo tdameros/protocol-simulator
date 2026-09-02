@@ -1,4 +1,5 @@
 GUI_PKG := sim-gui
+TUI_PKG := sim-tui
 CORE_PKG := sim-core
 # Same source of truth as the release workflow. Recursive, not `:=`, so only the
 # bundle target pays for it.
@@ -6,7 +7,7 @@ VERSION = $(shell cargo metadata --format-version 1 --no-deps | \
 	jq -r '.packages[] | select(.name == "$(GUI_PKG)") | .version')
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-release run run-release check check-release test test-core \
+.PHONY: help build build-release run run-tui run-release check check-release test test-core \
         clippy clippy-fix fmt fmt-check doc clean ci toolchain watch bundle-macos
 
 help: ## Show this help
@@ -20,6 +21,9 @@ build-release: ## Build the workspace (release profile)
 
 run: ## Run the GUI (dev profile)
 	cargo run -p $(GUI_PKG)
+
+run-tui: ## Run the terminal front end (dev profile)
+	cargo run -p $(TUI_PKG)
 
 run-release: ## Run the GUI (release profile)
 	cargo run -p $(GUI_PKG) --release
