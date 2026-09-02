@@ -21,8 +21,9 @@ the release profile compiles different code, which is explained in
 
 ## Invariants
 
-`sim-core` has no GUI dependency and `sim-gui` holds no protocol logic. Both
-hold for a headless front end later, and both are worth refusing a change over.
+`sim-core` has no GUI dependency and `sim-gui` holds no protocol logic.
+`sim-session` sits between them and draws nothing, so a terminal front end
+takes it as it stands. All three are worth refusing a change over.
 
 The GUI reaches the engine through `EngineHandle` and nothing else. There is no
 second path to a connection.

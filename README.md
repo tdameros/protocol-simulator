@@ -44,12 +44,16 @@ file as a project.
 
 ## Architecture
 
-Two crates.
+Three crates.
 
 `sim-core` holds the engine, the frame model, the codec and the file formats,
 with no GUI dependency. The engine runs on a dedicated thread with a Tokio
 runtime and one task per connection, and speaks to the front end over two `mpsc`
 channels carrying `Command` and `Event`.
+
+`sim-session` holds what a front end needs that is not drawing: the loaded
+libraries, the traffic buffer and its filters, the unsaved drafts, and the one
+door to the engine.
 
 `sim-gui` draws the panels with `egui` and `egui_dock`. It owns no protocol
 logic.

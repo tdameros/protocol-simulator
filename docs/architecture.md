@@ -1,20 +1,26 @@
 # Architecture
 
-Two crates. `sim-core` holds the engine, the frame model, the codec and the
-file formats, with no GUI dependency. `sim-gui` draws the panels and holds no
-protocol logic. The split is what makes a headless front end possible later,
-and it is worth refusing a change over.
+Three crates. `sim-core` holds the engine, the frame model, the codec and the
+file formats, with no GUI dependency. `sim-session` holds what a front end
+needs that is not drawing. `sim-gui` draws the panels and holds no protocol
+logic. The split is what lets a second front end exist, and it is worth
+refusing a change over.
 
 ```
-                sim-gui                          sim-core
-  panels  ->  AppState  ->  EngineHandle  ==>  Engine thread  ->  transport tasks
-     ^                            ^                  |                  |
-     |                            +===== Event ======+                  |
-     +--------- drained once per frame ------------------------ sockets and ports
+    sim-gui                sim-session                     sim-core
+  panels  ->  Session  ->  EngineHandle  ==>  Engine thread  ->  transport tasks
+     ^                          ^                   |                  |
+     |                          +===== Event =======+                  |
+     +------- drained once per frame ------------------------- sockets and ports
 ```
 
-The two arrows crossing the crate boundary are `mpsc` channels carrying
-`Command` one way and `Event` the other. There is no other path.
+The two arrows crossing into `sim-core` are `mpsc` channels carrying `Command`
+one way and `Event` the other. There is no other path.
+
+`sim-session` and `sim-core` differ in error strategy as much as in subject.
+`sim-core` is a library with typed errors a caller can branch on. `sim-session`
+is application state, where a failure ends up in front of a person, so `anyhow`
+carries the context instead.
 
 ## The engine
 
@@ -51,10 +57,10 @@ running against the frames it started with however they are edited meanwhile.
 ## The front end
 
 `main.rs` builds the window and hands `SimApp` an optional path. `app.rs`
-implements `eframe::App`, drains the event channel once per frame into
-`AppState`, and hands the dock to `egui_dock`.
+implements `eframe::App`, drains the event channel once per frame into the
+`Session`, and hands the dock to `egui_dock`.
 
-`AppState` in `state.rs` owns everything the panels draw. Panels take it by
+`Session` in `sim-session` owns everything the panels draw. Panels take it by
 reference and mutate it. They reach the engine only through `EngineHandle`,
 which wraps the channel pair and counts what it had to drop.
 
@@ -70,9 +76,9 @@ its own filter, its own paused state, and its own selected row.
 | `FrameEditor` | `panels/frame_editor.rs`, `frame_edit.rs`, `type_edit.rs` |
 | `Scenarios` | `panels/scenario_list.rs` and `scenario_edit.rs` |
 
-Meaning lives beside the drawing, not inside it. `frames.rs` and `scenarios.rs`
-hold what an edit means, the panels hold what it looks like, which is what
-makes the meaning testable without a window.
+Meaning lives beside the drawing, not inside it. `sim-session` holds what an
+edit means, the panels hold what it looks like, which is what makes the meaning
+testable without a window.
 
 ## Files
 
@@ -85,7 +91,7 @@ refused with a message naming the field rather than with a deserialiser error.
 | Frame definition | `frame/schema.rs` | `FrameDef` and `TypeLibrary` |
 | Scenario | `scenario.rs` | `Scenario` |
 | Connection settings | `config.rs` | `TransportConfig` |
-| Project | `sim-gui/src/project.rs` | the parts of `AppState` worth keeping |
+| Project | `sim-gui/src/project.rs` | the parts of `Session` worth keeping |
 
 Writing back goes through `document.rs`, which copies changes into the existing
 TOML key by key. Comments, blank lines and key order survive an edit made in
@@ -117,16 +123,21 @@ instead.
 | `config.rs` | connection settings as they are written down |
 | `error.rs` | `EngineError` and `TransportError` |
 
+### sim-session
+
+| File | Holds |
+| --- | --- |
+| `engine_handle.rs` | the only way to the engine |
+| `state.rs` | `Session`, `LogEntry`, `MonitorState`, `TrafficFilter` |
+| `frames.rs` | the frame folder, the one being edited, what an edit means |
+| `scenarios.rs` | the same for scenarios |
+| `layout.rs` | field list operations on a `FrameDef`, spans kept correct |
+
 ### sim-gui
 
 | File | Holds |
 | --- | --- |
 | `app.rs` | `SimApp`, the frame loop, the dock, the menu |
-| `engine_handle.rs` | the only way to the engine |
-| `state.rs` | `AppState`, `LogEntry`, `MonitorState`, `TrafficFilter` |
-| `frames.rs` | the frame folder, the one being edited, what an edit means |
-| `scenarios.rs` | the same for scenarios |
-| `layout.rs` | field list operations on a `FrameDef`, spans kept correct |
 | `project.rs` | the project file |
 | `prefs.rs` | what belongs to this machine |
 | `theme.rs` | the theme, applied once to the context |
@@ -134,7 +145,12 @@ instead.
 
 ## Seams
 
-A headless front end attaches at `EngineHandle`. It is the whole of the
-dependency the panels have on the engine, and nothing below it knows a window
-exists. What it would need beside the channels is the loading `frames.rs` and
-`scenarios.rs` do, which is why the loading sits apart from the drawing.
+A second front end depends on `sim-session` and stops there. Nothing in it
+knows a window exists, and the panels are the only thing that does.
+
+One piece is still on the wrong side. `project.rs` lives in `sim-gui` because
+its `[ui]` section holds the dock arrangement, which only `egui_dock` can read.
+A front end that opens the same project needs the rest of the file, so that
+section has to travel through as an opaque value rather than be understood,
+or a project saved from a terminal would come back with its window layout
+gone.
