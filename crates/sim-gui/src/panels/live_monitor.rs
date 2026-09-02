@@ -8,7 +8,7 @@ use sim_session::state::{
     Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState, Session,
     TrafficFilter,
 };
-use sim_session::{hex, traffic};
+use sim_session::{hex, reading, traffic};
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const SENT: Color32 = Color32::from_rgb(70, 130, 200);
@@ -371,10 +371,10 @@ fn fields_pane(
     entry: &LogEntry,
     hex_values: bool,
 ) -> bool {
-    let reading = frame_detail::read(frames, entry, &mut monitor.decode_as);
+    let reading = reading::read(frames, entry, &mut monitor.decode_as);
     // As much as the fields need, and never more than half the tab: the list is
     // what the pane is read against.
-    let wanted = reading.wanted_height(ui).min(ui.available_height() * 0.5);
+    let wanted = frame_detail::wanted_height(&reading, ui).min(ui.available_height() * 0.5);
     let mut open = true;
     egui::Panel::bottom(egui::Id::new(("frame_detail", id)))
         .resizable(true)
