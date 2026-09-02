@@ -136,3 +136,30 @@ pub fn restate(
         }],
     }
 }
+
+/// Where each sub-field sits in the word, written as a datasheet writes it.
+///
+/// The file lists them in packing order from the top of the word, which is what
+/// the codec relies on, so the positions fall straight out of the widths. Shown
+/// because nothing else on screen says whether the first row is the top bit or
+/// the bottom one, and that is the first thing anyone checks against a
+/// datasheet.
+///
+/// A width that does not fit what is left gives `None` rather than a wrong
+/// number. The schema refuses such a frame at load, so this is a guard, not a
+/// case anyone should see.
+#[must_use]
+pub fn bit_positions(repr: ScalarType, bits: &[BitDef]) -> Vec<Option<String>> {
+    let mut remaining = u32::try_from(repr.size()).unwrap_or(0) * 8;
+    bits.iter()
+        .map(|bit| {
+            remaining = remaining.checked_sub(bit.width)?;
+            let high = remaining + bit.width - 1;
+            Some(if bit.width == 1 {
+                high.to_string()
+            } else {
+                format!("{high}:{remaining}")
+            })
+        })
+        .collect()
+}

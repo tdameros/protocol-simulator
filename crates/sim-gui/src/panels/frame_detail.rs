@@ -12,8 +12,8 @@ use sim_core::frame::codec::{self, Decoded};
 use sim_core::frame::value::Value;
 use sim_core::frame::{BitDef, FieldDef, FieldKind, FrameDef, ScalarType};
 
-use crate::panels::bit_positions;
 use sim_session::hex;
+use sim_session::kinds::bit_positions;
 use sim_session::reading::{describe, unsigned, Reading};
 use sim_session::state::LogEntry;
 

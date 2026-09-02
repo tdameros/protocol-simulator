@@ -6,9 +6,10 @@ use sim_core::ConnectionStatus;
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::panels::{bit_positions, number};
+use crate::panels::number;
 use sim_session::engine_handle::EngineHandle;
 use sim_session::hex;
+use sim_session::kinds::bit_positions;
 use sim_session::state::Session;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);

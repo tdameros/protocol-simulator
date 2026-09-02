@@ -94,6 +94,57 @@ pub fn printable(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// A number as hexadecimal, prefixed so it cannot be mistaken for decimal and
+/// padded to the width of whatever holds it.
+///
+/// The prefix is not decoration: `10` shown bare would read as ten, and the
+/// same box takes decimal input, so the two have to be told apart on sight.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value comes from an integer field and is shown, not computed"
+)]
+pub fn number(value: f64, digits: usize) -> String {
+    let sign = if value < 0.0 { "-" } else { "" };
+    let magnitude = value.abs() as u64;
+    format!("{sign}0x{magnitude:0digits$X}")
+}
+
+/// Decimal, hexadecimal, binary or octal, signed, with `_` allowed anywhere as
+/// a separator.
+///
+/// `None` for anything else, which leaves the box holding its previous value
+/// rather than jumping to zero.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a drag value is an f64 whatever is typed into it"
+)]
+pub fn read_number(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let (negative, rest) = match text.strip_prefix(['-', '+']) {
+        Some(rest) => (text.starts_with('-'), rest.trim_start()),
+        None => (false, text),
+    };
+
+    let digits = rest.replace('_', "");
+    let radix = ["0x", "0b", "0o"]
+        .into_iter()
+        .zip([16, 2, 8])
+        .find(|(prefix, _)| {
+            digits.len() > prefix.len() && digits[..2].eq_ignore_ascii_case(prefix)
+        });
+
+    let value = match radix {
+        Some((_, radix)) => u64::from_str_radix(&digits[2..], radix).ok()? as f64,
+        // Plain decimal, and whatever else Rust reads as a float, so `1e3`
+        // still works for anyone who types it.
+        None => digits.parse::<f64>().ok()?,
+    };
+    Some(if negative { -value } else { value })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{packed, parse, printable, spaced, Problem};

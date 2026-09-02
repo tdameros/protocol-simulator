@@ -18,9 +18,9 @@ mod shots;
 use egui::{Color32, Layout, Response, TextStyle, Ui, WidgetText};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::TabViewer;
-use sim_core::frame::{BitDef, ScalarType};
 
 use sim_session::engine_handle::EngineHandle;
+use sim_session::hex;
 use sim_session::state::{MonitorId, Session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -88,60 +88,11 @@ pub fn number<Num: egui::emath::Numeric>(
     value: &mut Num,
     hex: Option<usize>,
 ) -> egui::DragValue<'_> {
-    let widget = egui::DragValue::new(value).custom_parser(read_number);
+    let widget = egui::DragValue::new(value).custom_parser(hex::read_number);
     match hex {
-        Some(digits) => widget.custom_formatter(move |value, _| hex_text(value, digits)),
+        Some(digits) => widget.custom_formatter(move |value, _| hex::number(value, digits)),
         None => widget,
     }
-}
-
-/// A number as hexadecimal, prefixed so it cannot be mistaken for decimal and
-/// padded to the width of whatever holds it.
-///
-/// The prefix is not decoration: `10` shown bare would read as ten, and the
-/// same box takes decimal input, so the two have to be told apart on sight.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the value comes from an integer field and is shown, not computed"
-)]
-fn hex_text(value: f64, digits: usize) -> String {
-    let sign = if value < 0.0 { "-" } else { "" };
-    let magnitude = value.abs() as u64;
-    format!("{sign}0x{magnitude:0digits$X}")
-}
-
-/// Decimal, hexadecimal, binary or octal, signed, with `_` allowed anywhere as
-/// a separator.
-///
-/// `None` for anything else, which leaves the box holding its previous value
-/// rather than jumping to zero.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "a drag value is an f64 whatever is typed into it"
-)]
-fn read_number(text: &str) -> Option<f64> {
-    let text = text.trim();
-    let (negative, rest) = match text.strip_prefix(['-', '+']) {
-        Some(rest) => (text.starts_with('-'), rest.trim_start()),
-        None => (false, text),
-    };
-
-    let digits = rest.replace('_', "");
-    let radix = ["0x", "0b", "0o"]
-        .into_iter()
-        .zip([16, 2, 8])
-        .find(|(prefix, _)| {
-            digits.len() > prefix.len() && digits[..2].eq_ignore_ascii_case(prefix)
-        });
-
-    let value = match radix {
-        Some((_, radix)) => u64::from_str_radix(&digits[2..], radix).ok()? as f64,
-        // Plain decimal, and whatever else Rust reads as a float, so `1e3`
-        // still works for anyone who types it.
-        None => digits.parse::<f64>().ok()?,
-    };
-    Some(if negative { -value } else { value })
 }
 
 /// The two words that open a library row, so the pickers below them line up.
@@ -212,32 +163,6 @@ impl TabViewer for AppTabViewer<'_> {
     }
 }
 
-/// Where each sub-field sits in the word, written as a datasheet writes it.
-///
-/// The file lists them in packing order from the top of the word, which is what
-/// the codec relies on, so the positions fall straight out of the widths. Shown
-/// because nothing else on screen says whether the first row is the top bit or
-/// the bottom one, and that is the first thing anyone checks against a
-/// datasheet.
-///
-/// A width that does not fit what is left gives `None` rather than a wrong
-/// number. The schema refuses such a frame at load, so this is a guard, not a
-/// case anyone should see.
-pub fn bit_positions(repr: ScalarType, bits: &[BitDef]) -> Vec<Option<String>> {
-    let mut remaining = u32::try_from(repr.size()).unwrap_or(0) * 8;
-    bits.iter()
-        .map(|bit| {
-            remaining = remaining.checked_sub(bit.width)?;
-            let high = remaining + bit.width - 1;
-            Some(if bit.width == 1 {
-                high.to_string()
-            } else {
-                format!("{high}:{remaining}")
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,7 +184,7 @@ mod tests {
             ("1e3", 1000.0),
             ("-7", -7.0),
         ] {
-            assert_eq!(read_number(typed), Some(expected), "reading {typed}");
+            assert_eq!(hex::read_number(typed), Some(expected), "reading {typed}");
         }
     }
 
@@ -272,10 +197,10 @@ mod tests {
             (-16.0, 2, "-0x10"),
             (0.0, 2, "0x00"),
         ] {
-            assert_eq!(hex_text(value, digits), shown);
+            assert_eq!(hex::number(value, digits), shown);
             // What it shows has to be something it would take back, or a box
             // could not be edited from the value it is displaying.
-            assert_eq!(read_number(shown), Some(value), "reading back {shown}");
+            assert_eq!(hex::read_number(shown), Some(value), "reading back {shown}");
         }
     }
 
@@ -284,7 +209,7 @@ mod tests {
         // `None` keeps the previous value, where a zero would silently replace
         // whatever was in the field.
         for typed in ["", "   ", "0x", "0b", "nope", "0xZZ", "12ab", "0x1.5"] {
-            assert_eq!(read_number(typed), None, "reading {typed}");
+            assert_eq!(hex::read_number(typed), None, "reading {typed}");
         }
     }
 
