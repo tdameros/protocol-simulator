@@ -16,6 +16,7 @@
 pub mod engine_handle;
 pub mod frames;
 pub mod hex;
+pub mod kinds;
 pub mod layout;
 pub mod scenarios;
 pub mod state;

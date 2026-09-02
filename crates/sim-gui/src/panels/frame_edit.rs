@@ -7,35 +7,18 @@
 
 use egui::{collapsing_header::CollapsingState, ComboBox, Id, RichText, Ui};
 use egui_phosphor::regular as icons;
-use sim_core::frame::checksum::{ChecksumSpec, CrcSpec};
-use sim_core::frame::schema::{self, TypeLibrary};
+use sim_core::frame::schema::TypeLibrary;
 use sim_core::frame::value::Value;
 use sim_core::frame::{
     BitDef, Endianness, EnumVariant, FieldDef, FieldKind, FieldSpan, FrameDef, ScalarType, Stated,
     ValueRange,
 };
 use sim_session::frames::Shared;
+use sim_session::kinds;
 
 use crate::panels::number;
 use sim_session::layout;
 use sim_session::state::Session;
-
-/// Room for a field name, in the width of the box that edits one.
-const NAME_WIDTH: f32 = 120.0;
-
-/// The scalars a field may be written as, in the order a datasheet lists them.
-const SCALARS: [ScalarType; 10] = [
-    ScalarType::U8,
-    ScalarType::I8,
-    ScalarType::U16,
-    ScalarType::I16,
-    ScalarType::U32,
-    ScalarType::I32,
-    ScalarType::U64,
-    ScalarType::I64,
-    ScalarType::F32,
-    ScalarType::F64,
-];
 
 /// A type the editor was asked to go and work on.
 ///
@@ -47,6 +30,9 @@ pub enum TypeWanted {
     /// Made for the declared field that asked, and given to it once saved.
     New(usize),
 }
+
+/// Room for a field name, in the width of the box that edits one.
+const NAME_WIDTH: f32 = 120.0;
 
 /// What one pass over the editor decided to do, applied once the drawing is
 /// over so that nothing is read after it has been changed underneath.
@@ -140,7 +126,7 @@ pub fn layout(
     match edit {
         Some(Edit::Add(after)) => {
             let endian = list.endian;
-            layout::add_field(list, after, blank_field(endian));
+            layout::add_field(list, after, kinds::blank_field(endian));
         }
         Some(Edit::Remove(index)) => {
             layout::remove_field(list, index);
@@ -148,14 +134,14 @@ pub fn layout(
         Some(Edit::Move(index, down)) => layout::move_field(list, index, down),
         Some(Edit::Rename(index, name)) => layout::rename_field(list, index, &name),
         Some(Edit::State(index, stated)) => {
-            let expansion = restate(list, index, stated.as_ref(), types);
+            let expansion = kinds::restate(list, index, stated.as_ref(), types);
             layout::state_as(list, index, stated.as_ref(), expansion);
         }
         Some(Edit::Kind(index, kind)) => {
             // A field written as a type has no field of its own to change, so
             // it goes back to being plain first.
             if layout::stated_of(list, index).is_some() {
-                let expansion = restate(list, index, None, types);
+                let expansion = kinds::restate(list, index, None, types);
                 layout::state_as(list, index, None, expansion);
             }
             if let Some(field) = layout::plain_field_mut(list, index) {
@@ -386,7 +372,7 @@ fn kind_picker(
     let current = match &row.stated {
         Some(stated) => stated.kind.clone(),
         None => match layout::plain_field(layout, index) {
-            Some(field) => label_of(&field.kind),
+            Some(field) => kinds::label_of(&field.kind),
             None => return,
         },
     };
@@ -394,11 +380,11 @@ fn kind_picker(
         .selected_text(current.clone())
         .width(ui.spacing().interact_size.x * 3.0)
         .show_ui(ui, |ui| {
-            for label in kind_labels() {
+            for label in kinds::labels() {
                 // What cannot exist here is not offered, rather than offered
                 // and ignored: a checksum at the top of a frame has nothing in
                 // front of it to cover.
-                let Some(kind) = kind_named(&label, frame, index) else {
+                let Some(kind) = kinds::named(&label, frame, index) else {
                     continue;
                 };
                 if ui.selectable_label(current == label, &label).clicked() && current != label {
@@ -813,100 +799,6 @@ fn end_picker(ui: &mut Ui, salt: (&str, usize), names: &[String], chosen: &mut S
     changed
 }
 
-/// What New starts a field as: one byte, to be told what it is.
-///
-/// Following the frame's order rather than assuming one, or widening it to a
-/// `u16` afterwards would silently put it on the wire the wrong way round.
-fn blank_field(endian: Endianness) -> FieldDef {
-    FieldDef {
-        name: "field".to_owned(),
-        description: None,
-        kind: FieldKind::Scalar(ScalarType::U8),
-        endian,
-        default: None,
-        range: None,
-    }
-}
-
-/// Every word the file's `type =` accepts, which is exactly what the picker
-/// offers.
-fn kind_labels() -> Vec<String> {
-    let mut labels: Vec<String> = SCALARS
-        .iter()
-        .map(|scalar| scalar.name().to_owned())
-        .collect();
-    labels.extend(["bytes", "text", "enum", "bits", "xor8"].map(ToOwned::to_owned));
-    labels.extend([8, 16, 32].map(|width| format!("sum{width}")));
-    labels.extend(
-        CrcSpec::preset_names()
-            .iter()
-            .map(|name| (*name).to_owned()),
-    );
-    labels
-}
-
-fn label_of(kind: &FieldKind) -> String {
-    match kind {
-        FieldKind::Scalar(scalar) => scalar.name().to_owned(),
-        FieldKind::Bytes { .. } => "bytes".to_owned(),
-        FieldKind::Text { .. } => "text".to_owned(),
-        FieldKind::Enum { .. } => "enum".to_owned(),
-        FieldKind::Bits { .. } => "bits".to_owned(),
-        FieldKind::Checksum { spec, .. } => match spec {
-            ChecksumSpec::Xor8 => "xor8".to_owned(),
-            ChecksumSpec::Sum { width_bytes } => format!("sum{}", width_bytes * 8),
-            ChecksumSpec::Crc(crc) => crc
-                .preset_name()
-                .map_or_else(|| format!("crc{}", crc.width_bits), ToOwned::to_owned),
-        },
-    }
-}
-
-/// A field of the named kind, starting from something that already encodes.
-///
-/// A checksum starts covering everything in front of it, which is both the
-/// commonest answer and the only one that is certainly a valid range.
-fn kind_named(label: &str, frame: &FrameDef, index: usize) -> Option<FieldKind> {
-    if let Some(scalar) = ScalarType::parse(label) {
-        return Some(FieldKind::Scalar(scalar));
-    }
-    let spec = match label {
-        "bytes" => return Some(FieldKind::Bytes { len: 1 }),
-        "text" => return Some(FieldKind::Text { len: 8 }),
-        "enum" => {
-            return Some(FieldKind::Enum {
-                repr: ScalarType::U8,
-                variants: vec![EnumVariant {
-                    name: "VALUE0".to_owned(),
-                    value: 0,
-                }],
-            })
-        }
-        "bits" => {
-            return Some(FieldKind::Bits {
-                repr: ScalarType::U8,
-                bits: vec![BitDef {
-                    name: "value".to_owned(),
-                    width: 8,
-                }],
-            })
-        }
-        "xor8" => ChecksumSpec::Xor8,
-        "sum8" => ChecksumSpec::Sum { width_bytes: 1 },
-        "sum16" => ChecksumSpec::Sum { width_bytes: 2 },
-        "sum32" => ChecksumSpec::Sum { width_bytes: 4 },
-        preset => ChecksumSpec::Crc(CrcSpec::preset(preset)?),
-    };
-    // Its own position among the wire fields, which is where the run in front
-    // of it ends.
-    let at = frame.field_index(frame.declared.get(index)?)?;
-    let to = at.checked_sub(1)?;
-    Some(FieldKind::Checksum {
-        spec,
-        covers: FieldSpan { from: 0, to },
-    })
-}
-
 /// A byte order picker, with the frame's own answer marked where a field is
 /// free to differ from it.
 pub fn byte_order(ui: &mut Ui, endian: &mut Endianness, inherited: Option<Endianness>) {
@@ -927,32 +819,4 @@ pub fn byte_order(ui: &mut Ui, endian: &mut Endianness, inherited: Option<Endian
             }
         }
     });
-}
-
-/// The fields a restated declaration puts on the wire.
-///
-/// A field going back to being plain keeps the one it already had, so that
-/// dropping a type does not also drop its name and its byte order.
-fn restate(
-    list: &FrameDef,
-    index: usize,
-    stated: Option<&Stated>,
-    types: &TypeLibrary,
-) -> Vec<FieldDef> {
-    let Some(name) = list.declared.get(index) else {
-        return Vec::new();
-    };
-    let endian = list.endian;
-    match stated {
-        Some(stated) => schema::instantiate(types, name, &stated.kind, stated, endian)
-            // An instance the library cannot expand leaves the field as it
-            // stands, which the guard will then refuse to save.
-            .unwrap_or_else(|_| list.fields[list.expansion_of(name)].to_vec()),
-        // Named after the declaration it replaces, or the model would hold a
-        // field the frame does not declare.
-        None => vec![FieldDef {
-            name: name.clone(),
-            ..blank_field(endian)
-        }],
-    }
 }
