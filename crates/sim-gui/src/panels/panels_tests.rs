@@ -13,18 +13,18 @@ use egui_kittest::kittest::{By, NodeT, Queryable};
 use egui_kittest::Harness;
 
 use sim_session::engine_handle::EngineHandle;
-use sim_session::state::AppState;
+use sim_session::state::Session;
 
 /// What a panel needs around it, held together so the harness can own it.
 struct World {
-    state: AppState,
+    state: Session,
     engine: EngineHandle,
 }
 
 impl World {
     fn new() -> Self {
         Self {
-            state: AppState::default(),
+            state: Session::default(),
             engine: EngineHandle::default(),
         }
     }

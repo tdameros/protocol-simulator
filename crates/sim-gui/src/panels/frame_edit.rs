@@ -18,7 +18,7 @@ use sim_session::frames::Shared;
 
 use crate::panels::number;
 use sim_session::layout;
-use sim_session::state::AppState;
+use sim_session::state::Session;
 
 /// Room for a field name, in the width of the box that edits one.
 const NAME_WIDTH: f32 = 120.0;
@@ -60,7 +60,7 @@ enum Edit {
     State(usize, Option<Stated>),
 }
 
-pub fn fields(ui: &mut Ui, state: &mut AppState) {
+pub fn fields(ui: &mut Ui, state: &mut Session) {
     let hex = state.hex_values;
     let shared = state.frames.shared_choices(None);
     let types = state.frames.types().clone();

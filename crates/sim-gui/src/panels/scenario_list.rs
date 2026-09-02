@@ -8,12 +8,12 @@ use egui_phosphor::regular as icons;
 
 use crate::panels::{scenario_edit, widest};
 use sim_session::engine_handle::EngineHandle;
-use sim_session::state::AppState;
+use sim_session::state::Session;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const RUNNING: Color32 = Color32::from_rgb(40, 160, 90);
 
-pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
+pub fn show(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
     library_bar(ui, state);
 
     for (file, reason) in &state.scenarios.failures {
@@ -80,7 +80,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 }
 
 /// Writes the draft out, choosing a file for one that has never had a home.
-fn save(state: &mut AppState) {
+fn save(state: &mut Session) {
     let Some(directory) = state.scenarios.directory.clone() else {
         state.last_error = Some("No scenarios folder to save into.".to_owned());
         return;
@@ -114,7 +114,7 @@ fn blank() -> Scenario {
     }
 }
 
-fn library_bar(ui: &mut Ui, state: &mut AppState) {
+fn library_bar(ui: &mut Ui, state: &mut Session) {
     ui.horizontal(|ui| {
         // Both throw the draft away, so neither is offered while one is open:
         // losing unsaved work to a stray click is not a trade worth making.
@@ -205,7 +205,7 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
     }
 }
 
-fn scenario_list(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
+fn scenario_list(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
     // Cloned out: the rows both read the library and start scenarios from it,
     // and the borrow checker is right that those cannot overlap.
     let listed: Vec<(usize, Scenario)> = state
@@ -268,7 +268,7 @@ fn scenario_list(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
 
 /// Hands the scenario to the engine along with the definitions it will encode
 /// against, so the run is unaffected by anything edited afterwards.
-fn start(state: &mut AppState, engine: &EngineHandle, scenario: &Scenario) {
+fn start(state: &mut Session, engine: &EngineHandle, scenario: &Scenario) {
     let wanted = scenario.frames_used();
     let frames: Vec<_> = state
         .frames
@@ -311,7 +311,7 @@ fn start(state: &mut AppState, engine: &EngineHandle, scenario: &Scenario) {
 
 /// Names the scenario aims at that the project does not define, in the order
 /// they first appear so the message points at the first line to fix.
-fn unknown_connections(state: &AppState, scenario: &Scenario) -> Vec<String> {
+fn unknown_connections(state: &Session, scenario: &Scenario) -> Vec<String> {
     let mut unknown: Vec<String> = Vec::new();
     for target in scenario.steps.iter().flat_map(|step| &step.targets) {
         let known = state.connections.iter().any(|(id, _)| id == target);
@@ -339,7 +339,7 @@ fn shape(scenario: &Scenario) -> String {
     }
 }
 
-fn steps(ui: &mut Ui, state: &AppState, scenario: &Scenario) {
+fn steps(ui: &mut Ui, state: &Session, scenario: &Scenario) {
     if let Some(description) = &scenario.description {
         ui.label(RichText::new(description).weak());
     }
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_misspelt_connection_is_caught_before_anything_is_sent() {
-        let mut state = AppState::default();
+        let mut state = Session::default();
         state.connections = vec![(
             sim_core::ConnectionId::from("bus"),
             sim_session::state::ConnectionEntry {

@@ -20,4 +20,4 @@ pub mod scenarios;
 pub mod state;
 
 pub use engine_handle::EngineHandle;
-pub use state::AppState;
+pub use state::Session;

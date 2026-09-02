@@ -12,7 +12,7 @@ use crate::prefs::Preferences;
 use crate::project::{self, Project, DEFAULT_FILE_NAME};
 use crate::theme;
 use sim_session::engine_handle::EngineHandle;
-use sim_session::state::{AppState, Direction, LogEntry};
+use sim_session::state::{Direction, LogEntry, Session};
 
 const APP_NAME: &str = "Protocol Simulator";
 
@@ -29,7 +29,7 @@ enum Pending {
 pub struct SimApp {
     /// Reachable from the crate so the documentation's screenshots can put a
     /// bench in front of the window before drawing it.
-    pub(crate) state: AppState,
+    pub(crate) state: Session,
     engine: EngineHandle,
     dock_state: DockState<Tab>,
     /// Where the current project lives, once it has anywhere to live.
@@ -55,7 +55,7 @@ impl SimApp {
         let theme = cc.egui_ctx.theme();
         theme::apply(&cc.egui_ctx, theme);
 
-        let mut state = AppState::default();
+        let mut state = Session::default();
         let mut monitors = BTreeMap::new();
         let dock_state = project::default_layout(&mut monitors);
         state.restore_monitors(monitors);
@@ -97,7 +97,7 @@ impl SimApp {
 
     /// Silences the engine before the window is given something else to show.
     ///
-    /// A scenario lives in the engine, not in `AppState`, so replacing the
+    /// A scenario lives in the engine, not in `Session`, so replacing the
     /// state would leave it running against links that are about to close,
     /// reporting an error per send, with nothing on screen offering to stop it.
     fn stop_everything(&mut self) {
@@ -140,7 +140,7 @@ impl SimApp {
 
     fn start_new(&mut self, ctx: &Context) {
         self.stop_everything();
-        self.state = AppState::default();
+        self.state = Session::default();
         let mut monitors = BTreeMap::new();
         self.dock_state = project::default_layout(&mut monitors);
         self.state.restore_monitors(monitors);

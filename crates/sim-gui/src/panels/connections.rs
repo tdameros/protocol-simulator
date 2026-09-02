@@ -31,7 +31,7 @@ const FORM_LABELS: &[&str] = &[
     "Flow control:",
 ];
 
-pub fn show(ui: &mut Ui, state: &mut sim_session::state::AppState, engine: &EngineHandle) {
+pub fn show(ui: &mut Ui, state: &mut sim_session::state::Session, engine: &EngineHandle) {
     ui.heading("New connection");
     new_connection_form(ui, &mut state.new_connection);
 

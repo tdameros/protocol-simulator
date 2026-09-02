@@ -4,9 +4,9 @@ use egui::{Color32, ComboBox, RichText, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
 use sim_session::engine_handle::EngineHandle;
-use sim_session::state::AppState;
+use sim_session::state::Session;
 
-pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
+pub fn show(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
     ui.heading("Raw hex injection");
 
     // Only a connection removed from the list clears the selection. A target that

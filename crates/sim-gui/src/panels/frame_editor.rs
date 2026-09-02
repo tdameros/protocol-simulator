@@ -8,12 +8,12 @@ use egui_phosphor::regular as icons;
 
 use crate::panels::{bit_positions, number, spaced_hex};
 use sim_session::engine_handle::EngineHandle;
-use sim_session::state::AppState;
+use sim_session::state::Session;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const WARNING: Color32 = Color32::from_rgb(200, 120, 40);
 
-pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
+pub fn show(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
     // Taken unconditionally: bytes sent here with no frame to decode them into
     // are dropped now rather than surfacing later against an unrelated frame.
     let handed_over = state.pending_frame_hex.take();
@@ -74,7 +74,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     preview_and_send(ui, state, engine, &frame);
 }
 
-fn library_bar(ui: &mut Ui, state: &mut AppState) {
+fn library_bar(ui: &mut Ui, state: &mut Session) {
     ui.horizontal(|ui| {
         // Both throw the draft away, so neither is offered while one is open:
         // losing unsaved work to a stray click is not a trade worth making.
@@ -114,7 +114,7 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
 
 /// New, Edit and Delete, beside the frame they act on rather than beside the
 /// folder, so that the row reads like the one for shared types below it.
-fn definition_buttons(ui: &mut Ui, state: &mut AppState) {
+fn definition_buttons(ui: &mut Ui, state: &mut Session) {
     let idle = state.frames.draft.is_none() && state.frames.type_draft.is_none();
     if ui
         .add_enabled(
@@ -164,7 +164,7 @@ fn blank(name: &str) -> FrameDef {
     )
 }
 
-fn draft_editor(ui: &mut Ui, state: &mut AppState) {
+fn draft_editor(ui: &mut Ui, state: &mut Session) {
     let dirty = state.frames.draft_is_dirty();
     let problem = state.frames.draft_problem();
     let Some(draft) = &mut state.frames.draft else {
@@ -217,7 +217,7 @@ fn draft_editor(ui: &mut Ui, state: &mut AppState) {
 }
 
 /// Writes the draft out, choosing a file for one that has never had a home.
-fn save_draft(state: &mut AppState) {
+fn save_draft(state: &mut Session) {
     let Some(directory) = state.frames.directory.clone() else {
         state.last_error = Some("No frames folder to save into.".to_owned());
         return;
@@ -235,7 +235,7 @@ fn save_draft(state: &mut AppState) {
     }
 }
 
-fn frame_picker(ui: &mut Ui, state: &mut AppState) {
+fn frame_picker(ui: &mut Ui, state: &mut Session) {
     if state.frames.directory.is_none() {
         return;
     }
@@ -299,7 +299,7 @@ fn frame_picker(ui: &mut Ui, state: &mut AppState) {
     }
 }
 
-fn show_failures(ui: &mut Ui, state: &AppState) {
+fn show_failures(ui: &mut Ui, state: &Session) {
     for (file, reason) in &state.frames.failures {
         ui.colored_label(ERROR, format!("{file}: {reason}"));
     }
@@ -641,7 +641,7 @@ fn bits_widget(
     }
 }
 
-fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, frame: &FrameDef) {
+fn preview_and_send(ui: &mut Ui, state: &mut Session, engine: &EngineHandle, frame: &FrameDef) {
     let encoded = {
         let values = state.frames.values_mut(frame);
         codec::encode(frame, values)
@@ -716,7 +716,7 @@ fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, fr
 ///
 /// The box only mirrors the encoder while it is not focused. Once it is, the
 /// text is whatever was typed, and the fields follow it instead.
-fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: Option<&[u8]>) {
+fn hex_preview(ui: &mut Ui, state: &mut Session, frame: &FrameDef, bytes: Option<&[u8]>) {
     let id = egui::Id::new(("frame_hex", &frame.name));
     // With nothing to mirror, the typed text stays put rather than being wiped.
     if let (false, Some(bytes)) = (ui.memory(|memory| memory.has_focus(id)), bytes) {
@@ -740,7 +740,7 @@ fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: Optio
 ///
 /// Returns what the operator should know about: why nothing was applied, or
 /// what the frame will not keep.
-fn apply_hex(state: &mut AppState, frame: &FrameDef, typed: &str) -> Option<String> {
+fn apply_hex(state: &mut Session, frame: &FrameDef, typed: &str) -> Option<String> {
     let cleaned: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
     if !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
         return Some("Not hexadecimal.".to_owned());
@@ -910,7 +910,7 @@ covers = { from = "sync", to = "mode" }
     #[test]
     fn typing_hex_drives_the_fields() {
         let frame = guarded();
-        let mut state = AppState::default();
+        let mut state = Session::default();
 
         // 0xAA ^ 0x55 ^ 0x02 = 0xFD
         assert_eq!(apply_hex(&mut state, &frame, "AA 55 02 FD"), None);
@@ -925,7 +925,7 @@ covers = { from = "sync", to = "mode" }
     #[test]
     fn an_incomplete_byte_is_not_worth_complaining_about() {
         let frame = guarded();
-        let mut state = AppState::default();
+        let mut state = Session::default();
 
         state
             .frames
@@ -945,7 +945,7 @@ covers = { from = "sync", to = "mode" }
     #[test]
     fn a_short_frame_says_how_short() {
         let frame = guarded();
-        let mut state = AppState::default();
+        let mut state = Session::default();
         let note = apply_hex(&mut state, &frame, "AA 55").expect("should be reported");
         assert!(note.contains('2') && note.contains('4'), "got {note}");
     }
@@ -953,7 +953,7 @@ covers = { from = "sync", to = "mode" }
     #[test]
     fn a_wrong_checksum_is_applied_but_flagged() {
         let frame = guarded();
-        let mut state = AppState::default();
+        let mut state = Session::default();
 
         // Right bytes, deliberately wrong check byte.
         let note = apply_hex(&mut state, &frame, "AA 55 02 00").expect("should be reported");

@@ -15,7 +15,7 @@ use tokio_serial::{DataBits, FlowControl, Parity, StopBits};
 pub const MAX_LOG_ENTRIES: usize = 10_000;
 
 #[derive(Default)]
-pub struct AppState {
+pub struct Session {
     pub connections: Vec<(ConnectionId, ConnectionEntry)>,
     pub log: VecDeque<LogEntry>,
     pub new_connection: NewConnectionForm,
@@ -55,7 +55,7 @@ pub struct AppState {
     pub last_error: Option<String>,
 }
 
-impl AppState {
+impl Session {
     pub fn connection_mut(&mut self, id: &ConnectionId) -> Option<&mut ConnectionEntry> {
         self.connections
             .iter_mut()
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn a_paused_monitor_stops_at_the_frame_it_froze_on() {
-        let mut state = AppState::default();
+        let mut state = Session::default();
         let id = state.open_monitor();
         for _ in 0..3 {
             state.push_log(logged("bus", Direction::Sent, &[1], None));
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn a_dropped_connection_reconnects_with_the_settings_it_had() {
         let id = ConnectionId("link".to_owned());
-        let mut state = AppState {
+        let mut state = Session {
             connections: vec![(
                 id.clone(),
                 ConnectionEntry {
@@ -723,7 +723,7 @@ mod tests {
                     autoconnect: true,
                 },
             )],
-            ..AppState::default()
+            ..Session::default()
         };
 
         // Nothing to reconnect while it is up, so the button cannot restart a
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn log_forgets_oldest_entries_past_the_cap() {
-        let mut state = AppState::default();
+        let mut state = Session::default();
         for n in 0..MAX_LOG_ENTRIES + 50 {
             state.push_log(LogEntry {
                 seq: 0,

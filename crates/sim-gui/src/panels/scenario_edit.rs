@@ -22,7 +22,7 @@ use crate::panels::frame_editor::value_widget;
 use crate::panels::hex_inject::parse_hex;
 use crate::panels::{column, field_label, widest};
 use sim_session::scenarios::{self, ActionKind};
-use sim_session::state::AppState;
+use sim_session::state::Session;
 
 /// A change to the list of steps, which cannot happen while it is being drawn.
 enum Edit {
@@ -32,7 +32,7 @@ enum Edit {
     Kind { index: usize, kind: ActionKind },
 }
 
-pub fn steps(ui: &mut Ui, state: &mut AppState) {
+pub fn steps(ui: &mut Ui, state: &mut Session) {
     let links: Vec<ConnectionId> = state.connections.iter().map(|(id, _)| id.clone()).collect();
     let frames: Vec<FrameDef> = state.frames.frames().cloned().collect();
     // The same answer as the frame editor gives: a value written into a step is
@@ -486,7 +486,7 @@ fn spaced(bytes: &[u8]) -> String {
 }
 
 /// The settings a scenario has beyond its steps.
-pub fn header(ui: &mut Ui, state: &mut AppState) {
+pub fn header(ui: &mut Ui, state: &mut Session) {
     let labels = widest(ui, &TextStyle::Body, &["Name:", "Description:", "Repeat:"]);
     let dirty = state.scenarios.draft_is_dirty();
 

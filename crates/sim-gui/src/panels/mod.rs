@@ -21,7 +21,7 @@ use egui_dock::TabViewer;
 use sim_core::frame::{BitDef, ScalarType};
 
 use sim_session::engine_handle::EngineHandle;
-use sim_session::state::{AppState, MonitorId};
+use sim_session::state::{MonitorId, Session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
@@ -34,7 +34,7 @@ pub enum Tab {
 }
 
 pub struct AppTabViewer<'a> {
-    pub state: &'a mut AppState,
+    pub state: &'a mut Session,
     pub engine: &'a EngineHandle,
 }
 
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn renaming_a_traffic_tab_leaves_its_identity_alone() {
-        let mut state = AppState::default();
+        let mut state = Session::default();
         let monitor = state.open_monitor();
         let engine = EngineHandle::new();
         let mut viewer = AppTabViewer {

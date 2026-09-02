@@ -20,7 +20,7 @@ use sim_core::frame::{FrameDef, ScalarType, ValueRange};
 
 use crate::panels::number;
 use sim_session::frames::Effect;
-use sim_session::state::AppState;
+use sim_session::state::Session;
 
 const ERROR: egui::Color32 = egui::Color32::from_rgb(200, 60, 60);
 const WARNING: egui::Color32 = egui::Color32::from_rgb(200, 120, 40);
@@ -40,7 +40,7 @@ const BASES: [ScalarType; 10] = [
 ];
 
 /// The shared types, listed under the frames with the same three buttons.
-pub fn library_bar(ui: &mut Ui, state: &mut AppState) {
+pub fn library_bar(ui: &mut Ui, state: &mut Session) {
     if state.frames.directory.is_none() {
         return;
     }
@@ -53,7 +53,7 @@ pub fn library_bar(ui: &mut Ui, state: &mut AppState) {
         .show(ui, |ui| types_row(ui, state));
 }
 
-fn types_row(ui: &mut Ui, state: &mut AppState) {
+fn types_row(ui: &mut Ui, state: &mut Session) {
     ui.horizontal(|ui| {
         let names: Vec<String> = state
             .frames
@@ -120,7 +120,7 @@ fn types_row(ui: &mut Ui, state: &mut AppState) {
     });
 }
 
-pub fn editor(ui: &mut Ui, state: &mut AppState) {
+pub fn editor(ui: &mut Ui, state: &mut Session) {
     let dirty = state.frames.type_draft_is_dirty();
     let problem = state.frames.type_draft_problem();
     let impact = state.frames.type_draft_impact();

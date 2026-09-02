@@ -6,7 +6,7 @@ use egui_phosphor::regular as icons;
 
 use crate::panels::{column, field_label, frame_detail, number, printable, spaced_hex, widest};
 use sim_session::state::{
-    AppState, Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState,
+    Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState, Session,
     TrafficFilter,
 };
 
@@ -29,7 +29,7 @@ const FILTER_LABELS: &[&str] = &[
     "Length:",
 ];
 
-pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
+pub fn show(ui: &mut Ui, state: &mut Session, id: MonitorId) {
     let next_seq = state.next_seq();
     let names: Vec<String> = state
         .connections
@@ -38,7 +38,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, id: MonitorId) {
         .collect();
 
     // Split apart so the monitor can be edited while the buffer is being read.
-    let AppState {
+    let Session {
         monitors,
         log,
         hex_input,

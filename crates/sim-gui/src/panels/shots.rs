@@ -19,7 +19,7 @@ use sim_core::{ConnectionId, ConnectionStatus, TransportConfig};
 
 use crate::theme;
 use sim_session::engine_handle::EngineHandle;
-use sim_session::state::{AppState, ConnectionEntry, Direction, LogEntry};
+use sim_session::state::{ConnectionEntry, Direction, LogEntry, Session};
 
 /// Where the documentation looks for them, from the workspace root rather than
 /// from wherever the test happens to be run.
@@ -40,7 +40,7 @@ fn examples() -> String {
 }
 
 struct World {
-    state: AppState,
+    state: Session,
     engine: EngineHandle,
 }
 
@@ -82,7 +82,7 @@ fn open_row(ctx: &egui::Context, index: usize) {
 }
 
 fn world_on(folder: &str) -> World {
-    let mut state = AppState::default();
+    let mut state = Session::default();
     state.frames.load_from(std::path::PathBuf::from(folder));
     World {
         state,
@@ -142,7 +142,7 @@ fn shared_types() {
 #[test]
 fn connections_panel() {
     let mut world = World {
-        state: AppState::default(),
+        state: Session::default(),
         engine: EngineHandle::default(),
     };
     world.state.connections = vec![
@@ -283,7 +283,7 @@ fn traffic_monitor() {
 #[test]
 fn hex_inject() {
     let mut world = World {
-        state: AppState::default(),
+        state: Session::default(),
         engine: EngineHandle::default(),
     };
     let id = ConnectionId("uart".to_owned());

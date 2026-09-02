@@ -23,7 +23,7 @@ use sim_core::{ConnectionId, ConnectionStatus, RetryPolicy, TransportConfig};
 
 use crate::panels::Tab;
 use sim_session::state::{
-    AppState, ConnectionEntry, DirectionFilter, HexAnchor, MonitorId, MonitorState, TrafficFilter,
+    ConnectionEntry, DirectionFilter, HexAnchor, MonitorId, MonitorState, Session, TrafficFilter,
 };
 
 /// Bumped only when an older reader would get a project wrong. A reader refuses
@@ -94,7 +94,7 @@ impl Project {
     /// relative to.
     #[must_use]
     pub fn capture(
-        state: &AppState,
+        state: &Session,
         dock: &DockState<Tab>,
         theme: Theme,
         path: Option<&Path>,
@@ -110,7 +110,7 @@ impl Project {
     /// is anything left to save. Cloning a layout that the comparison ignores
     /// anyway would be work done sixty times a second for nothing.
     #[must_use]
-    pub fn capture_settings(state: &AppState, theme: Theme, path: Option<&Path>) -> Self {
+    pub fn capture_settings(state: &Session, theme: Theme, path: Option<&Path>) -> Self {
         let base = path.and_then(Path::parent);
         Self {
             version: FORMAT_VERSION,
@@ -156,7 +156,7 @@ impl Project {
     ///
     /// Returns an error if a connection entry cannot be turned into a usable
     /// configuration.
-    pub fn apply(&self, state: &mut AppState, path: Option<&Path>) -> Result<Restored> {
+    pub fn apply(&self, state: &mut Session, path: Option<&Path>) -> Result<Restored> {
         let resolved = self
             .connections
             .iter()
@@ -254,7 +254,7 @@ impl Project {
 }
 
 /// What loading a project leaves for the caller: the parts that are not
-/// [`AppState`]'s to hold.
+/// [`Session`]'s to hold.
 #[derive(Debug)]
 pub struct Restored {
     pub layout: DockState<Tab>,
@@ -615,8 +615,8 @@ mod tests {
         )
     }
 
-    fn busy_state() -> AppState {
-        let mut state = AppState::default();
+    fn busy_state() -> Session {
+        let mut state = Session::default();
         state.connections = vec![connection("bus", true), connection("probe", false)];
         state.hex_input = "AA 55".to_owned();
         state.hex_values = true;
@@ -642,7 +642,7 @@ mod tests {
         state
     }
 
-    fn capture(state: &AppState, dock: &DockState<Tab>) -> Project {
+    fn capture(state: &Session, dock: &DockState<Tab>) -> Project {
         Project::capture(state, dock, Theme::Dark, None)
     }
 
@@ -656,7 +656,7 @@ mod tests {
         let read: Project = toml::from_str(&text).expect("should parse back");
         assert_eq!(read, written, "through:\n{text}");
 
-        let mut reopened = AppState::default();
+        let mut reopened = Session::default();
         let restored = read.apply(&mut reopened, None).expect("should apply");
 
         assert_eq!(reopened.connections.len(), 2);
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn an_untouched_traffic_tab_costs_no_lines() {
-        let mut state = AppState::default();
+        let mut state = Session::default();
         state.open_monitor();
         let dock = default_layout(&mut BTreeMap::new());
         let text = toml::to_string_pretty(&capture(&state, &dock)).expect("should serialise");
@@ -710,7 +710,7 @@ mod tests {
         std::fs::create_dir_all(&frames).expect("frames dir");
         let file = root.join(DEFAULT_FILE_NAME);
 
-        let mut state = AppState::default();
+        let mut state = Session::default();
         state.frames.load_from(frames.clone());
 
         let dock = default_layout(&mut BTreeMap::new());
@@ -721,7 +721,7 @@ mod tests {
         // which is the whole point of not writing an absolute path.
         let moved = scratch("relative-moved");
         std::fs::create_dir_all(moved.join("frames")).expect("frames dir");
-        let mut elsewhere = AppState::default();
+        let mut elsewhere = Session::default();
         project
             .apply(&mut elsewhere, Some(&moved.join(DEFAULT_FILE_NAME)))
             .expect("should apply");
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn dragging_a_pane_neither_rewrites_the_file_nor_asks_to_be_saved() {
-        let state = AppState::default();
+        let state = Session::default();
         let fresh = default_layout(&mut BTreeMap::new());
 
         let mut used = fresh.clone();
@@ -783,7 +783,7 @@ mod tests {
         };
         project.monitors.clear();
 
-        let mut state = AppState::default();
+        let mut state = Session::default();
         let restored = project.apply(&mut state, None).expect("should apply");
         let shown: Vec<MonitorId> = restored
             .layout
@@ -851,7 +851,7 @@ stop_bits = 3
         )
         .expect("valid toml");
 
-        let mut state = AppState::default();
+        let mut state = Session::default();
         state.connections = vec![connection("kept", false)];
         let error = project.apply(&mut state, None).expect_err("should refuse");
         assert!(error.to_string().contains("uart"), "{error}");
@@ -862,7 +862,7 @@ stop_bits = 3
     fn a_file_says_what_it_is_before_it_says_anything_else() {
         let dir = scratch("header");
         let file = dir.join(DEFAULT_FILE_NAME);
-        let state = AppState::default();
+        let state = Session::default();
         let dock = default_layout(&mut BTreeMap::new());
 
         Project::capture(&state, &dock, Theme::Light, Some(&file))
