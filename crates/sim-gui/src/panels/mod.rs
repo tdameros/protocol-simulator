@@ -212,29 +212,6 @@ impl TabViewer for AppTabViewer<'_> {
     }
 }
 
-/// Bytes as the panels write them: two upper-case digits, one space between.
-pub fn spaced_hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// The same bytes as text, with anything unprintable shown as a dot.
-pub fn printable(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|&byte| {
-            if byte.is_ascii_graphic() || byte == b' ' {
-                byte as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
-}
-
 /// Where each sub-field sits in the word, written as a datasheet writes it.
 ///
 /// The file lists them in packing order from the top of the word, which is what

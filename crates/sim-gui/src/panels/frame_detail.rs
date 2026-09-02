@@ -12,8 +12,9 @@ use sim_core::frame::codec::{self, Decoded};
 use sim_core::frame::value::Value;
 use sim_core::frame::{BitDef, FieldDef, FieldKind, FrameDef, ScalarType};
 
-use crate::panels::{bit_positions, printable, spaced_hex};
+use crate::panels::bit_positions;
 use sim_session::frames::FrameLibrary;
+use sim_session::hex;
 use sim_session::state::LogEntry;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
@@ -193,7 +194,7 @@ fn fields(ui: &mut Ui, frame: &FrameDef, bytes: &[u8], decoded: &Decoded, hex: b
                     label.on_hover_text(description);
                 }
                 ui.label(RichText::new(format!("{offset}..{end}")).weak().monospace());
-                ui.label(RichText::new(spaced_hex(&bytes[offset..end])).monospace());
+                ui.label(RichText::new(hex::spaced(&bytes[offset..end])).monospace());
                 value_cell(ui, field, decoded, hex);
                 ui.end_row();
 
@@ -267,7 +268,7 @@ fn describe(field: &FieldDef, value: &Value, hex: bool) -> String {
         (_, Value::Float(raw)) => raw.to_string(),
         (_, Value::Text(text)) => format!("{text:?}"),
         // Whose hex is already in the column before this one.
-        (_, Value::Bytes(raw)) => printable(raw),
+        (_, Value::Bytes(raw)) => hex::printable(raw),
     }
 }
 

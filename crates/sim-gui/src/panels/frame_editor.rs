@@ -6,8 +6,9 @@ use sim_core::ConnectionStatus;
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::panels::{bit_positions, number, spaced_hex};
+use crate::panels::{bit_positions, number};
 use sim_session::engine_handle::EngineHandle;
+use sim_session::hex;
 use sim_session::state::Session;
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
@@ -53,7 +54,7 @@ pub fn show(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
     };
 
     if let Some(bytes) = handed_over {
-        let typed = spaced_hex(&bytes);
+        let typed = hex::spaced(&bytes);
         state.frame_hex_note = apply_hex(state, &frame, &typed);
         state.frame_hex = typed;
     }
@@ -532,7 +533,7 @@ pub fn value_widget(
         }
         FieldKind::Bytes { len } => {
             let current = entry.as_bytes().unwrap_or(&[]).to_vec();
-            let mut text = to_hex(&current);
+            let mut text = hex::packed(&current);
             if ui
                 .add(
                     egui::TextEdit::singleline(&mut text)
@@ -541,7 +542,7 @@ pub fn value_widget(
                 )
                 .changed()
             {
-                if let Some(mut bytes) = parse_hex(&text) {
+                if let Ok(mut bytes) = hex::parse(&text) {
                     bytes.resize(*len, 0);
                     *entry = Value::Bytes(bytes);
                 }
@@ -720,7 +721,7 @@ fn hex_preview(ui: &mut Ui, state: &mut Session, frame: &FrameDef, bytes: Option
     let id = egui::Id::new(("frame_hex", &frame.name));
     // With nothing to mirror, the typed text stays put rather than being wiped.
     if let (false, Some(bytes)) = (ui.memory(|memory| memory.has_focus(id)), bytes) {
-        state.frame_hex = spaced_hex(bytes);
+        state.frame_hex = hex::spaced(bytes);
     }
 
     let response = ui.add(
@@ -741,12 +742,14 @@ fn hex_preview(ui: &mut Ui, state: &mut Session, frame: &FrameDef, bytes: Option
 /// Returns what the operator should know about: why nothing was applied, or
 /// what the frame will not keep.
 fn apply_hex(state: &mut Session, frame: &FrameDef, typed: &str) -> Option<String> {
-    let cleaned: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
-    if !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Some("Not hexadecimal.".to_owned());
-    }
-    // Half a byte typed is someone mid-keystroke, not a mistake to point at.
-    let bytes = parse_hex(&cleaned)?;
+    let bytes = match hex::parse(typed) {
+        Ok(bytes) => bytes,
+        // An emptied box is nought bytes, which the length below reports.
+        Err(hex::Problem::Empty) => Vec::new(),
+        // Half a byte typed is someone mid-keystroke, not a mistake to point at.
+        Err(hex::Problem::OddDigits) => return None,
+        Err(problem) => return Some(problem.to_string()),
+    };
     if bytes.len() != frame.size() {
         return Some(format!(
             "{} bytes typed, the frame is {}.",
@@ -802,25 +805,6 @@ fn max_unsigned(scalar: ScalarType) -> u64 {
     } else {
         (1u64 << bits) - 1
     }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        let _ = write!(out, "{byte:02X}");
-        out
-    })
-}
-
-fn parse_hex(text: &str) -> Option<Vec<u8>> {
-    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if !cleaned.len().is_multiple_of(2) || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    (0..cleaned.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).ok())
-        .collect()
 }
 
 #[cfg(test)]

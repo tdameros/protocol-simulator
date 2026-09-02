@@ -4,7 +4,8 @@ use chrono::{DateTime, Local};
 use egui::{Color32, Label, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::panels::{column, field_label, frame_detail, number, printable, spaced_hex, widest};
+use crate::panels::{column, field_label, frame_detail, number, widest};
+use sim_session::hex;
 use sim_session::state::{
     Direction, DirectionFilter, HexAnchor, LogEntry, MonitorId, MonitorState, Session,
     TrafficFilter,
@@ -423,11 +424,11 @@ fn frame_row(
     let drawn = ui.horizontal(|ui| {
         ui.menu_button(icons::DOTS_THREE, |ui| {
             if ui.button("Copy hex").clicked() {
-                ui.ctx().copy_text(spaced_hex(&entry.bytes));
+                ui.ctx().copy_text(hex::spaced(&entry.bytes));
                 ui.close();
             }
             if ui.button("Send to Hex Inject").clicked() {
-                *hex_input = spaced_hex(&entry.bytes);
+                *hex_input = hex::spaced(&entry.bytes);
                 ui.close();
             }
             if ui
@@ -465,9 +466,9 @@ fn frame_row(
                 ui.add(Label::new(RichText::new(source.to_string()).weak()).truncate());
             }
         });
-        ui.label(RichText::new(spaced_hex(&entry.bytes)).text_style(TextStyle::Monospace));
+        ui.label(RichText::new(hex::spaced(&entry.bytes)).text_style(TextStyle::Monospace));
         ui.label(
-            RichText::new(printable(&entry.bytes))
+            RichText::new(hex::printable(&entry.bytes))
                 .text_style(TextStyle::Monospace)
                 .weak(),
         );

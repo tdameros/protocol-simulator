@@ -19,8 +19,8 @@ use sim_core::scenario::{Action, Expect, Step};
 use sim_core::{Anchor, ConnectionId, HexPattern};
 
 use crate::panels::frame_editor::value_widget;
-use crate::panels::hex_inject::parse_hex;
 use crate::panels::{column, field_label, widest};
+use sim_session::hex;
 use sim_session::scenarios::{self, ActionKind};
 use sim_session::state::Session;
 
@@ -470,19 +470,11 @@ fn kept_text(ui: &mut Ui, salt: &str, mirror: &str, hint: &str) -> Option<String
 
 /// Bytes, taken from the box only once they parse.
 fn hex_field(ui: &mut Ui, salt: &str, bytes: &mut Vec<u8>) {
-    if let Some(text) = kept_text(ui, salt, &spaced(bytes), "DE AD BE EF") {
-        if let Ok(parsed) = parse_hex(&text) {
+    if let Some(text) = kept_text(ui, salt, &hex::spaced(bytes), "DE AD BE EF") {
+        if let Ok(parsed) = hex::parse(&text) {
             *bytes = parsed;
         }
     }
-}
-
-fn spaced(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// The settings a scenario has beyond its steps.
