@@ -131,8 +131,6 @@ mod tests {
         assert_eq!(tree[1].size(), 8);
     }
 
-    /// Four bytes, the last one a checksum, so the round trip is easy to read.
-
     #[test]
     fn a_repeated_builtin_stays_a_plain_row() {
         let fields = [field("sample[0]"), field("sample[1]")];

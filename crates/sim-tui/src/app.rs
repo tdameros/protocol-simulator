@@ -313,17 +313,16 @@ impl App {
             return &[("Enter", "send")];
         }
 
-        match self.overlay {
-            Some(Overlay::Pick(_)) => {
-                return &[
-                    ("up/down", "choose"),
-                    ("type", "narrow"),
-                    ("Enter", "take it"),
-                    ("Esc", "back"),
-                ]
-            }
-            Some(Overlay::Keys) => return &[],
-            None => {}
+        // A list has the keyboard, so its keys are the ones worth the room. The
+        // key map does not: it is what you open to read the view's own keys, so
+        // it falls through to them.
+        if let Some(Overlay::Pick(_)) = self.overlay {
+            return &[
+                ("up/down", "choose"),
+                ("type", "narrow"),
+                ("Enter", "take it"),
+                ("Esc", "back"),
+            ];
         }
 
         match self.tab {
@@ -340,7 +339,19 @@ impl App {
         }
     }
 
+    /// What went wrong, until the next key says it has been read.
+    #[must_use]
+    pub fn trouble(&self) -> Option<&str> {
+        self.session.last_error.as_deref()
+    }
+
     pub fn handle(&mut self, key: KeyEvent) {
+        // Cleared before the key is acted on, not after: an action that fails
+        // again puts its message straight back, and one that succeeds leaves
+        // the line to whatever comes next. Anything else would have a stale
+        // complaint outlive the thing complained about.
+        self.session.last_error = None;
+
         // Ctrl+C is the one key a terminal program may not redefine, whatever
         // else is on screen.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {

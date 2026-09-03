@@ -12,6 +12,8 @@ use ratatui::Frame;
 
 use sim_core::frame::codec;
 use sim_core::frame::value::seed_values;
+use sim_core::frame::value::Value;
+use sim_core::frame::{FieldDef, FieldKind};
 use sim_session::kinds;
 use sim_session::reading;
 use sim_session::scenarios;
@@ -27,15 +29,25 @@ const RECEIVED: Color = Color::Rgb(40, 160, 90);
 const ERROR: Color = Color::Rgb(200, 60, 60);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [bar, body, hints] = Layout::vertical([
+    // The trouble line only exists while there is trouble, so a working bench
+    // gives the whole screen to what it is watching.
+    let complaint = u16::from(app.trouble().is_some());
+    let [bar, body, said, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
+        Constraint::Length(complaint),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
     tab_bar(frame, bar, app);
     view(frame, body, app);
+    if let Some(trouble) = app.trouble() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::raw(trouble.to_owned()).fg(ERROR))),
+            said,
+        );
+    }
     hint_line(frame, hints, app);
 
     match app.overlay() {
@@ -202,25 +214,25 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
         .max()
         .unwrap_or(0);
 
-    let mut lines: Vec<Line> = chosen
-        .fields
-        .iter()
-        .map(|field| {
-            let said = values.get(&field.name).map_or_else(String::new, |value| {
-                reading::describe(field, value, app.session().hex_values)
-            });
-            Line::from(vec![
-                Span::styled(
-                    format!("{:widest$}", field.name),
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::raw(kinds::label_of(&field.kind)).dim(),
-                Span::raw("  "),
-                Span::raw(said),
-            ])
-        })
-        .collect();
+    let hex_values = app.session().hex_values;
+    let mut lines: Vec<Line> = Vec::new();
+    for field in &chosen.fields {
+        let held = values.get(&field.name);
+        let said = held.map_or_else(String::new, |value| {
+            reading::describe(field, value, hex_values)
+        });
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:widest$}", field.name),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::raw(kinds::label_of(&field.kind)).dim(),
+            Span::raw("  "),
+            Span::raw(said),
+        ]));
+        lines.extend(bit_rows(field, held, hex_values));
+    }
 
     lines.push(Line::from(""));
     // What would go out, which is the answer the fields above are working
@@ -383,8 +395,11 @@ fn watch(frame: &mut Frame, area: Rect, app: &mut App) {
     let (list, pane) = match &fields {
         Some(lines) => {
             // Never more than half the screen: the list is what tells you which
-            // row you are on.
-            let wanted = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+            // row you are on, and a definition with twenty fields would
+            // otherwise leave one row of it.
+            let wanted = u16::try_from(lines.len() + 2)
+                .unwrap_or(u16::MAX)
+                .min(area.height / 2);
             let [list, pane] =
                 Layout::vertical([Constraint::Min(3), Constraint::Length(wanted)]).areas(area);
             (list, Some(pane))
@@ -400,6 +415,42 @@ fn watch(frame: &mut Frame, area: Rect, app: &mut App) {
             pane,
         );
     }
+}
+
+/// One row per sub-field, under the word holding them.
+///
+/// The packed word reads as nothing on its own, which is why `describe` leaves
+/// it blank: what a bitfield says is in its flags. A set flag stands out of a
+/// column of clear ones, so a fault is what the eye lands on.
+fn bit_rows(field: &FieldDef, value: Option<&Value>, hex: bool) -> Vec<Line<'static>> {
+    let FieldKind::Bits { repr, bits } = &field.kind else {
+        return Vec::new();
+    };
+    let Some(Value::Bits(set)) = value else {
+        return Vec::new();
+    };
+
+    let widest = bits.iter().map(|bit| bit.name.len()).max().unwrap_or(0);
+
+    bits.iter()
+        .zip(kinds::bit_positions(*repr, bits))
+        .map(|(bit, position)| {
+            let held = set.get(&bit.name).copied().unwrap_or_default();
+            let said = reading::unsigned(held, (bit.width.div_ceil(4)) as usize, hex);
+            let tint = if held == 0 {
+                Style::new().add_modifier(Modifier::DIM)
+            } else {
+                Style::new().add_modifier(Modifier::BOLD)
+            };
+            Line::from(vec![
+                Span::raw(format!("  {:widest$}", bit.name)).dim(),
+                Span::raw("  "),
+                Span::raw(position.unwrap_or_default()).dim(),
+                Span::raw("  "),
+                Span::styled(said, tint),
+            ])
+        })
+        .collect()
 }
 
 /// The selected row read field by field, or the reason there is nothing to
@@ -446,6 +497,7 @@ fn field_lines(app: &mut App) -> Option<Vec<Line<'static>>> {
             Span::raw("  "),
             Span::raw(said),
         ]));
+        lines.extend(bit_rows(field, decoded.values.get(&field.name), hex));
     }
     Some(lines)
 }
@@ -481,7 +533,8 @@ fn rows_view(frame: &mut Frame, area: Rect, app: &App) {
         None => rows.len().saturating_sub(room),
     };
 
-    let lines: Vec<Line> = rows[first..]
+    let last = (first + room).min(rows.len());
+    let lines: Vec<Line> = rows[first..last]
         .iter()
         .enumerate()
         .map(|(offset, entry)| {

@@ -704,3 +704,147 @@ fn a_frame_shows_the_bytes_it_would_send() {
     // frame encodes to.
     assert!(shown.contains("00 00 00 00 00"), "{shown}");
 }
+
+const FLAGS: &str = r#"
+name = "Flags"
+endian = "big"
+
+[[field]]
+name = "state"
+type = "bits"
+repr = "u8"
+bits = [
+  { name = "armed",   width = 1 },
+  { name = "link_up", width = 1 },
+  { name = "fault",   width = 1 },
+  { name = "spare",   width = 5 },
+]
+"#;
+
+fn with_bits(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-bits-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("flags.toml"), FLAGS).expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+}
+
+/// A bench that cannot say what went wrong is a bench you debug from the logs.
+#[test]
+fn what_went_wrong_is_on_screen() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    for letter in "AA".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        screen(&mut app).contains("No link to send on"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+/// And it gives way once it has been read, rather than outliving the thing it
+/// complained about.
+#[test]
+fn a_complaint_lasts_until_the_next_key() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('A'));
+    press(&mut app, KeyCode::Char('A'));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.trouble().is_some());
+
+    press(&mut app, KeyCode::Char('1'));
+    assert!(app.trouble().is_none());
+}
+
+/// The packed word says nothing on its own. What a bitfield says is in its
+/// flags.
+#[test]
+fn a_bitfield_shows_each_of_its_flags() {
+    let mut app = App::default();
+    with_bits(&mut app, "a_bitfield_shows_each_of_its_flags");
+    captured(&mut app, &[0b1010_0000], Duration::from_secs(1));
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("armed"), "{shown}");
+    assert!(shown.contains("link_up"), "{shown}");
+    assert!(shown.contains("fault"), "{shown}");
+    assert!(
+        shown.contains("4:0"),
+        "each flag says where it sits: {shown}"
+    );
+    assert!(shown.contains("armed"), "and a set one stands out: {shown}");
+}
+
+#[test]
+fn a_bitfield_shows_its_flags_in_the_frames_view_too() {
+    let mut app = App::default();
+    with_bits(
+        &mut app,
+        "a_bitfield_shows_its_flags_in_the_frames_view_too",
+    );
+
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("armed"), "{shown}");
+    assert!(shown.contains("fault"), "{shown}");
+}
+
+/// The list is what tells you which row you are on, so it keeps its half.
+#[test]
+fn a_long_definition_does_not_squeeze_the_list_away() {
+    let mut app = App::default();
+    let dir = std::env::temp_dir().join(format!("sim-tui-wide-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    let fields = (0..20).fold(String::new(), |mut out, n| {
+        use std::fmt::Write as _;
+        let _ = write!(out, "\n[[field]]\nname = \"f{n}\"\ntype = \"u8\"\n");
+        out
+    });
+    std::fs::write(
+        dir.join("wide.toml"),
+        format!("name = \"Wide\"\nendian = \"big\"\n{fields}"),
+    )
+    .expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+
+    for n in 0..30u8 {
+        captured(&mut app, &[n; 20], Duration::from_millis(u64::from(n)));
+    }
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+
+    let shown = screen(&mut app);
+    let rows = shown.lines().filter(|line| line.contains(" RX ")).count();
+    assert!(
+        rows >= 8,
+        "the list keeps its half, got {rows} rows:\n{shown}"
+    );
+}
+
+/// The map is what you open to learn the keys the view answers to.
+#[test]
+fn the_key_map_lists_the_keys_of_the_view_behind_it() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('?'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("read a row"), "{shown}");
+    assert!(
+        shown.contains("follow"),
+        "the key nothing else documents: {shown}"
+    );
+}
