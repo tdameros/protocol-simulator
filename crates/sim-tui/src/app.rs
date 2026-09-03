@@ -295,6 +295,21 @@ impl App {
     /// nobody presses.
     #[must_use]
     pub fn view_keys(&self) -> &'static [(&'static str, &'static str)] {
+        // An overlay has the keyboard, so it is its keys that are worth the
+        // room: the view behind it answers to nothing while it is up.
+        match self.overlay {
+            Some(Overlay::Pick(_)) => {
+                return &[
+                    ("up/down", "choose"),
+                    ("type", "narrow"),
+                    ("Enter", "take it"),
+                    ("Esc", "back"),
+                ]
+            }
+            Some(Overlay::Keys) => return &[],
+            None => {}
+        }
+
         match self.tab {
             Tab::Traffic => &[
                 ("up/down", "read a row"),

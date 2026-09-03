@@ -490,3 +490,24 @@ fn a_choice_survives_the_next_row_of_the_same_shape() {
     assert!(!shown.contains("Pick the frame"), "{shown}");
     assert!(shown.contains("RUNNING"), "{shown}");
 }
+
+/// Whatever has the keyboard says what it answers to.
+#[test]
+fn the_hints_follow_the_list_that_is_open() {
+    let mut app = App::default();
+    with_frames(&mut app, "the_hints_follow_the_list_that_is_open");
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x02, 0x05, 0xDC],
+        Duration::from_secs(1),
+    );
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    let last = shown.lines().last().expect("a hint line").to_owned();
+    assert!(last.contains("narrow"), "{last}");
+    assert!(!last.contains("read a row"), "{last}");
+}
