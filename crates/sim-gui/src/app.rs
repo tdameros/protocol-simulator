@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use sim_core::Event;
-
 use egui::{Color32, Context, CornerRadius, Modal, Theme, ViewportCommand};
 use egui_dock::{DockArea, DockState, Style};
 use egui_phosphor::regular as icons;
@@ -13,7 +11,7 @@ use crate::project;
 use crate::theme;
 use sim_session::engine_handle::EngineHandle;
 use sim_session::project::{Project, DEFAULT_FILE_NAME};
-use sim_session::state::{Direction, LogEntry, Session};
+use sim_session::state::Session;
 
 const APP_NAME: &str = "Protocol Simulator";
 
@@ -222,73 +220,6 @@ impl SimApp {
             self.pending = Some(action);
         } else {
             self.go_ahead(ctx, action);
-        }
-    }
-
-    fn apply_events(&mut self) {
-        // Said once per pass rather than at each of the ten places a command is
-        // given: a refused Send is a frame that never went out, and silence
-        // there reads as a test that passed.
-        let dropped = self.engine.take_dropped();
-        if dropped > 0 {
-            self.state.last_error = Some(format!(
-                "the engine is too busy: {dropped} command(s) were not carried out"
-            ));
-        }
-
-        for event in self.engine.drain_events() {
-            match event {
-                Event::ConnectionStatus { id, status } => {
-                    if let Some(entry) = self.state.connection_mut(&id) {
-                        entry.status = status;
-                    }
-                }
-                Event::FrameSent {
-                    id,
-                    bytes,
-                    timestamp,
-                } => {
-                    self.state.push_log(LogEntry {
-                        seq: 0,
-                        id,
-                        direction: Direction::Sent,
-                        bytes,
-                        source: None,
-                        timestamp,
-                    });
-                }
-                Event::FrameReceived {
-                    id,
-                    bytes,
-                    source,
-                    timestamp,
-                } => {
-                    self.state.push_log(LogEntry {
-                        seq: 0,
-                        id,
-                        direction: Direction::Received,
-                        bytes,
-                        source,
-                        timestamp,
-                    });
-                }
-                Event::Error { id, error } => {
-                    self.state.record_error(id, &error);
-                }
-                Event::ScenarioStep { name, step, pass } => {
-                    self.state
-                        .running
-                        .insert(name, sim_session::state::ScenarioRun { step, pass });
-                }
-                Event::ScenarioFinished { name, outcome } => {
-                    self.state.running.remove(&name);
-                    // A scenario that gave up says why, where a scenario that
-                    // simply ran out has nothing to report.
-                    if let sim_core::Outcome::Failed(reason) = outcome {
-                        self.state.last_error = Some(format!("[{name}] {reason}"));
-                    }
-                }
-            }
         }
     }
 
@@ -520,7 +451,7 @@ impl eframe::App for SimApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::sync_row_height(ui);
-        self.apply_events();
+        self.engine.drain_into(&mut self.state);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
         let dirty = self.is_dirty(ctx.theme());

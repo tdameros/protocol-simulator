@@ -1,6 +1,7 @@
+use crate::state::{Direction, LogEntry, ScenarioRun, Session};
 use sim_core::frame::FrameDef;
 use sim_core::scenario::Scenario;
-use sim_core::{Command, ConnectionId, Engine, Event, RetryPolicy, TransportConfig};
+use sim_core::{Command, ConnectionId, Engine, Event, Outcome, RetryPolicy, TransportConfig};
 
 use std::cell::Cell;
 
@@ -72,6 +73,75 @@ impl EngineHandle {
     fn send(&self, command: Command) {
         if self.command_tx.try_send(command).is_err() {
             self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+
+    /// Takes everything the engine has said since the last look.
+    ///
+    /// Both front ends want the same answer to the same event, so the
+    /// reading of one lives here rather than beside a window.
+    pub fn drain_into(&mut self, session: &mut Session) {
+        // Said once per pass rather than at each of the ten places a command is
+        // given: a refused Send is a frame that never went out, and silence
+        // there reads as a test that passed.
+        let dropped = self.take_dropped();
+        if dropped > 0 {
+            session.last_error = Some(format!(
+                "the engine is too busy: {dropped} command(s) were not carried out"
+            ));
+        }
+
+        for event in self.drain_events() {
+            match event {
+                Event::ConnectionStatus { id, status } => {
+                    if let Some(entry) = session.connection_mut(&id) {
+                        entry.status = status;
+                    }
+                }
+                Event::FrameSent {
+                    id,
+                    bytes,
+                    timestamp,
+                } => {
+                    session.push_log(LogEntry {
+                        seq: 0,
+                        id,
+                        direction: Direction::Sent,
+                        bytes,
+                        source: None,
+                        timestamp,
+                    });
+                }
+                Event::FrameReceived {
+                    id,
+                    bytes,
+                    source,
+                    timestamp,
+                } => {
+                    session.push_log(LogEntry {
+                        seq: 0,
+                        id,
+                        direction: Direction::Received,
+                        bytes,
+                        source,
+                        timestamp,
+                    });
+                }
+                Event::Error { id, error } => {
+                    session.record_error(id, &error);
+                }
+                Event::ScenarioStep { name, step, pass } => {
+                    session.running.insert(name, ScenarioRun { step, pass });
+                }
+                Event::ScenarioFinished { name, outcome } => {
+                    session.running.remove(&name);
+                    // A scenario that gave up says why, where a scenario that
+                    // simply ran out has nothing to report.
+                    if let Outcome::Failed(reason) = outcome {
+                        session.last_error = Some(format!("[{name}] {reason}"));
+                    }
+                }
+            }
         }
     }
 }
