@@ -2045,3 +2045,362 @@ fn a_fresh_app_with_nothing_opened_is_not_dirty() {
     let app = App::default();
     assert!(!app.is_dirty());
 }
+
+fn type_text(app: &mut App, text: &str) {
+    for letter in text.chars() {
+        press(app, KeyCode::Char(letter));
+    }
+}
+
+fn clear_field(app: &mut App) {
+    for _ in 0..40 {
+        press(app, KeyCode::Backspace);
+    }
+}
+
+#[test]
+fn new_starts_a_frame_from_scratch() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("New frame"), "{shown}");
+    assert!(shown.contains("id"), "the field it starts with: {shown}");
+}
+
+#[test]
+fn the_frame_name_can_be_edited() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Enter);
+    clear_field(&mut app);
+    type_text(&mut app, "Heartbeat");
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        screen(&mut app).contains("Heartbeat"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn a_field_can_be_added_and_removed() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a'));
+    assert!(screen(&mut app).contains("2."), "{}", screen(&mut app));
+
+    press(&mut app, KeyCode::Down); // Endian
+    press(&mut app, KeyCode::Down); // field 1
+    press(&mut app, KeyCode::Down); // field 2
+    press(&mut app, KeyCode::Char('x'));
+    assert!(!screen(&mut app).contains("2."), "{}", screen(&mut app));
+}
+
+#[test]
+fn a_field_can_be_reordered() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a')); // adds "field", cursor lands on it
+    press(&mut app, KeyCode::Char('[')); // moves it up, before "id"
+
+    let shown = screen(&mut app);
+    let id_at = shown.find("id").expect("the id field: {shown}");
+    let field_at = shown.find("field").expect("the added field: {shown}");
+    assert!(field_at < id_at, "{shown}");
+}
+
+#[test]
+fn endian_can_be_toggled() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Down); // Endian row
+
+    assert!(screen(&mut app).contains("little"), "{}", screen(&mut app));
+    press(&mut app, KeyCode::Right);
+    assert!(screen(&mut app).contains("big"), "{}", screen(&mut app));
+    press(&mut app, KeyCode::Left);
+    assert!(screen(&mut app).contains("little"), "{}", screen(&mut app));
+}
+
+#[test]
+fn cancel_discards_the_frame_draft() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.session().frames.draft.is_none());
+}
+
+#[test]
+fn edit_opens_an_existing_frame() {
+    let mut app = App::default();
+    with_frames(&mut app, "edit_opens_an_existing_frame");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('e'));
+
+    assert!(
+        screen(&mut app).contains("Heartbeat"),
+        "the first frame alphabetically, selected by default: {}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn delete_removes_a_frame_from_disk() {
+    let mut app = App::default();
+    with_frames(&mut app, "delete_removes_a_frame_from_disk");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('d'));
+
+    assert!(!app
+        .session()
+        .frames
+        .entries
+        .iter()
+        .any(|entry| entry.frame.name == "Heartbeat"));
+}
+
+/// Opens a fresh frame draft and moves the cursor onto its one field.
+fn on_the_one_field(app: &mut App) {
+    press(app, KeyCode::Char('4'));
+    press(app, KeyCode::Char('n'));
+    press(app, KeyCode::Down); // Endian
+    press(app, KeyCode::Down); // the field
+}
+
+#[test]
+fn a_field_opens_its_own_editor() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Kind"), "{shown}");
+    assert!(shown.contains("u8"), "{shown}");
+}
+
+#[test]
+fn the_field_name_can_be_edited() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Enter); // Name row's own editor
+    clear_field(&mut app);
+    type_text(&mut app, "sequence");
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        screen(&mut app).contains("sequence"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn cycling_the_kind_changes_what_the_editor_asks_for() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+
+    // u8 -> u16 -> ... eventually reaches bytes.
+    for _ in 0..12 {
+        press(&mut app, KeyCode::Right);
+        if screen(&mut app).contains("Length") {
+            break;
+        }
+    }
+    assert!(screen(&mut app).contains("Length"), "{}", screen(&mut app));
+}
+
+fn cycle_kind_to(app: &mut App, label: &str) {
+    for _ in 0..40 {
+        if screen(app).contains(label) {
+            return;
+        }
+        press(app, KeyCode::Right);
+    }
+    panic!("never reached {label}: {}", screen(app));
+}
+
+#[test]
+fn a_bytes_field_length_can_be_edited() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "bytes");
+
+    press(&mut app, KeyCode::Down); // Length row
+    press(&mut app, KeyCode::Enter);
+    clear_field(&mut app);
+    type_text(&mut app, "6");
+    press(&mut app, KeyCode::Enter);
+
+    assert!(screen(&mut app).contains('6'), "{}", screen(&mut app));
+}
+
+#[test]
+fn an_enum_variant_can_be_added_edited_and_removed() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "enum");
+
+    press(&mut app, KeyCode::Down); // Repr
+    press(&mut app, KeyCode::Down); // Variant 0
+    press(&mut app, KeyCode::Char('a'));
+    assert!(
+        screen(&mut app).contains("Variant 1"),
+        "{}",
+        screen(&mut app)
+    );
+
+    press(&mut app, KeyCode::Enter);
+    clear_field(&mut app);
+    type_text(&mut app, "ON = 1");
+    press(&mut app, KeyCode::Enter);
+    assert!(screen(&mut app).contains("ON = 1"), "{}", screen(&mut app));
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(
+        !screen(&mut app).contains("Variant 1"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn the_last_enum_variant_cannot_be_removed() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "enum");
+    press(&mut app, KeyCode::Down); // Repr
+    press(&mut app, KeyCode::Down); // Variant 0
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(
+        screen(&mut app).contains("Variant 0"),
+        "the only variant stays: {}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn a_bit_can_be_added_edited_and_removed() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "bits");
+
+    press(&mut app, KeyCode::Down); // Repr
+    press(&mut app, KeyCode::Down); // Bit 0
+    press(&mut app, KeyCode::Char('a'));
+    assert!(screen(&mut app).contains("Bit 1"), "{}", screen(&mut app));
+
+    press(&mut app, KeyCode::Enter);
+    clear_field(&mut app);
+    type_text(&mut app, "ready 2");
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        screen(&mut app).contains("ready (2)"),
+        "{}",
+        screen(&mut app)
+    );
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(!screen(&mut app).contains("Bit 1"), "{}", screen(&mut app));
+}
+
+#[test]
+fn the_last_bit_cannot_be_removed() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "bits");
+    press(&mut app, KeyCode::Down); // Repr
+    press(&mut app, KeyCode::Down); // Bit 0
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(
+        screen(&mut app).contains("Bit 0"),
+        "the only bit stays: {}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn a_checksum_covers_from_and_to_can_be_cycled() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a')); // a second field
+    press(&mut app, KeyCode::Down); // Endian
+    press(&mut app, KeyCode::Down); // id
+    press(&mut app, KeyCode::Down); // field
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "xor8");
+
+    press(&mut app, KeyCode::Down); // Covers from
+    let before = screen(&mut app);
+    press(&mut app, KeyCode::Right);
+    let after = screen(&mut app);
+    assert_ne!(before, after, "cycling covers-from changes what is shown");
+}
+
+#[test]
+fn a_checksum_field_starts_with_no_length_row() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Down); // Endian
+    press(&mut app, KeyCode::Down); // id
+    press(&mut app, KeyCode::Down); // field
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "xor8");
+
+    assert!(!screen(&mut app).contains("Length"), "{}", screen(&mut app));
+}
+
+#[test]
+fn escape_closes_the_frame_field_editor() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay().is_some());
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay().is_none());
+}
+
+#[test]
+fn saving_the_frame_writes_it_to_disk_and_closes_the_draft() {
+    let mut app = App::default();
+    let dir = std::env::temp_dir().join(format!("sim-tui-frame-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    app.session_mut().frames.load_from(dir.clone());
+
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('s'));
+
+    assert!(app.session().frames.draft.is_none());
+    let written = std::fs::read_dir(&dir).expect("the scratch folder").count();
+    assert_eq!(written, 1, "the new frame's own file");
+}

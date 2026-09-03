@@ -60,6 +60,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(Overlay::NewConnection(form)) => connection_form_over(frame, frame.area(), form),
         Some(Overlay::Filter(edit)) => filter_editor_over(frame, frame.area(), edit, app),
         Some(Overlay::Step(edit)) => step_editor_over(frame, frame.area(), edit, app),
+        Some(Overlay::FrameField(edit)) => frame_field_editor_over(frame, frame.area(), edit, app),
         None => {}
     }
 }
@@ -297,6 +298,10 @@ fn step_editor_over(frame: &mut Frame, area: Rect, edit: &crate::app::StepEdit, 
 }
 
 fn frames_view(frame: &mut Frame, area: Rect, app: &App) {
+    if app.session().frames.draft.is_some() {
+        frame_editor_view(frame, area, app);
+        return;
+    }
     let library = &app.session().frames;
     let block = Block::bordered().title(format!(" Frames ({}) ", library.entries.len()));
 
@@ -341,6 +346,106 @@ fn frames_view(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(lines).block(block), list);
     frame_detail(frame, detail, app);
+}
+
+/// The header and the fields of the frame being built, as one navigable
+/// list.
+fn frame_editor_view(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(draft) = &app.session().frames.draft else {
+        return;
+    };
+    let definition = &draft.frame;
+    let rows = crate::app::frame_rows(definition);
+    let cursor = app.frame_row();
+
+    let widest = 8; // "Endian" plus room, the widest label in the header.
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(at, row)| {
+            let (label, value) = match row {
+                crate::app::FrameRow::Name => ("Name".to_owned(), definition.name.clone()),
+                crate::app::FrameRow::Endian => (
+                    "Endian".to_owned(),
+                    format!("{:?}", definition.endian).to_lowercase(),
+                ),
+                crate::app::FrameRow::Field(index) => {
+                    let field = &definition.fields[*index];
+                    (
+                        format!("{}.", index + 1),
+                        format!("{}  {}", field.name, kinds::label_of(&field.kind)),
+                    )
+                }
+            };
+            let line = Line::from(vec![
+                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(value),
+            ]);
+            if cursor == Some(at) {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    let invalid = if draft.problem(app.session().frames.types()).is_some() {
+        " · invalid"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(format!(" {}{invalid} ", definition.name))),
+        area,
+    );
+}
+
+/// The field under the cursor, opened for its own editor.
+fn frame_field_editor_over(
+    frame: &mut Frame,
+    area: Rect,
+    edit: &crate::app::FrameFieldEdit,
+    app: &App,
+) {
+    let Some(draft) = &app.session().frames.draft else {
+        return;
+    };
+    let Some(field) = draft.frame.fields.get(edit.field_index()) else {
+        return;
+    };
+
+    let lines = edit.lines(field, &draft.frame);
+    let widest = lines
+        .iter()
+        .map(|(label, _, _)| label.len())
+        .max()
+        .unwrap_or(0);
+
+    let rendered: Vec<Line> = lines
+        .into_iter()
+        .map(|(label, value, focused)| {
+            let line = Line::from(vec![
+                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(value),
+            ]);
+            if focused {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    let wanted = rendered.iter().map(Line::width).max().unwrap_or(0) + 4;
+    let popup = centred(area, wanted, rendered.len() + 4);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(rendered).block(Block::bordered().title(format!(" {} ", field.name))),
+        popup,
+    );
 }
 
 /// The chosen definition, its values, and the bytes they encode to.

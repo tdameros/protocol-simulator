@@ -8,13 +8,14 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use sim_core::frame::{codec, FieldKind, FrameDef};
+use sim_core::frame::{codec, FieldDef, FieldKind, FrameDef};
 use sim_core::scenario::{Action, Expect, Scenario, Step};
 use sim_core::{ConnectionStatus, RetryPolicy};
 
 use crate::connection_form::ConnectionForm;
 use sim_session::engine_handle::EngineHandle;
 use sim_session::hex;
+use sim_session::kinds;
 use sim_session::project::Project;
 use sim_session::reading::{self, Reading};
 use sim_session::scenarios::{self, ActionKind};
@@ -133,6 +134,19 @@ enum EditTarget {
     RepeatTimes,
     /// The folder to save into, chosen; the name is what is typed here.
     SaveFileName(PathBuf),
+    FrameName,
+    FrameFieldName(usize),
+    FrameFieldLength(usize),
+    /// `NAME = VALUE`, typed as one line.
+    FrameVariant {
+        field: usize,
+        variant: usize,
+    },
+    /// `NAME WIDTH`, typed as one line.
+    FrameBit {
+        field: usize,
+        bit: usize,
+    },
 }
 
 pub enum Overlay {
@@ -147,6 +161,8 @@ pub enum Overlay {
     Filter(FilterEdit),
     /// One scenario step, opened for its own editor.
     Step(StepEdit),
+    /// One frame field, opened for its own editor.
+    FrameField(FrameFieldEdit),
     /// A file to be found on this machine.
     Browse(Browser),
     /// A connection being described before it exists.
@@ -433,6 +449,160 @@ fn edit_digits(code: KeyCode, text: &mut String) {
 }
 
 /// One row of the scenario editor: the header, or a step.
+/// One row of the frame editor: the header, or a field.
+pub(crate) enum FrameRow {
+    Name,
+    Endian,
+    Field(usize),
+}
+
+pub(crate) fn frame_rows(frame: &FrameDef) -> Vec<FrameRow> {
+    let mut rows = vec![FrameRow::Name, FrameRow::Endian];
+    rows.extend((0..frame.fields.len()).map(FrameRow::Field));
+    rows
+}
+
+/// One field, opened for its own editor.
+pub struct FrameFieldEdit {
+    field: usize,
+    focus: usize,
+}
+
+/// One field of the field editor: what it is, and how a key changes it.
+#[derive(PartialEq, Eq)]
+enum FrameFieldRow {
+    Name,
+    Kind,
+    Length,
+    Repr,
+    Variant(usize),
+    Bit(usize),
+    CoversFrom,
+    CoversTo,
+}
+
+impl FrameFieldEdit {
+    fn opening(field: usize) -> Self {
+        Self { field, focus: 0 }
+    }
+
+    #[must_use]
+    pub fn field_index(&self) -> usize {
+        self.field
+    }
+
+    #[must_use]
+    fn focus(&self) -> usize {
+        self.focus
+    }
+
+    fn fields(field: &FieldDef) -> Vec<FrameFieldRow> {
+        let mut fields = vec![FrameFieldRow::Name, FrameFieldRow::Kind];
+        match &field.kind {
+            FieldKind::Bytes { .. } | FieldKind::Text { .. } => fields.push(FrameFieldRow::Length),
+            FieldKind::Enum { variants, .. } => {
+                fields.push(FrameFieldRow::Repr);
+                fields.extend((0..variants.len()).map(FrameFieldRow::Variant));
+            }
+            FieldKind::Bits { bits, .. } => {
+                fields.push(FrameFieldRow::Repr);
+                fields.extend((0..bits.len()).map(FrameFieldRow::Bit));
+            }
+            FieldKind::Checksum { .. } => {
+                fields.push(FrameFieldRow::CoversFrom);
+                fields.push(FrameFieldRow::CoversTo);
+            }
+            FieldKind::Scalar(_) => {}
+        }
+        fields
+    }
+
+    #[must_use]
+    pub fn lines(&self, field: &FieldDef, frame: &FrameDef) -> Vec<(String, String, bool)> {
+        let rows = Self::fields(field);
+        let focus = self.focus.min(rows.len().saturating_sub(1));
+        rows.iter()
+            .enumerate()
+            .map(|(at, row)| {
+                let (label, value) = Self::render(row, field, frame);
+                (label, value, at == focus)
+            })
+            .collect()
+    }
+
+    fn render(row: &FrameFieldRow, field: &FieldDef, frame: &FrameDef) -> (String, String) {
+        match row {
+            FrameFieldRow::Name => ("Name".to_owned(), field.name.clone()),
+            FrameFieldRow::Kind => ("Kind".to_owned(), kinds::label_of(&field.kind)),
+            FrameFieldRow::Length => {
+                let len = match &field.kind {
+                    FieldKind::Bytes { len } | FieldKind::Text { len } => *len,
+                    _ => 0,
+                };
+                ("Length".to_owned(), len.to_string())
+            }
+            FrameFieldRow::Repr => {
+                let repr = match &field.kind {
+                    FieldKind::Enum { repr, .. } | FieldKind::Bits { repr, .. } => Some(*repr),
+                    _ => None,
+                };
+                (
+                    "Repr".to_owned(),
+                    repr.map_or_else(String::new, |repr| repr.name().to_owned()),
+                )
+            }
+            FrameFieldRow::Variant(i) => {
+                let FieldKind::Enum { variants, .. } = &field.kind else {
+                    return (String::new(), String::new());
+                };
+                let Some(variant) = variants.get(*i) else {
+                    return (String::new(), String::new());
+                };
+                (
+                    format!("  Variant {i}"),
+                    format!("{} = {}", variant.name, variant.value),
+                )
+            }
+            FrameFieldRow::Bit(i) => {
+                let FieldKind::Bits { bits, .. } = &field.kind else {
+                    return (String::new(), String::new());
+                };
+                let Some(bit) = bits.get(*i) else {
+                    return (String::new(), String::new());
+                };
+                (
+                    format!("  Bit {i}"),
+                    format!("{} ({})", bit.name, bit.width),
+                )
+            }
+            FrameFieldRow::CoversFrom => {
+                let FieldKind::Checksum { covers, .. } = &field.kind else {
+                    return (String::new(), String::new());
+                };
+                (
+                    "Covers from".to_owned(),
+                    frame
+                        .fields
+                        .get(covers.from)
+                        .map_or_else(String::new, |f| f.name.clone()),
+                )
+            }
+            FrameFieldRow::CoversTo => {
+                let FieldKind::Checksum { covers, .. } = &field.kind else {
+                    return (String::new(), String::new());
+                };
+                (
+                    "Covers to".to_owned(),
+                    frame
+                        .fields
+                        .get(covers.to)
+                        .map_or_else(String::new, |f| f.name.clone()),
+                )
+            }
+        }
+    }
+}
+
 pub(crate) enum ScenarioRow {
     Name,
     Description,
@@ -1145,6 +1315,9 @@ pub struct App {
     /// The row under the cursor in the scenario editor's header and step
     /// list, while a draft is open.
     scenario_row: Option<usize>,
+    /// The row under the cursor in the frame editor's header and field list,
+    /// while a draft is open.
+    frame_row: Option<usize>,
     /// Which pane of the Frames view a key acts on.
     frame_focus: FramesFocus,
     /// The row under the cursor in the fields pane, and the frame it belongs
@@ -1177,6 +1350,7 @@ impl Default for App {
             status: None,
             current_monitor: None,
             scenario_row: None,
+            frame_row: None,
             frame_focus: FramesFocus::Library,
             field_at: None,
         };
@@ -1336,6 +1510,12 @@ impl App {
         self.scenario_row
     }
 
+    /// The row under the cursor in the frame editor, while a draft is open.
+    #[must_use]
+    pub fn frame_row(&self) -> Option<usize> {
+        self.frame_row
+    }
+
     /// Whether a key in the Frames view acts on the frame list or the fields
     /// of the one chosen.
     #[must_use]
@@ -1472,6 +1652,75 @@ impl App {
         }
     }
 
+    /// The keys an open overlay answers to, which take the room over
+    /// whatever the view behind it would otherwise offer.
+    fn overlay_keys(&self) -> Option<&'static [(&'static str, &'static str)]> {
+        if let Some(Overlay::Pick(_, _)) = self.overlay {
+            return Some(&[
+                ("up/down", "choose"),
+                ("type", "narrow"),
+                ("Enter", "take it"),
+                ("Esc", "back"),
+            ]);
+        }
+        if let Some(Overlay::Browse(browser)) = &self.overlay {
+            return Some(if browser.mode() == BrowserMode::Save {
+                &[
+                    ("up/down", "choose"),
+                    ("s", "save here"),
+                    ("Enter", "into folder"),
+                    ("Esc", "cancel"),
+                ]
+            } else {
+                &[
+                    ("up/down", "choose"),
+                    ("type", "narrow"),
+                    ("Enter", "open"),
+                    ("Esc", "back"),
+                ]
+            });
+        }
+        if let Some(Overlay::NewConnection(_)) = self.overlay {
+            return Some(&[
+                ("Tab", "next field"),
+                ("left/right", "change"),
+                ("space", "toggle"),
+                ("Enter", "create"),
+                ("Esc", "cancel"),
+            ]);
+        }
+        if let Some(Overlay::Filter(_)) = self.overlay {
+            return Some(&[
+                ("Tab", "next field"),
+                ("left/right", "change"),
+                ("space", "toggle"),
+                ("Esc", "done"),
+            ]);
+        }
+        if let Some(Overlay::Step(_)) = self.overlay {
+            return Some(&[
+                ("Tab", "next field"),
+                ("left/right", "change"),
+                ("space", "toggle"),
+                ("type", "edit"),
+                ("Esc", "done"),
+            ]);
+        }
+        if let Some(Overlay::EditText(_)) = self.overlay {
+            return Some(&[("Enter", "apply"), ("Esc", "cancel")]);
+        }
+        if let Some(Overlay::FrameField(_)) = self.overlay {
+            return Some(&[
+                ("Tab", "next field"),
+                ("left/right", "change"),
+                ("a", "add"),
+                ("x", "remove"),
+                ("Esc", "done"),
+            ]);
+        }
+        None
+    }
+
     /// What the view on show adds to them.
     ///
     /// Offered without being asked for, since a key nobody can guess is a key
@@ -1487,59 +1736,8 @@ impl App {
         // A list has the keyboard, so its keys are the ones worth the room. The
         // key map does not: it is what you open to read the view's own keys, so
         // it falls through to them.
-        if let Some(Overlay::Pick(_, _)) = self.overlay {
-            return &[
-                ("up/down", "choose"),
-                ("type", "narrow"),
-                ("Enter", "take it"),
-                ("Esc", "back"),
-            ];
-        }
-        if let Some(Overlay::Browse(browser)) = &self.overlay {
-            return if browser.mode() == BrowserMode::Save {
-                &[
-                    ("up/down", "choose"),
-                    ("s", "save here"),
-                    ("Enter", "into folder"),
-                    ("Esc", "cancel"),
-                ]
-            } else {
-                &[
-                    ("up/down", "choose"),
-                    ("type", "narrow"),
-                    ("Enter", "open"),
-                    ("Esc", "back"),
-                ]
-            };
-        }
-        if let Some(Overlay::NewConnection(_)) = self.overlay {
-            return &[
-                ("Tab", "next field"),
-                ("left/right", "change"),
-                ("space", "toggle"),
-                ("Enter", "create"),
-                ("Esc", "cancel"),
-            ];
-        }
-        if let Some(Overlay::Filter(_)) = self.overlay {
-            return &[
-                ("Tab", "next field"),
-                ("left/right", "change"),
-                ("space", "toggle"),
-                ("Esc", "done"),
-            ];
-        }
-        if let Some(Overlay::Step(_)) = self.overlay {
-            return &[
-                ("Tab", "next field"),
-                ("left/right", "change"),
-                ("space", "toggle"),
-                ("type", "edit"),
-                ("Esc", "done"),
-            ];
-        }
-        if let Some(Overlay::EditText(_)) = self.overlay {
-            return &[("Enter", "apply"), ("Esc", "cancel")];
+        if let Some(keys) = self.overlay_keys() {
+            return keys;
         }
 
         match self.tab {
@@ -1566,6 +1764,14 @@ impl App {
                 ("e", "edit"),
             ],
             Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
+            Tab::Frames if self.session.frames.draft.is_some() => &[
+                ("up/down", "choose"),
+                ("Enter", "edit"),
+                ("a", "add field"),
+                ("x", "remove field"),
+                ("s", "save"),
+                ("Esc", "cancel"),
+            ],
             Tab::Frames if self.frame_focus == FramesFocus::Fields => &[
                 ("up/down", "choose"),
                 ("Enter", "edit"),
@@ -1668,6 +1874,10 @@ impl App {
             self.step_key(code);
             return;
         }
+        if matches!(self.overlay, Some(Overlay::FrameField(_))) {
+            self.frame_field_key(code);
+            return;
+        }
         let Some(overlay) = &mut self.overlay else {
             return;
         };
@@ -1754,7 +1964,7 @@ impl App {
             // Handled apart, before this match: it changes the model as it
             // goes, which reads awkwardly from inside a match already holding
             // the overlay itself borrowed.
-            Overlay::Filter(_) | Overlay::Step(_) => {}
+            Overlay::Filter(_) | Overlay::Step(_) | Overlay::FrameField(_) => {}
         }
     }
 
@@ -1925,7 +2135,27 @@ impl App {
 
     /// The keys the Frames view answers to, and whether it took this one.
     fn framing(&mut self, code: KeyCode) -> bool {
+        if self.session.frames.draft.is_some() {
+            return self.editing_frame(code);
+        }
         match code {
+            KeyCode::Char('n') => {
+                let name = self.session.frames.unused_frame_name("New frame");
+                self.session
+                    .frames
+                    .begin_new(sim_session::frames::blank_frame(&name));
+                self.frame_row = Some(0);
+            }
+            KeyCode::Char('e') => {
+                self.session.frames.begin_edit();
+                self.frame_row = Some(0);
+            }
+            KeyCode::Char('d') => {
+                if let Err(error) = self.session.frames.delete_selected() {
+                    self.session.last_error = Some(format!("{error:#}"));
+                }
+            }
+            KeyCode::Char('r') => self.session.frames.reload(),
             KeyCode::Left => self.frame_focus = FramesFocus::Library,
             KeyCode::Right if self.session.frames.selected_frame().is_some() => {
                 self.frame_focus = FramesFocus::Fields;
@@ -1946,6 +2176,431 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// The keys the frame structure editor answers to while a draft is open.
+    fn editing_frame(&mut self, code: KeyCode) -> bool {
+        if matches!(self.overlay, Some(Overlay::FrameField(_))) {
+            self.frame_field_key(code);
+            return true;
+        }
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.move_frame_row(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_frame_row(-1),
+            KeyCode::Enter => self.enter_frame_row(),
+            KeyCode::Left => self.cycle_frame_row(-1),
+            KeyCode::Right => self.cycle_frame_row(1),
+            KeyCode::Char('a') => self.add_frame_field(),
+            KeyCode::Char('x') => self.remove_frame_field(),
+            KeyCode::Char('[') => self.move_frame_field(false),
+            KeyCode::Char(']') => self.move_frame_field(true),
+            KeyCode::Char('s') => sim_session::frames::save_draft(&mut self.session),
+            KeyCode::Esc => self.session.frames.cancel_edit(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn frame_row_count(&self) -> usize {
+        self.session
+            .frames
+            .draft
+            .as_ref()
+            .map_or(0, |draft| frame_rows(&draft.frame).len())
+    }
+
+    fn move_frame_row(&mut self, delta: isize) {
+        self.frame_row = moved(self.frame_row, delta, self.frame_row_count());
+    }
+
+    fn enter_frame_row(&mut self) {
+        let Some(draft) = &self.session.frames.draft else {
+            return;
+        };
+        let rows = frame_rows(&draft.frame);
+        let Some(row) = self.frame_row.and_then(|at| rows.get(at)) else {
+            return;
+        };
+        match row {
+            FrameRow::Name => {
+                self.overlay = Some(Overlay::EditText(EditBox {
+                    title: "Name".to_owned(),
+                    text: draft.frame.name.clone(),
+                    target: EditTarget::FrameName,
+                }));
+            }
+            FrameRow::Endian => {}
+            FrameRow::Field(index) => {
+                self.overlay = Some(Overlay::FrameField(FrameFieldEdit::opening(*index)));
+            }
+        }
+    }
+
+    /// Changes the field under the cursor: the frame's byte order, when it is
+    /// the header row selected.
+    fn cycle_frame_row(&mut self, delta: isize) {
+        let Some(draft) = &self.session.frames.draft else {
+            return;
+        };
+        let rows = frame_rows(&draft.frame);
+        if !matches!(
+            self.frame_row.and_then(|at| rows.get(at)),
+            Some(FrameRow::Endian)
+        ) {
+            return;
+        }
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let next = crate::connection_form::cycle(
+            &[
+                sim_core::frame::Endianness::Big,
+                sim_core::frame::Endianness::Little,
+            ],
+            draft.frame.endian,
+            delta,
+        );
+        sim_session::layout::set_endian(&mut draft.frame, next);
+    }
+
+    fn add_frame_field(&mut self) {
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let endian = draft.frame.endian;
+        sim_session::layout::add_field(&mut draft.frame, None, kinds::blank_field(endian));
+        self.frame_row = Some(frame_rows(&draft.frame).len() - 1);
+    }
+
+    fn selected_frame_field_index(&self) -> Option<usize> {
+        let draft = self.session.frames.draft.as_ref()?;
+        let rows = frame_rows(&draft.frame);
+        match rows.get(self.frame_row?)? {
+            FrameRow::Field(index) => Some(*index),
+            _ => None,
+        }
+    }
+
+    fn remove_frame_field(&mut self) {
+        let Some(index) = self.selected_frame_field_index() else {
+            return;
+        };
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        if !sim_session::layout::may_remove(&draft.frame, index) {
+            self.session.last_error =
+                Some("Removing this field would leave a checksum covering nothing.".to_owned());
+            return;
+        }
+        sim_session::layout::remove_field(&mut draft.frame, index);
+    }
+
+    fn move_frame_field(&mut self, down: bool) {
+        let Some(index) = self.selected_frame_field_index() else {
+            return;
+        };
+        if let Some(draft) = self.session.frames.draft.as_mut() {
+            sim_session::layout::move_field(&mut draft.frame, index, down);
+        }
+        let at = self.frame_row.unwrap_or(0);
+        self.frame_row = Some(if down { at + 1 } else { at.saturating_sub(1) });
+    }
+
+    /// Applies a key to the field editor, mutating the live draft directly:
+    /// the same reasoning as [`Self::filter_key`], since the overlay and the
+    /// session are different fields of `self`.
+    fn frame_field_key(&mut self, code: KeyCode) {
+        let Some(Overlay::FrameField(edit)) = &self.overlay else {
+            return;
+        };
+        let field_index = edit.field_index();
+        let mut focus = edit.focus();
+
+        let Some(draft) = self.session.frames.draft.as_ref() else {
+            self.overlay = None;
+            return;
+        };
+        let Some(field) = draft.frame.fields.get(field_index).cloned() else {
+            self.overlay = None;
+            return;
+        };
+        let held = FrameFieldEdit::fields(&field).len().max(1);
+
+        let mut close = false;
+        match code {
+            KeyCode::Esc => close = true,
+            KeyCode::Tab | KeyCode::Down => focus = (focus + 1) % held,
+            KeyCode::BackTab | KeyCode::Up => focus = (focus + held - 1) % held,
+            _ => self.act_on_frame_field(field_index, focus, code),
+        }
+
+        if close {
+            self.overlay = None;
+        } else if matches!(self.overlay, Some(Overlay::FrameField(_))) {
+            // Left as it was unless the action above opened its own overlay
+            // (a rename or a variant/bit box), which must not be clobbered.
+            self.overlay = Some(Overlay::FrameField(FrameFieldEdit {
+                field: field_index,
+                focus,
+            }));
+        }
+    }
+
+    fn act_on_frame_field(&mut self, field_index: usize, focus: usize, code: KeyCode) {
+        let Some(draft) = self.session.frames.draft.as_ref() else {
+            return;
+        };
+        let Some(field) = draft.frame.fields.get(field_index).cloned() else {
+            return;
+        };
+        let rows = FrameFieldEdit::fields(&field);
+        let Some(row) = rows.get(focus.min(rows.len().saturating_sub(1))) else {
+            return;
+        };
+
+        match row {
+            FrameFieldRow::Name => {
+                if matches!(code, KeyCode::Enter) {
+                    self.overlay_edit_frame_field_name(field_index, &field.name);
+                }
+            }
+            FrameFieldRow::Kind => {
+                let Some(delta) = arrow_delta(code) else {
+                    return;
+                };
+                self.cycle_frame_field_kind(field_index, &field, delta);
+            }
+            FrameFieldRow::Length => {
+                if matches!(code, KeyCode::Enter) {
+                    self.overlay_edit_frame_field_length(field_index, &field.kind);
+                }
+            }
+            FrameFieldRow::Repr => {
+                let Some(delta) = arrow_delta(code) else {
+                    return;
+                };
+                self.cycle_frame_field_repr(field_index, &field.kind, delta);
+            }
+            FrameFieldRow::Variant(i) => match code {
+                KeyCode::Enter => self.overlay_edit_frame_variant(field_index, *i, &field.kind),
+                KeyCode::Char('a') => self.add_frame_variant(field_index),
+                KeyCode::Char('x') => self.remove_frame_variant(field_index, *i),
+                _ => {}
+            },
+            FrameFieldRow::Bit(i) => match code {
+                KeyCode::Enter => self.overlay_edit_frame_bit(field_index, *i, &field.kind),
+                KeyCode::Char('a') => self.add_frame_bit(field_index),
+                KeyCode::Char('x') => self.remove_frame_bit(field_index, *i),
+                _ => {}
+            },
+            FrameFieldRow::CoversFrom | FrameFieldRow::CoversTo => {
+                let Some(delta) = arrow_delta(code) else {
+                    return;
+                };
+                self.cycle_frame_coverage(
+                    field_index,
+                    matches!(row, FrameFieldRow::CoversFrom),
+                    delta,
+                );
+            }
+        }
+    }
+    fn overlay_edit_frame_field_name(&mut self, field_index: usize, current: &str) {
+        self.overlay = Some(Overlay::EditText(EditBox {
+            title: "Field name".to_owned(),
+            text: current.to_owned(),
+            target: EditTarget::FrameFieldName(field_index),
+        }));
+    }
+
+    fn overlay_edit_frame_field_length(&mut self, field_index: usize, kind: &FieldKind) {
+        let len = match kind {
+            FieldKind::Bytes { len } | FieldKind::Text { len } => *len,
+            _ => return,
+        };
+        self.overlay = Some(Overlay::EditText(EditBox {
+            title: "Length".to_owned(),
+            text: len.to_string(),
+            target: EditTarget::FrameFieldLength(field_index),
+        }));
+    }
+
+    fn overlay_edit_frame_variant(&mut self, field_index: usize, variant: usize, kind: &FieldKind) {
+        let FieldKind::Enum { variants, .. } = kind else {
+            return;
+        };
+        let Some(current) = variants.get(variant) else {
+            return;
+        };
+        self.overlay = Some(Overlay::EditText(EditBox {
+            title: "Variant: NAME = VALUE".to_owned(),
+            text: format!("{} = {}", current.name, current.value),
+            target: EditTarget::FrameVariant {
+                field: field_index,
+                variant,
+            },
+        }));
+    }
+
+    fn overlay_edit_frame_bit(&mut self, field_index: usize, bit: usize, kind: &FieldKind) {
+        let FieldKind::Bits { bits, .. } = kind else {
+            return;
+        };
+        let Some(current) = bits.get(bit) else {
+            return;
+        };
+        self.overlay = Some(Overlay::EditText(EditBox {
+            title: "Bit: NAME WIDTH".to_owned(),
+            text: format!("{} {}", current.name, current.width),
+            target: EditTarget::FrameBit {
+                field: field_index,
+                bit,
+            },
+        }));
+    }
+
+    fn cycle_frame_field_kind(&mut self, field_index: usize, field: &FieldDef, delta: isize) {
+        let labels = kinds::labels();
+        let current = kinds::label_of(&field.kind);
+        let Some(at) = labels.iter().position(|label| *label == current) else {
+            return;
+        };
+        let next = crate::connection_form::cycle(&(0..labels.len()).collect::<Vec<_>>(), at, delta);
+        let Some(draft) = self.session.frames.draft.as_ref() else {
+            return;
+        };
+        let Some(kind) = kinds::named(&labels[next], &draft.frame, field_index) else {
+            return;
+        };
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        if let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, field_index) {
+            field.kind = kind;
+        }
+    }
+
+    fn cycle_frame_field_repr(&mut self, field_index: usize, kind: &FieldKind, delta: isize) {
+        let repr = match kind {
+            FieldKind::Enum { repr, .. } | FieldKind::Bits { repr, .. } => *repr,
+            _ => return,
+        };
+        let next = crate::connection_form::cycle(&sim_core::frame::ScalarType::ALL, repr, delta);
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, field_index)
+        else {
+            return;
+        };
+        match &mut field.kind {
+            FieldKind::Enum { repr, .. } | FieldKind::Bits { repr, .. } => *repr = next,
+            _ => {}
+        }
+    }
+
+    fn add_frame_variant(&mut self, field_index: usize) {
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, field_index)
+        else {
+            return;
+        };
+        if let FieldKind::Enum { variants, .. } = &mut field.kind {
+            let next = variants.iter().map(|v| v.value).max().map_or(0, |v| v + 1);
+            variants.push(sim_core::frame::EnumVariant {
+                name: format!("VALUE{next}"),
+                value: next,
+            });
+        }
+    }
+
+    fn remove_frame_variant(&mut self, field_index: usize, variant: usize) {
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, field_index)
+        else {
+            return;
+        };
+        if let FieldKind::Enum { variants, .. } = &mut field.kind {
+            if variants.len() > 1 && variant < variants.len() {
+                variants.remove(variant);
+            }
+        }
+    }
+
+    fn add_frame_bit(&mut self, field_index: usize) {
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, field_index)
+        else {
+            return;
+        };
+        if let FieldKind::Bits { bits, .. } = &mut field.kind {
+            bits.push(sim_core::frame::BitDef {
+                name: format!("bit{}", bits.len()),
+                width: 1,
+            });
+        }
+    }
+
+    fn remove_frame_bit(&mut self, field_index: usize, bit: usize) {
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, field_index)
+        else {
+            return;
+        };
+        if let FieldKind::Bits { bits, .. } = &mut field.kind {
+            if bits.len() > 1 && bit < bits.len() {
+                bits.remove(bit);
+            }
+        }
+    }
+
+    fn cycle_frame_coverage(&mut self, field_index: usize, from_end: bool, delta: isize) {
+        let Some(draft) = self.session.frames.draft.as_ref() else {
+            return;
+        };
+        let Some(field) = draft.frame.fields.get(field_index) else {
+            return;
+        };
+        let FieldKind::Checksum { covers, .. } = &field.kind else {
+            return;
+        };
+        let names: Vec<String> = draft.frame.fields.iter().map(|f| f.name.clone()).collect();
+        if names.is_empty() {
+            return;
+        }
+        let current_at = if from_end { covers.from } else { covers.to };
+        let current_name = names.get(current_at).cloned().unwrap_or_default();
+        let indices: Vec<usize> = (0..names.len()).collect();
+        let current_index = indices
+            .iter()
+            .position(|i| names[*i] == current_name)
+            .unwrap_or(0);
+        let next_index = crate::connection_form::cycle(&indices, current_index, delta);
+        let next_name = names[next_index].clone();
+        let other_name = if from_end {
+            names.get(covers.to).cloned().unwrap_or_default()
+        } else {
+            names.get(covers.from).cloned().unwrap_or_default()
+        };
+
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let (from, to) = if from_end {
+            (next_name.as_str(), other_name.as_str())
+        } else {
+            (other_name.as_str(), next_name.as_str())
+        };
+        sim_session::layout::set_coverage(&mut draft.frame, field_index, from, to);
     }
 
     /// Offers the connections currently up, to choose which one a frame goes
@@ -2150,6 +2805,106 @@ impl App {
 
     /// Applies an edit that belongs to the scenario header rather than to a
     /// frame field. Returns whether the target was one of those.
+    /// Where a text edit nested inside the field editor should land once it
+    /// is applied: back on the same field's popup, at the row it came from,
+    /// rather than all the way out to the frame's own field list.
+    fn reopened_frame_field(&self, target: &EditTarget) -> Option<Overlay> {
+        let (field_index, focus) = match *target {
+            EditTarget::FrameFieldName(index) => (index, Some(FrameFieldRow::Name)),
+            EditTarget::FrameFieldLength(index) => (index, Some(FrameFieldRow::Length)),
+            EditTarget::FrameVariant { field, variant } => {
+                (field, Some(FrameFieldRow::Variant(variant)))
+            }
+            EditTarget::FrameBit { field, bit } => (field, Some(FrameFieldRow::Bit(bit))),
+            _ => return None,
+        };
+        let draft = self.session.frames.draft.as_ref()?;
+        let field = draft.frame.fields.get(field_index)?;
+        let rows = FrameFieldEdit::fields(field);
+        let focus = focus.and_then(|row| rows.iter().position(|held| *held == row))?;
+        Some(Overlay::FrameField(FrameFieldEdit {
+            field: field_index,
+            focus,
+        }))
+    }
+
+    /// Applies an edit that belongs to a frame definition rather than to a
+    /// value being sent. Returns whether the target was one of those.
+    fn apply_frame_edit(&mut self, target: &EditTarget, text: &str) -> bool {
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return matches!(
+                target,
+                EditTarget::FrameName
+                    | EditTarget::FrameFieldName(_)
+                    | EditTarget::FrameFieldLength(_)
+                    | EditTarget::FrameVariant { .. }
+                    | EditTarget::FrameBit { .. }
+            );
+        };
+        match target {
+            EditTarget::FrameName => text.clone_into(&mut draft.frame.name),
+            EditTarget::FrameFieldName(index) => {
+                sim_session::layout::rename_field(&mut draft.frame, *index, text.trim());
+            }
+            EditTarget::FrameFieldLength(index) => {
+                let Ok(len) = text.trim().parse::<usize>() else {
+                    return true;
+                };
+                if let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, *index)
+                {
+                    match &mut field.kind {
+                        FieldKind::Bytes { len: held } | FieldKind::Text { len: held } => {
+                            *held = len.max(1);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            EditTarget::FrameVariant { field, variant } => {
+                let Some((name, value)) = text.split_once('=') else {
+                    return true;
+                };
+                let Ok(value) = value.trim().parse::<u64>() else {
+                    return true;
+                };
+                if let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, *field)
+                {
+                    if let FieldKind::Enum { variants, .. } = &mut field.kind {
+                        if let Some(held) = variants.get_mut(*variant) {
+                            name.trim().clone_into(&mut held.name);
+                            held.value = value;
+                        }
+                    }
+                }
+            }
+            EditTarget::FrameBit { field, bit } => {
+                let Some((name, width)) = text.trim().rsplit_once(' ') else {
+                    return true;
+                };
+                let Ok(width) = width.trim().parse::<u32>() else {
+                    return true;
+                };
+                if let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, *field)
+                {
+                    if let FieldKind::Bits { bits, .. } = &mut field.kind {
+                        if let Some(held) = bits.get_mut(*bit) {
+                            name.trim().clone_into(&mut held.name);
+                            held.width = width.max(1);
+                        }
+                    }
+                }
+            }
+            EditTarget::Field(_)
+            | EditTarget::Bit { .. }
+            | EditTarget::ScenarioName
+            | EditTarget::ScenarioDescription
+            | EditTarget::RepeatEvery
+            | EditTarget::RepeatTimes
+            | EditTarget::SaveFileName(_) => return false,
+        }
+        true
+    }
+
     fn apply_scenario_edit(&mut self, target: &EditTarget, text: &str) -> bool {
         let Some(draft) = self.session.scenarios.draft.as_mut() else {
             return matches!(
@@ -2181,9 +2936,14 @@ impl App {
                     repeat.times = text.parse().ok();
                 }
             }
-            EditTarget::Field(_) | EditTarget::Bit { .. } | EditTarget::SaveFileName(_) => {
-                return false
-            }
+            EditTarget::Field(_)
+            | EditTarget::Bit { .. }
+            | EditTarget::SaveFileName(_)
+            | EditTarget::FrameName
+            | EditTarget::FrameFieldName(_)
+            | EditTarget::FrameFieldLength(_)
+            | EditTarget::FrameVariant { .. }
+            | EditTarget::FrameBit { .. } => return false,
         }
         true
     }
@@ -2208,6 +2968,11 @@ impl App {
             if !text.trim().is_empty() {
                 self.save_to(&directory.join(text.trim()));
             }
+            return;
+        }
+
+        if self.apply_frame_edit(&target, &text) {
+            self.overlay = self.reopened_frame_field(&target);
             return;
         }
 
@@ -2279,7 +3044,12 @@ impl App {
             | EditTarget::ScenarioDescription
             | EditTarget::RepeatEvery
             | EditTarget::RepeatTimes
-            | EditTarget::SaveFileName(_) => unreachable!("handled and returned above"),
+            | EditTarget::SaveFileName(_)
+            | EditTarget::FrameName
+            | EditTarget::FrameFieldName(_)
+            | EditTarget::FrameFieldLength(_)
+            | EditTarget::FrameVariant { .. }
+            | EditTarget::FrameBit { .. } => unreachable!("handled and returned above"),
         }
         self.overlay = None;
     }
