@@ -4,10 +4,13 @@
 //! one file made the part that ships hard to find.
 
 use super::*;
+use crate::kinds::bit_positions;
 use crate::layout;
 use sim_core::frame::schema::Subtype;
 use sim_core::frame::value::Value;
-use sim_core::frame::{Endianness, FieldDef, FieldKind, FieldSpan, ScalarType, Stated, ValueRange};
+use sim_core::frame::{
+    BitDef, Endianness, FieldDef, FieldKind, FieldSpan, ScalarType, Stated, ValueRange,
+};
 
 const GOOD: &str = r#"
 name = "Telemetry"
@@ -1763,4 +1766,144 @@ fn a_frame_waiting_under_a_type_survives_it_being_deleted() {
         ["colour.red", "colour.green", "colour.blue"]
     );
     assert_eq!(library.draft_problem(), None);
+}
+
+const GUARDED: &str = r#"
+name = "Guarded"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+default = 0xAA55
+
+[[field]]
+name = "mode"
+type = "enum"
+repr = "u8"
+variants = { IDLE = 0, RUN = 1, FAULT = 2 }
+
+[[field]]
+name = "check"
+type = "xor8"
+covers = { from = "sync", to = "mode" }
+"#;
+
+fn guarded() -> FrameDef {
+    sim_core::frame::schema::from_toml(GUARDED).expect("fixture should parse")
+}
+
+#[test]
+fn typing_hex_drives_the_fields() {
+    let frame = guarded();
+    let mut state = Session::default();
+
+    // 0xAA ^ 0x55 ^ 0x02 = 0xFD
+    assert_eq!(apply_hex(&mut state, &frame, "AA 55 02 FD"), None);
+
+    let values = state.frames.values_mut(&frame);
+    assert_eq!(values["sync"], Value::Uint(0xAA55));
+    assert_eq!(values["mode"], Value::Uint(2));
+    // Recomputed on encode, so it is never written back as a value.
+    assert!(!values.contains_key("check"));
+}
+
+#[test]
+fn an_incomplete_byte_is_not_worth_complaining_about() {
+    let frame = guarded();
+    let mut state = Session::default();
+
+    state
+        .frames
+        .values_mut(&frame)
+        .insert("mode".to_owned(), Value::Uint(2));
+
+    // Mid-keystroke: silent, and what is already there is left alone.
+    assert_eq!(apply_hex(&mut state, &frame, "AA 5"), None);
+    assert_eq!(state.frames.values_mut(&frame)["mode"], Value::Uint(2));
+
+    assert_eq!(
+        apply_hex(&mut state, &frame, "AA ZZ"),
+        Some("Not hexadecimal.".to_owned())
+    );
+}
+
+#[test]
+fn a_short_frame_says_how_short() {
+    let frame = guarded();
+    let mut state = Session::default();
+    let note = apply_hex(&mut state, &frame, "AA 55").expect("should be reported");
+    assert!(note.contains('2') && note.contains('4'), "got {note}");
+}
+
+#[test]
+fn a_wrong_checksum_is_applied_but_flagged() {
+    let frame = guarded();
+    let mut state = Session::default();
+
+    // Right bytes, deliberately wrong check byte.
+    let note = apply_hex(&mut state, &frame, "AA 55 02 00").expect("should be reported");
+    assert!(note.contains("check"), "got {note}");
+
+    // The fields still took the pasted values: a capture with a bad
+    // checksum is exactly what you want to look at.
+    assert_eq!(state.frames.values_mut(&frame)["mode"], Value::Uint(2));
+}
+
+#[test]
+fn a_bitfield_says_where_each_of_its_parts_sits() {
+    let frame = sim_core::frame::schema::from_toml(
+        r#"
+name = "Status"
+[[field]]
+name = "flags"
+type = "bits"
+repr = "u8"
+bits = [
+  { name = "armed",       width = 1 },
+  { name = "heater_on",   width = 1 },
+  { name = "link_up",     width = 1 },
+  { name = "power_level", width = 2 },
+  { name = "spare",       width = 3 },
+]
+"#,
+    )
+    .expect("should parse");
+    let FieldKind::Bits { repr, bits } = &frame.fields[0].kind else {
+        panic!("expected a bitfield");
+    };
+
+    // Listed from the top of the word, which is the order the codec packs
+    // them in and the order the file declares them in.
+    assert_eq!(
+        bit_positions(*repr, bits),
+        [
+            Some("7".to_owned()),
+            Some("6".to_owned()),
+            Some("5".to_owned()),
+            Some("4:3".to_owned()),
+            Some("2:0".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn a_bitfield_wider_than_its_word_says_so_rather_than_lying() {
+    // The schema refuses this at load, so it is a guard rather than a case
+    // anyone should meet, but a wrong number would be worse than a question
+    // mark.
+    let bits = [
+        BitDef {
+            name: "big".to_owned(),
+            width: 6,
+        },
+        BitDef {
+            name: "too_big".to_owned(),
+            width: 6,
+        },
+    ];
+    assert_eq!(
+        bit_positions(ScalarType::U8, &bits),
+        [Some("7:2".to_owned()), None]
+    );
 }

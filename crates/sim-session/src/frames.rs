@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::state::Session;
 use anyhow::{bail, Context, Result};
+use sim_core::frame::codec;
 use sim_core::frame::schema::{self, TypeDef, TypeLibrary};
 use sim_core::frame::value::{seed_values, FieldValues};
-use sim_core::frame::FrameDef;
+use sim_core::frame::{FieldDef, FieldKind, FrameDef, ScalarType};
 
+use crate::hex;
 use crate::layout;
 
 /// Subdirectory holding the type definitions every frame in the folder can use.
@@ -1224,6 +1227,145 @@ fn file_label(path: &Path) -> String {
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// What New starts from: one byte, the smallest thing that is still a frame.
+#[must_use]
+pub fn blank_frame(name: &str) -> FrameDef {
+    FrameDef::flat(
+        name,
+        vec![FieldDef {
+            name: "id".to_owned(),
+            description: None,
+            kind: FieldKind::Scalar(ScalarType::U8),
+            endian: sim_core::frame::Endianness::default(),
+            default: None,
+            range: None,
+        }],
+    )
+}
+
+/// Writes the draft out, choosing a file for one that has never had a home.
+pub fn save_draft(state: &mut Session) {
+    let Some(directory) = state.frames.directory.clone() else {
+        state.last_error = Some("No frames folder to save into.".to_owned());
+        return;
+    };
+    let name = state
+        .frames
+        .draft
+        .as_ref()
+        .map(|draft| draft.frame.name.clone())
+        .unwrap_or_default();
+
+    let into = suggested_file(&directory, &name);
+    if let Err(error) = state.frames.save_draft(&into) {
+        state.last_error = Some(format!("{error:#}"));
+    }
+}
+
+/// The declared type, shown next to every field so the layout is readable
+/// without opening the TOML.
+pub fn type_label(field: &FieldDef) -> String {
+    let endian = match field.endian {
+        sim_core::frame::Endianness::Big => "be",
+        sim_core::frame::Endianness::Little => "le",
+    };
+    let constraint = field
+        .range
+        .as_ref()
+        .map(|range| format!(" {}", range.describe()))
+        .unwrap_or_default();
+    match &field.kind {
+        FieldKind::Scalar(scalar) if scalar.size() > 1 => {
+            format!("{} {endian}{constraint}", scalar.name())
+        }
+        FieldKind::Scalar(scalar) => format!("{}{constraint}", scalar.name()),
+        FieldKind::Bytes { len } => format!("bytes[{len}]"),
+        FieldKind::Text { len } => format!("text[{len}]"),
+        FieldKind::Enum { repr, .. } => format!("enum {}", repr.name()),
+        FieldKind::Bits { repr, .. } => format!("bits {}", repr.name()),
+        FieldKind::Checksum { spec, .. } => match spec {
+            sim_core::frame::checksum::ChecksumSpec::Crc(crc) => crc
+                .preset_name()
+                .map_or_else(|| format!("crc{}", crc.width_bits), ToOwned::to_owned),
+            sim_core::frame::checksum::ChecksumSpec::Xor8 => "xor8".to_owned(),
+            sim_core::frame::checksum::ChecksumSpec::Sum { width_bytes } => {
+                format!("sum{}", width_bytes * 8)
+            }
+        },
+    }
+}
+
+/// Decodes typed hex back into the field values.
+///
+/// Returns what the operator should know about: why nothing was applied, or
+/// what the frame will not keep.
+pub fn apply_hex(state: &mut Session, frame: &FrameDef, typed: &str) -> Option<String> {
+    let bytes = match hex::parse(typed) {
+        Ok(bytes) => bytes,
+        // An emptied box is nought bytes, which the length below reports.
+        Err(hex::Problem::Empty) => Vec::new(),
+        // Half a byte typed is someone mid-keystroke, not a mistake to point at.
+        Err(hex::Problem::OddDigits) => return None,
+        Err(problem) => return Some(problem.to_string()),
+    };
+    if bytes.len() != frame.size() {
+        return Some(format!(
+            "{} bytes typed, the frame is {}.",
+            bytes.len(),
+            frame.size()
+        ));
+    }
+
+    let decoded = match codec::decode(frame, &bytes) {
+        Ok(decoded) => decoded,
+        Err(error) => return Some(error.to_string()),
+    };
+
+    let values = state.frames.values_mut(frame);
+    for field in &frame.fields {
+        // Checksums are recomputed on encode, so writing one back would be
+        // overwritten anyway; the mismatch below is the honest report.
+        if matches!(field.kind, FieldKind::Checksum { .. }) {
+            continue;
+        }
+        if let Some(value) = decoded.values.get(&field.name) {
+            values.insert(field.name.clone(), value.clone());
+        }
+    }
+
+    let mut notes = Vec::new();
+    // Worth saying out loud: paste a capture with a bad checksum and the
+    // preview will quietly show the corrected one a moment later.
+    if !decoded.checksum_mismatches.is_empty() {
+        let fields: Vec<&str> = decoded
+            .checksum_mismatches
+            .iter()
+            .map(|mismatch| mismatch.field.as_str())
+            .collect();
+        notes.push(format!(
+            "{} did not match; the preview will show the recomputed value.",
+            fields.join(", ")
+        ));
+    }
+    for violation in &decoded.range_violations {
+        notes.push(format!(
+            "{} is {}, outside {}.",
+            violation.field, violation.found, violation.range
+        ));
+    }
+    (!notes.is_empty()).then(|| notes.join(" "))
+}
+
+#[must_use]
+pub fn max_unsigned(scalar: ScalarType) -> u64 {
+    let bits = scalar.size() * 8;
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
 }
 
 #[cfg(test)]

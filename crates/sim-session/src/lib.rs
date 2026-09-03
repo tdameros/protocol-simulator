@@ -23,6 +23,7 @@ pub mod reading;
 pub mod scenarios;
 pub mod state;
 pub mod traffic;
+pub mod tree;
 
 pub use engine_handle::EngineHandle;
 pub use state::Session;
