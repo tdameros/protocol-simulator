@@ -60,6 +60,107 @@ pub enum Overlay {
     Keys,
     /// One answer to be chosen from a list.
     Pick(Picker),
+    /// A file to be found on this machine.
+    Browse(Browser),
+}
+
+/// Walking the disk to reach a file.
+///
+/// The window opens a desktop file dialog. A board reached over ssh has no
+/// desktop to put one on, so the walk is here: a folder at a time, with the
+/// same keys as every other list.
+pub struct Browser {
+    at: PathBuf,
+    picker: Picker,
+    /// What went wrong reading a folder, in place of its contents.
+    trouble: Option<String>,
+}
+
+/// The entry that goes back up, shown first so it is always in the same place.
+const UPWARDS: &str = "..";
+
+impl Browser {
+    fn opening(at: PathBuf) -> Self {
+        let mut browser = Self {
+            at,
+            picker: Picker::new(String::new(), Vec::new()),
+            trouble: None,
+        };
+        browser.listing();
+        browser
+    }
+
+    /// Where the walk currently is, which is what the popup titles itself with.
+    #[must_use]
+    pub fn at(&self) -> &Path {
+        &self.at
+    }
+
+    #[must_use]
+    pub fn trouble(&self) -> Option<&str> {
+        self.trouble.as_deref()
+    }
+
+    #[must_use]
+    pub fn picker(&self) -> &Picker {
+        &self.picker
+    }
+
+    /// Folders first, then files, each in name order.
+    ///
+    /// A folder that cannot be read says so in place of its contents rather
+    /// than showing an empty one, which reads as a folder with nothing in it.
+    fn listing(&mut self) {
+        let mut folders = Vec::new();
+        let mut files = Vec::new();
+
+        match std::fs::read_dir(&self.at) {
+            Ok(entries) => {
+                self.trouble = None;
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    // Dot files are noise on the way to a project.
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    if entry.path().is_dir() {
+                        folders.push(format!("{name}/"));
+                    } else {
+                        files.push(name);
+                    }
+                }
+            }
+            Err(error) => self.trouble = Some(format!("{}: {error}", self.at.display())),
+        }
+
+        folders.sort();
+        files.sort();
+
+        let mut options = vec![UPWARDS.to_owned()];
+        options.append(&mut folders);
+        options.append(&mut files);
+        self.picker = Picker::new(String::new(), options);
+    }
+
+    /// Takes the line under the cursor. A folder is walked into, a file is the
+    /// answer.
+    fn taken(&mut self) -> Option<PathBuf> {
+        let name = self.picker.taken()?;
+        if name == UPWARDS {
+            if let Some(up) = self.at.parent() {
+                self.at = up.to_path_buf();
+                self.listing();
+            }
+            return None;
+        }
+        let path = self.at.join(name.trim_end_matches('/'));
+        if path.is_dir() {
+            self.at = path;
+            self.listing();
+            return None;
+        }
+        Some(path)
+    }
 }
 
 /// A list to choose one line from, narrowed by what is typed.
@@ -68,16 +169,16 @@ pub enum Overlay {
 /// the choice is offered rather than spelled, so a name that does not exist
 /// cannot be given.
 pub struct Picker {
-    pub title: &'static str,
+    pub title: String,
     options: Vec<String>,
     typed: String,
     at: usize,
 }
 
 impl Picker {
-    fn new(title: &'static str, options: Vec<String>) -> Self {
+    fn new(title: impl Into<String>, options: Vec<String>) -> Self {
         Self {
-            title,
+            title: title.into(),
             options,
             typed: String::new(),
             at: 0,
@@ -145,6 +246,12 @@ pub struct App {
     engine: EngineHandle,
     /// The project this was opened with, for the header to name.
     path: Option<PathBuf>,
+    /// The folder last looked in, whether or not it held what was wanted.
+    ///
+    /// Kept apart from `path`, which is a project that opened. Naming a file
+    /// that is not there is usually a typo, and the folder around it is where
+    /// the right name is.
+    looked_in: Option<PathBuf>,
 }
 
 impl Default for App {
@@ -161,6 +268,7 @@ impl Default for App {
             session,
             engine: EngineHandle::new(),
             path: None,
+            looked_in: None,
         }
     }
 }
@@ -177,7 +285,10 @@ impl App {
         let mut app = Self::default();
         match opened_with {
             Some(path) if path.is_dir() => app.session.frames.load_from(path),
-            Some(path) => app.open(&path),
+            Some(path) => {
+                app.looked_in = path.parent().map(Path::to_path_buf);
+                app.open(&path);
+            }
             None => {}
         }
         // A project without one, or no project at all, still has traffic to
@@ -192,6 +303,7 @@ impl App {
         let loaded = Project::read(path).and_then(|read| read.apply(&mut self.session, Some(path)));
         match loaded {
             Ok(restored) => {
+                self.looked_in = path.parent().map(Path::to_path_buf);
                 for (id, config, retry) in restored.connect {
                     self.engine.connect(id, config, retry);
                 }
@@ -274,8 +386,9 @@ impl App {
         self.running
     }
 
-    /// Moving between views, which every view answers to.
-    pub const KEYS: [(&'static str, &'static str); 3] = [
+    /// What every view answers to, whichever one is on show.
+    pub const KEYS: [(&'static str, &'static str); 4] = [
+        ("o", "open"),
         ("1-5", "go to a view"),
         ("Tab", "next view"),
         ("Shift+Tab", "previous view"),
@@ -321,6 +434,14 @@ impl App {
                 ("up/down", "choose"),
                 ("type", "narrow"),
                 ("Enter", "take it"),
+                ("Esc", "back"),
+            ];
+        }
+        if let Some(Overlay::Browse(_)) = self.overlay {
+            return &[
+                ("up/down", "choose"),
+                ("type", "narrow"),
+                ("Enter", "open"),
                 ("Esc", "back"),
             ];
         }
@@ -387,6 +508,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('?') => self.overlay = Some(Overlay::Keys),
+            KeyCode::Char('o') => self.browse(),
             KeyCode::Tab => self.tab = Tab::at(self.tab.index() + 1),
             KeyCode::BackTab => self.tab = Tab::at(self.tab.index() + Tab::ALL.len() - 1),
             KeyCode::Char(digit @ '1'..='5') => {
@@ -408,6 +530,21 @@ impl App {
                     self.overlay = None;
                 }
             }
+            Overlay::Browse(browser) => match code {
+                KeyCode::Down => browser.picker.step(1),
+                KeyCode::Up => browser.picker.step(-1),
+                KeyCode::Backspace => browser.picker.rubbed_out(),
+                KeyCode::Esc => self.overlay = None,
+                KeyCode::Enter => {
+                    // A folder walks, and only a file ends the walk.
+                    if let Some(path) = browser.taken() {
+                        self.overlay = None;
+                        self.open(&path);
+                    }
+                }
+                KeyCode::Char(letter) => browser.picker.typing(letter),
+                _ => {}
+            },
             Overlay::Pick(picker) => match code {
                 KeyCode::Down => picker.step(1),
                 KeyCode::Up => picker.step(-1),
@@ -446,6 +583,19 @@ impl App {
         if !candidates.is_empty() {
             self.overlay = Some(Overlay::Pick(Picker::new("Read as", candidates)));
         }
+    }
+
+    /// Offers the disk, starting where the project on show sits.
+    fn browse(&mut self) {
+        let at = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| self.looked_in.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        self.overlay = Some(Overlay::Browse(Browser::opening(at)));
     }
 
     /// The keys the frame list answers to, and whether it took this one.

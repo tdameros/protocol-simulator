@@ -20,7 +20,7 @@ use sim_session::scenarios;
 use sim_session::state::{Direction, LogEntry};
 use sim_session::{hex, links, traffic};
 
-use crate::app::{App, Overlay, Picker, Tab};
+use crate::app::{App, Browser, Overlay, Picker, Tab};
 
 /// The two directions, told apart at a glance rather than read.
 const SENT: Color = Color::Rgb(90, 140, 220);
@@ -53,6 +53,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.overlay() {
         Some(Overlay::Keys) => key_map(frame, frame.area(), app),
         Some(Overlay::Pick(picker)) => list_over(frame, frame.area(), picker),
+        Some(Overlay::Browse(browser)) => walk_over(frame, frame.area(), browser),
         None => {}
     }
 }
@@ -668,6 +669,11 @@ fn key_map(frame: &mut Frame, area: Rect, app: &App) {
 
 /// One answer chosen from a list, over whatever the view was showing.
 fn list_over(frame: &mut Frame, area: Rect, picker: &Picker) {
+    let named = picker.title.clone();
+    list_titled(frame, area, picker, &named);
+}
+
+fn list_titled(frame: &mut Frame, area: Rect, picker: &Picker, named: &str) {
     let (shown, at) = picker.shown();
 
     let lines: Vec<Line> = shown
@@ -686,9 +692,9 @@ fn list_over(frame: &mut Frame, area: Rect, picker: &Picker) {
     // What is typed goes in the title, where it explains a list that has just
     // become shorter without anything else changing.
     let title = if picker.typed().is_empty() {
-        format!(" {} ", picker.title)
+        format!(" {named} ")
     } else {
-        format!(" {} · {} ", picker.title, picker.typed())
+        format!(" {named} · {} ", picker.typed())
     };
 
     let widest = lines
@@ -703,6 +709,32 @@ fn list_over(frame: &mut Frame, area: Rect, picker: &Picker) {
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(title)),
         popup,
+    );
+}
+
+/// The disk, a folder at a time.
+///
+/// Where the walk is stands in the title rather than beside the list, since it
+/// is the one thing that changes when a folder is entered and everything else
+/// on screen looks the same.
+fn walk_over(frame: &mut Frame, area: Rect, browser: &Browser) {
+    if let Some(trouble) = browser.trouble() {
+        let popup = centred(area, trouble.len() + 4, 3);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::raw(trouble.to_owned()).fg(ERROR)))
+                .block(Block::bordered().title(" Open ")),
+            popup,
+        );
+        return;
+    }
+    // The whole path, not just the folder name: two projects both under a
+    // `frames` folder look the same otherwise.
+    list_titled(
+        frame,
+        area,
+        browser.picker(),
+        &browser.at().display().to_string(),
     );
 }
 

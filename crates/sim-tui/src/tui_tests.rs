@@ -848,3 +848,83 @@ fn the_key_map_lists_the_keys_of_the_view_behind_it() {
         "the key nothing else documents: {shown}"
     );
 }
+
+/// A board reached over ssh has no desktop to put a file dialog on.
+fn a_project_on_disk(name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("sim-tui-open-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("frames")).expect("a scratch folder");
+    std::fs::write(root.join("frames").join("status.toml"), STATUS).expect("a frame file");
+    std::fs::write(
+        root.join("bench.toml"),
+        "version = 1\nframes_dir = \"frames\"\n",
+    )
+    .expect("a project file");
+    root
+}
+
+#[test]
+fn a_project_can_be_opened_without_leaving_the_terminal() {
+    let root = a_project_on_disk("a_project_can_be_opened_without_leaving_the_terminal");
+    let mut app = App::opening(Some(root.join("elsewhere.toml")));
+
+    press(&mut app, KeyCode::Char('o'));
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("bench.toml"),
+        "the folder is listed: {shown}"
+    );
+    assert!(shown.contains("frames/"), "folders are marked: {shown}");
+
+    press(&mut app, KeyCode::Char('b'));
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(app.opened(), Some(root.join("bench.toml").as_path()));
+    press(&mut app, KeyCode::Char('4'));
+    assert!(
+        screen(&mut app).contains("Status"),
+        "its frames came with it"
+    );
+}
+
+#[test]
+fn a_folder_is_walked_into_rather_than_opened() {
+    let root = a_project_on_disk("a_folder_is_walked_into_rather_than_opened");
+    let mut app = App::opening(Some(root.join("elsewhere.toml")));
+
+    press(&mut app, KeyCode::Char('o'));
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("status.toml"), "now inside it: {shown}");
+    assert!(app.opened().is_none(), "and nothing was opened");
+}
+
+#[test]
+fn the_walk_can_go_back_up() {
+    let root = a_project_on_disk("the_walk_can_go_back_up");
+    let mut app = App::opening(Some(root.join("frames").join("elsewhere.toml")));
+
+    press(&mut app, KeyCode::Char('o'));
+    assert!(screen(&mut app).contains("status.toml"));
+
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        screen(&mut app).contains("bench.toml"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn backing_out_of_the_walk_opens_nothing() {
+    let root = a_project_on_disk("backing_out_of_the_walk_opens_nothing");
+    let mut app = App::opening(Some(root.join("elsewhere.toml")));
+
+    press(&mut app, KeyCode::Char('o'));
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay().is_none());
+    assert!(app.opened().is_none());
+}
