@@ -29,6 +29,8 @@ const SENT: Color = Color::Rgb(90, 140, 220);
 const RECEIVED: Color = Color::Rgb(40, 160, 90);
 /// What a frame that will not decode is written in.
 const ERROR: Color = Color::Rgb(200, 60, 60);
+/// What a note about a decode that partly worked is written in.
+const WARNING: Color = Color::Rgb(200, 120, 40);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // The line only exists while there is something to say, so a working
@@ -468,7 +470,7 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
     let widest = chosen
         .fields
         .iter()
-        .map(|field| field.name.len())
+        .map(|field| sim_session::tree::leaf_name(&field.name).len())
         .max()
         .unwrap_or(0);
 
@@ -497,6 +499,9 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
         Ok(bytes) => Line::from(Span::raw(hex::spaced(&bytes))),
         Err(error) => Line::from(Span::raw(error.to_string()).fg(ERROR)),
     });
+    if let Some(note) = &app.session().frame_hex_note {
+        lines.push(Line::from(Span::raw(note.clone()).fg(WARNING)));
+    }
     lines.push(target_line(app));
 
     let title = if focused {
@@ -540,11 +545,11 @@ fn field_row_line(
             let said = held.map_or_else(String::new, |value| reading::describe(field, value, hex));
             Line::from(vec![
                 Span::styled(
-                    format!("{:widest$}", field.name),
+                    format!("{:widest$}", sim_session::tree::leaf_name(&field.name)),
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::raw(kinds::label_of(&field.kind)).dim(),
+                Span::raw(sim_session::frames::type_label(field)).dim(),
                 Span::raw("  "),
                 Span::raw(said),
             ])
@@ -935,14 +940,8 @@ fn rows_view(frame: &mut Frame, area: Rect, app: &App) {
                 .monitor_position()
                 .filter(|(_, of)| *of > 1)
                 .map_or_else(String::new, |(at, of)| format!(" [{at}/{of}]"));
-            format!(
-                " {}{} ({}{}{}) ",
-                monitor.title,
-                tab,
-                rows.len(),
-                following,
-                paused
-            )
+            let counted = traffic::summary(&rows, app.session().log.len());
+            format!(" {}{} ({counted}{following}{paused}) ", monitor.title, tab)
         },
     );
     let block = Block::bordered().title(title);

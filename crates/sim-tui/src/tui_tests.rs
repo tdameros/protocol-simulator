@@ -1372,13 +1372,14 @@ fn pausing_freezes_the_view_but_not_the_buffer() {
 
     captured(&mut app, &[0x02], Duration::from_secs(2));
     let shown = screen(&mut app);
-    assert!(shown.contains("(1, following, paused)"), "{shown}");
+    assert!(shown.contains("1 of 2 shown"), "{shown}");
+    assert!(shown.contains(", following, paused)"), "{shown}");
 
     press(&mut app, KeyCode::Char('p'));
     let shown = screen(&mut app);
     assert!(!shown.contains("paused"), "{shown}");
     assert!(
-        shown.contains("(2, following)"),
+        shown.contains("2 of 2 shown") && shown.contains(", following)"),
         "the buffered frame catches up: {shown}"
     );
 }
@@ -1392,7 +1393,11 @@ fn clearing_hides_what_was_captured_before_it() {
 
     assert!(screen(&mut app).contains("Nothing captured yet"));
     captured(&mut app, &[0x02], Duration::from_secs(2));
-    assert!(screen(&mut app).contains("(1,"), "{}", screen(&mut app));
+    assert!(
+        screen(&mut app).contains("1 of 2 shown"),
+        "{}",
+        screen(&mut app)
+    );
 }
 
 #[test]
@@ -2403,4 +2408,77 @@ fn saving_the_frame_writes_it_to_disk_and_closes_the_draft() {
     assert!(app.session().frames.draft.is_none());
     let written = std::fs::read_dir(&dir).expect("the scratch folder").count();
     assert_eq!(written, 1, "the new frame's own file");
+}
+
+#[test]
+fn a_mismatched_row_leaves_its_own_note_rather_than_the_error_line() {
+    let mut app = App::default();
+    with_frames(
+        &mut app,
+        "a_mismatched_row_leaves_its_own_note_rather_than_the_error_line",
+    );
+    captured(&mut app, &[0xAA, 0x55, 0x02], Duration::from_secs(1));
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Down); // choose Status
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('F'));
+
+    assert_eq!(
+        app.trouble(),
+        None,
+        "a decode note is not a standing error, so it must not evict one already on screen"
+    );
+    assert!(
+        app.session()
+            .frame_hex_note
+            .as_deref()
+            .is_some_and(|note| note.contains("bytes typed")),
+        "{:?}",
+        app.session().frame_hex_note
+    );
+}
+
+const NESTED: &str = r#"
+name = "Nested"
+endian = "little"
+
+[[field]]
+name = "zone.left"
+type = "u16"
+
+[[field]]
+name = "zone.right"
+type = "u16"
+"#;
+
+fn with_nested_frame(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-nested-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("nested.toml"), NESTED).expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+}
+
+#[test]
+fn a_dotted_field_name_shows_only_its_own_leaf() {
+    let mut app = App::default();
+    with_nested_frame(&mut app, "a_dotted_field_name_shows_only_its_own_leaf");
+    press(&mut app, KeyCode::Char('4'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("left"), "{shown}");
+    assert!(!shown.contains("zone.left"), "{shown}");
+}
+
+#[test]
+fn a_little_endian_multi_byte_field_says_so_next_to_its_type() {
+    let mut app = App::default();
+    with_nested_frame(
+        &mut app,
+        "a_little_endian_multi_byte_field_says_so_next_to_its_type",
+    );
+    press(&mut app, KeyCode::Char('4'));
+
+    assert!(screen(&mut app).contains("u16 le"), "{}", screen(&mut app));
 }

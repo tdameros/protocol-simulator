@@ -2636,6 +2636,8 @@ impl App {
             delta,
             self.session.frames.entries.len(),
         );
+        // Whatever the note said, it said it about another frame.
+        self.session.frame_hex_note = None;
     }
 
     /// The rows of the frame on show, resetting the cursor when it is not the
@@ -3996,7 +3998,8 @@ impl App {
             return;
         };
         let typed = hex::spaced(&bytes);
-        self.session.last_error = sim_session::frames::apply_hex(&mut self.session, &frame, &typed);
+        self.session.frame_hex_note =
+            sim_session::frames::apply_hex(&mut self.session, &frame, &typed);
     }
 
     /// Moves the read row by `delta`, stopping at either end.
