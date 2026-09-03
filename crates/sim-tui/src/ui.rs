@@ -11,6 +11,8 @@ use ratatui::widgets::{Block, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
 use sim_core::frame::codec;
+use sim_core::frame::value::seed_values;
+use sim_session::kinds;
 use sim_session::reading;
 use sim_session::scenarios;
 use sim_session::state::{Direction, LogEntry};
@@ -84,20 +86,8 @@ fn view(frame: &mut Frame, area: Rect, app: &mut App) {
         Tab::Traffic => watch(frame, area, app),
         Tab::Scenarios => scenarios_view(frame, area, app),
         Tab::HexInject => inject_view(frame, area, app),
-        tab @ Tab::Frames => pending(frame, area, tab),
+        Tab::Frames => frames_view(frame, area, app),
     }
-}
-
-fn pending(frame: &mut Frame, area: Rect, tab: Tab) {
-    let body = Paragraph::new(vec![
-        Line::from(tab.pending()),
-        Line::from(""),
-        Line::from("Nothing is wired to the engine yet.".dim()),
-    ])
-    .wrap(Wrap { trim: true })
-    .block(Block::bordered().title(format!(" {} ", tab.title())));
-
-    frame.render_widget(body, area);
 }
 
 fn connections(frame: &mut Frame, area: Rect, app: &App) {
@@ -139,6 +129,113 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     frame.render_widget(Paragraph::new(rows).block(block), area);
+}
+
+fn frames_view(frame: &mut Frame, area: Rect, app: &App) {
+    let library = &app.session().frames;
+    let block = Block::bordered().title(format!(" Frames ({}) ", library.entries.len()));
+
+    if library.entries.is_empty() {
+        let empty = Paragraph::new("No frame definition. Open a project, or pass a folder.".dim())
+            .wrap(Wrap { trim: true })
+            .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let [list, detail] =
+        Layout::vertical([Constraint::Percentage(40), Constraint::Min(3)]).areas(area);
+
+    let widest = library
+        .entries
+        .iter()
+        .map(|entry| entry.frame.name.len())
+        .max()
+        .unwrap_or(0);
+
+    let lines: Vec<Line> = library
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(at, entry)| {
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{:widest$}", entry.frame.name),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(format!("{} bytes", entry.frame.size())).dim(),
+            ]);
+            if library.selected == Some(at) {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines).block(block), list);
+    frame_detail(frame, detail, app);
+}
+
+/// The chosen definition, its values, and the bytes they encode to.
+fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(chosen) = app.session().frames.selected_frame() else {
+        let hint = Paragraph::new("Choose a frame to see its fields.".dim())
+            .block(Block::bordered().title(" Fields "));
+        frame.render_widget(hint, area);
+        return;
+    };
+
+    let values = app
+        .session()
+        .frames
+        .saved_values()
+        .get(&chosen.name)
+        .cloned()
+        .unwrap_or_else(|| seed_values(chosen));
+
+    let widest = chosen
+        .fields
+        .iter()
+        .map(|field| field.name.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines: Vec<Line> = chosen
+        .fields
+        .iter()
+        .map(|field| {
+            let said = values.get(&field.name).map_or_else(String::new, |value| {
+                reading::describe(field, value, app.session().hex_values)
+            });
+            Line::from(vec![
+                Span::styled(
+                    format!("{:widest$}", field.name),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(kinds::label_of(&field.kind)).dim(),
+                Span::raw("  "),
+                Span::raw(said),
+            ])
+        })
+        .collect();
+
+    lines.push(Line::from(""));
+    // What would go out, which is the answer the fields above are working
+    // towards.
+    lines.push(match codec::encode(chosen, &values) {
+        Ok(bytes) => Line::from(Span::raw(hex::spaced(&bytes))),
+        Err(error) => Line::from(Span::raw(error.to_string()).fg(ERROR)),
+    });
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(format!(" {} ", chosen.name))),
+        area,
+    );
 }
 
 fn inject_view(frame: &mut Frame, area: Rect, app: &App) {

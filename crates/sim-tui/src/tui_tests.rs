@@ -663,3 +663,44 @@ fn escape_gives_the_keyboard_back_to_the_view() {
     press(&mut app, KeyCode::Char('1'));
     assert_eq!(app.tab(), crate::app::Tab::Connections);
 }
+
+#[test]
+fn a_frame_shows_its_fields_and_the_bytes_they_make() {
+    let mut app = App::default();
+    with_frames(&mut app, "a_frame_shows_its_fields_and_the_bytes_they_make");
+
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("Heartbeat"), "{shown}");
+    assert!(shown.contains("Status"), "{shown}");
+    assert!(shown.contains("5 bytes"), "{shown}");
+    assert!(
+        shown.contains("sync"),
+        "the fields of the chosen one: {shown}"
+    );
+    assert!(shown.contains("enum"), "and what kind each is: {shown}");
+}
+
+#[test]
+fn no_frame_definition_says_so_rather_than_showing_an_empty_box() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('4'));
+    assert!(screen(&mut app).contains("No frame definition"));
+}
+
+/// What would go out, which is the answer the fields are working towards.
+#[test]
+fn a_frame_shows_the_bytes_it_would_send() {
+    let mut app = App::default();
+    with_frames(&mut app, "a_frame_shows_the_bytes_it_would_send");
+
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+
+    // Five bytes of zeroes until a value is typed, which is what a seeded
+    // frame encodes to.
+    assert!(shown.contains("00 00 00 00 00"), "{shown}");
+}

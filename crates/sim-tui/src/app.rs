@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use sim_core::frame::codec;
 use sim_session::engine_handle::EngineHandle;
 use sim_session::hex;
 use sim_session::project::Project;
@@ -41,18 +42,6 @@ impl Tab {
             Self::HexInject => "Hex",
             Self::Frames => "Frames",
             Self::Scenarios => "Scenarios",
-        }
-    }
-
-    /// What the view will hold, said plainly until it holds it.
-    #[must_use]
-    pub fn pending(self) -> &'static str {
-        match self {
-            Self::Connections => "The links, their state, and what it takes to open one.",
-            Self::Traffic => "Every frame sent and received, and the fields behind a row.",
-            Self::HexInject => "Bytes typed by hand, sent as they are.",
-            Self::Frames => "The frame definitions, their fields, and the shared types.",
-            Self::Scenarios => "The scenarios, what each step does, and which are running.",
         }
     }
 
@@ -346,7 +335,8 @@ impl App {
             ],
             Tab::Scenarios => &[("up/down", "choose"), ("Enter", "run"), ("x", "stop")],
             Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
-            _ => &[],
+            Tab::Frames => &[("up/down", "choose"), ("Enter", "send")],
+            Tab::Connections => &[],
         }
     }
 
@@ -376,7 +366,8 @@ impl App {
             Tab::Traffic => self.watching(key.code),
             Tab::Scenarios => self.running_scenarios(key.code),
             Tab::HexInject => self.injecting(key.code),
-            _ => false,
+            Tab::Frames => self.framing(key.code),
+            Tab::Connections => false,
         };
         if taken {
             return;
@@ -443,6 +434,53 @@ impl App {
             .collect();
         if !candidates.is_empty() {
             self.overlay = Some(Overlay::Pick(Picker::new("Read as", candidates)));
+        }
+    }
+
+    /// The keys the frame list answers to, and whether it took this one.
+    fn framing(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.pick_frame_in_library(1),
+            KeyCode::Up | KeyCode::Char('k') => self.pick_frame_in_library(-1),
+            KeyCode::Enter => self.send_selected_frame(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn pick_frame_in_library(&mut self, delta: isize) {
+        let Some(last) = self.session.frames.entries.len().checked_sub(1) else {
+            return;
+        };
+        let at = match self.session.frames.selected {
+            Some(at) => at.saturating_add_signed(delta).min(last),
+            None => 0,
+        };
+        self.session.frames.selected = Some(at);
+    }
+
+    /// Encodes the chosen frame from the values on show and sends it.
+    ///
+    /// Failing to encode is reported rather than sent as whatever fell out: a
+    /// frame the definition refuses is not a frame the receiver asked for.
+    fn send_selected_frame(&mut self) {
+        let Some(frame) = self.session.frames.selected_frame().cloned() else {
+            return;
+        };
+        let Some(id) = self
+            .session
+            .frame_target
+            .clone()
+            .or_else(|| self.session.connections.first().map(|(id, _)| id.clone()))
+        else {
+            self.session.last_error = Some("No link to send on.".to_owned());
+            return;
+        };
+
+        let values = self.session.frames.values_mut(&frame).clone();
+        match codec::encode(&frame, &values) {
+            Ok(bytes) => self.engine.send_raw(id, bytes),
+            Err(error) => self.session.last_error = Some(error.to_string()),
         }
     }
 
