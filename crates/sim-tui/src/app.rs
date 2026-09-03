@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use sim_session::engine_handle::EngineHandle;
 use sim_session::project::Project;
+use sim_session::reading::{self, Reading};
 use sim_session::state::{LogEntry, MonitorState, Session};
 
 /// The same five views the window has, in the same order.
@@ -62,9 +63,16 @@ impl Tab {
     }
 }
 
+/// What is laid over the view, taking the keys the view would otherwise get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    /// The key map.
+    Keys,
+}
+
 pub struct App {
     tab: Tab,
-    help: bool,
+    overlay: Option<Overlay>,
     running: bool,
     session: Session,
     engine: EngineHandle,
@@ -80,7 +88,7 @@ impl Default for App {
         session.open_monitor();
         Self {
             tab: Tab::Connections,
-            help: false,
+            overlay: None,
             running: true,
             session,
             engine: EngineHandle::new(),
@@ -151,6 +159,18 @@ impl App {
         self.session.monitors.values().next()
     }
 
+    /// The row being read, and what it reads as.
+    ///
+    /// Settling which definition to use is part of the answer, hence the
+    /// mutable borrow: a row with one candidate takes it without asking.
+    pub fn selected_reading(&mut self) -> Option<(&LogEntry, Reading<'_>)> {
+        let seq = self.session.monitors.values().next()?.selected?;
+        let entry = self.session.log.iter().find(|entry| entry.seq == seq)?;
+        let decode_as = &mut self.session.monitors.values_mut().next()?.decode_as;
+        let reading = reading::read(&self.session.frames, entry, decode_as);
+        Some((entry, reading))
+    }
+
     /// The rows that pass the view's filter, oldest first.
     #[must_use]
     pub fn rows(&self) -> Vec<&LogEntry> {
@@ -177,8 +197,8 @@ impl App {
     }
 
     #[must_use]
-    pub fn help_is_open(&self) -> bool {
-        self.help
+    pub fn overlay(&self) -> Option<Overlay> {
+        self.overlay
     }
 
     #[must_use]
@@ -186,7 +206,7 @@ impl App {
         self.running
     }
 
-    /// The key map, in the order it is shown.
+    /// The keys every view answers to, in the order they are shown.
     pub const KEYS: [(&'static str, &'static str); 5] = [
         ("1-5", "go to a view"),
         ("Tab", "next view"),
@@ -194,6 +214,22 @@ impl App {
         ("?", "keys"),
         ("q", "quit"),
     ];
+
+    /// What the view on show adds to them.
+    ///
+    /// Offered without being asked for, since a key nobody can guess is a key
+    /// nobody presses.
+    #[must_use]
+    pub fn view_keys(&self) -> &'static [(&'static str, &'static str)] {
+        match self.tab {
+            Tab::Traffic => &[
+                ("up/down", "read a row"),
+                ("Esc", "put it away"),
+                ("f", "follow"),
+            ],
+            _ => &[],
+        }
+    }
 
     pub fn handle(&mut self, key: KeyEvent) {
         // Ctrl+C is the one key a terminal program may not redefine, whatever
@@ -205,16 +241,22 @@ impl App {
 
         // An overlay takes the keys it knows and swallows the rest, so that
         // reading the key map cannot change the view behind it.
-        if self.help {
+        if self.overlay.is_some() {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.help = false;
+                self.overlay = None;
             }
+            return;
+        }
+
+        // What the view does with a key comes first: a list has to have Up and
+        // Down before anything else claims them.
+        if self.tab == Tab::Traffic && self.watching(key.code) {
             return;
         }
 
         match key.code {
             KeyCode::Char('q') => self.running = false,
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => self.overlay = Some(Overlay::Keys),
             KeyCode::Tab => self.tab = Tab::at(self.tab.index() + 1),
             KeyCode::BackTab => self.tab = Tab::at(self.tab.index() + Tab::ALL.len() - 1),
             KeyCode::Char(digit @ '1'..='5') => {
@@ -223,5 +265,52 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The keys the traffic list answers to, and whether it took this one.
+    fn watching(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.step(1),
+            KeyCode::Up | KeyCode::Char('k') => self.step(-1),
+            KeyCode::Esc => {
+                if let Some(monitor) = self.session.monitors.values_mut().next() {
+                    monitor.selected = None;
+                }
+            }
+            KeyCode::Char('f') => {
+                if let Some(monitor) = self.session.monitors.values_mut().next() {
+                    monitor.follow = !monitor.follow;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Moves the read row by `delta`, stopping at either end.
+    ///
+    /// Reading a row and following the newest frame are opposite things, so the
+    /// first stops the second: a list that keeps scrolling moves the row being
+    /// read out from under you.
+    fn step(&mut self, delta: isize) {
+        let seqs: Vec<u64> = self.rows().iter().map(|entry| entry.seq).collect();
+        let Some(last) = seqs.len().checked_sub(1) else {
+            return;
+        };
+        let Some(monitor) = self.session.monitors.values_mut().next() else {
+            return;
+        };
+
+        let at = match monitor
+            .selected
+            .and_then(|seq| seqs.iter().position(|s| *s == seq))
+        {
+            Some(at) => at.saturating_add_signed(delta).min(last),
+            // Nothing read yet: start at the newest, which is what a bench is
+            // looking at when it reaches for the keyboard.
+            None => last,
+        };
+        monitor.selected = Some(seqs[at]);
+        monitor.follow = false;
     }
 }

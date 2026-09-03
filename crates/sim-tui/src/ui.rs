@@ -10,16 +10,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
+use sim_core::frame::codec;
+use sim_session::reading;
 use sim_session::state::{Direction, LogEntry};
 use sim_session::{hex, links, traffic};
 
-use crate::app::{App, Tab};
+use crate::app::{App, Overlay, Tab};
 
 /// The two directions, told apart at a glance rather than read.
 const SENT: Color = Color::Rgb(90, 140, 220);
 const RECEIVED: Color = Color::Rgb(40, 160, 90);
+/// What a frame that will not decode is written in.
+const ERROR: Color = Color::Rgb(200, 60, 60);
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let [bar, body, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -29,10 +33,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     tab_bar(frame, bar, app);
     view(frame, body, app);
-    hint_line(frame, hints);
+    hint_line(frame, hints, app);
 
-    if app.help_is_open() {
-        key_map(frame, frame.area());
+    if app.overlay() == Some(Overlay::Keys) {
+        key_map(frame, frame.area(), app);
     }
 }
 
@@ -71,7 +75,7 @@ fn tab_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(tabs, area);
 }
 
-fn view(frame: &mut Frame, area: Rect, app: &App) {
+fn view(frame: &mut Frame, area: Rect, app: &mut App) {
     match app.tab() {
         Tab::Connections => connections(frame, area, app),
         Tab::Traffic => watch(frame, area, app),
@@ -132,11 +136,89 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(rows).block(block), area);
 }
 
-fn watch(frame: &mut Frame, area: Rect, app: &App) {
+fn watch(frame: &mut Frame, area: Rect, app: &mut App) {
+    // Built first, while the reading may still settle which definition it uses.
+    // What comes back is owned, so the list below can borrow freely.
+    let fields = field_lines(app);
+
+    let (list, pane) = match &fields {
+        Some(lines) => {
+            // Never more than half the screen: the list is what tells you which
+            // row you are on.
+            let wanted = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+            let [list, pane] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(wanted)]).areas(area);
+            (list, Some(pane))
+        }
+        None => (area, None),
+    };
+
+    rows_view(frame, list, app);
+
+    if let (Some(pane), Some(lines)) = (pane, fields) {
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(" Fields ")),
+            pane,
+        );
+    }
+}
+
+/// The selected row read field by field, or the reason there is nothing to
+/// read.
+fn field_lines(app: &mut App) -> Option<Vec<Line<'static>>> {
+    let hex = app.session().hex_values;
+    let (entry, reading) = app.selected_reading()?;
+
+    let Some(frame) = reading.chosen() else {
+        let said = reading.nothing().unwrap_or("Nothing to read.").to_owned();
+        return Some(vec![Line::from(said.dim())]);
+    };
+
+    let decoded = match codec::decode(frame, &entry.bytes) {
+        Ok(decoded) => decoded,
+        Err(error) => return Some(vec![Line::from(error.to_string().fg(ERROR))]),
+    };
+
+    let widest = frame
+        .fields
+        .iter()
+        .map(|field| field.name.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines = vec![Line::from(format!("read as {}", frame.name).fg(RECEIVED))];
+    for (index, field) in frame.fields.iter().enumerate() {
+        let offset = frame.offset_of(index);
+        let end = offset + field.kind.size();
+        let said = decoded
+            .values
+            .get(&field.name)
+            .map_or_else(String::new, |value| reading::describe(field, value, hex));
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:widest$}", field.name),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::raw(format!("{offset}..{end}")).dim(),
+            Span::raw("  "),
+            Span::raw(hex::spaced(&entry.bytes[offset..end])),
+            Span::raw("  "),
+            Span::raw(said),
+        ]));
+    }
+    Some(lines)
+}
+
+fn rows_view(frame: &mut Frame, area: Rect, app: &App) {
     let rows = app.rows();
     let title = app.monitor().map_or_else(
         || " Traffic ".to_owned(),
-        |monitor| format!(" {} ", monitor.title),
+        |monitor| {
+            let following = if monitor.follow { ", following" } else { "" };
+            format!(" {} ({}{}) ", monitor.title, rows.len(), following)
+        },
     );
     let block = Block::bordered().title(title);
 
@@ -146,19 +228,32 @@ fn watch(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Only the tail is drawn. Painting ten thousand rows to show twenty would
-    // cost a board its idle time.
+    let reading = app.monitor().and_then(|monitor| monitor.selected);
+    let at = reading.and_then(|seq| rows.iter().position(|entry| entry.seq == seq));
+
+    // Only the visible slice is drawn. Painting ten thousand rows to show
+    // twenty would cost a board its idle time.
     let room = block.inner(area).height as usize;
-    let first = rows.len().saturating_sub(room);
+    let first = match at {
+        // Keep the read row on screen, and the rows around it for context.
+        Some(at) => at
+            .saturating_sub(room / 2)
+            .min(rows.len().saturating_sub(room)),
+        None => rows.len().saturating_sub(room),
+    };
 
     let lines: Vec<Line> = rows[first..]
         .iter()
         .enumerate()
-        .map(|(at, entry)| {
-            let previous = (at + first)
-                .checked_sub(1)
-                .and_then(|before| rows.get(before));
-            row(entry, previous.copied())
+        .map(|(offset, entry)| {
+            let index = offset + first;
+            let previous = index.checked_sub(1).and_then(|before| rows.get(before));
+            let line = row(entry, previous.copied());
+            if at == Some(index) {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
         })
         .collect();
 
@@ -189,9 +284,10 @@ fn row(entry: &LogEntry, previous: Option<&LogEntry>) -> Line<'static> {
     ])
 }
 
-fn hint_line(frame: &mut Frame, area: Rect) {
+fn hint_line(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = Vec::new();
-    for (at, (key, does)) in App::KEYS.iter().enumerate() {
+    let keys = app.view_keys().iter().chain(App::KEYS.iter());
+    for (at, (key, does)) in keys.enumerate() {
         if at > 0 {
             spans.push(Span::raw("   "));
         }
@@ -205,14 +301,17 @@ fn hint_line(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn key_map(frame: &mut Frame, area: Rect) {
-    let widest = App::KEYS
+fn key_map(frame: &mut Frame, area: Rect, app: &App) {
+    let keys: Vec<(&str, &str)> = app
+        .view_keys()
         .iter()
-        .map(|(key, _)| key.len())
-        .max()
-        .unwrap_or(0);
+        .chain(App::KEYS.iter())
+        .copied()
+        .collect();
 
-    let lines: Vec<Line> = App::KEYS
+    let widest = keys.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+
+    let lines: Vec<Line> = keys
         .iter()
         .map(|(key, does)| {
             Line::from(vec![

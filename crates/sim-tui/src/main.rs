@@ -42,7 +42,7 @@ fn run(terminal: &mut DefaultTerminal, opened_with: Option<PathBuf>) -> std::io:
 
     while app.running() {
         app.take_engine_events();
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
         if event::poll(TICK)? {
             if let Event::Key(key) = event::read()? {

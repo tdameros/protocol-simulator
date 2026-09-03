@@ -16,7 +16,7 @@ use crate::app::App;
 use crate::ui;
 
 /// The screen as one string, one line per row.
-fn screen(app: &App) -> String {
+fn screen(app: &mut App) -> String {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("a test terminal");
     terminal.draw(|frame| ui::draw(frame, app)).expect("a draw");
 
@@ -38,8 +38,8 @@ fn press(app: &mut App, code: KeyCode) {
 
 #[test]
 fn every_view_is_offered_from_the_first_screen() {
-    let app = App::default();
-    let shown = screen(&app);
+    let mut app = App::default();
+    let shown = screen(&mut app);
 
     for tab in crate::app::Tab::ALL {
         assert!(shown.contains(tab.title()), "{} is missing", tab.title());
@@ -52,7 +52,7 @@ fn a_digit_goes_straight_to_its_view() {
     press(&mut app, KeyCode::Char('3'));
 
     assert_eq!(app.tab(), crate::app::Tab::HexInject);
-    assert!(screen(&app).contains("Bytes typed by hand"));
+    assert!(screen(&mut app).contains("Bytes typed by hand"));
 }
 
 #[test]
@@ -76,15 +76,15 @@ fn shift_tab_walks_the_other_way() {
 #[test]
 fn the_key_map_opens_and_closes() {
     let mut app = App::default();
-    assert!(!screen(&app).contains("Keys"));
+    assert!(!screen(&mut app).contains("Keys"));
 
     press(&mut app, KeyCode::Char('?'));
-    let shown = screen(&app);
+    let shown = screen(&mut app);
     assert!(shown.contains("Keys"));
     assert!(shown.contains("next view"), "the map lists what a key does");
 
     press(&mut app, KeyCode::Esc);
-    assert!(!app.help_is_open());
+    assert!(app.overlay().is_none());
 }
 
 /// Reading the key map is not meant to move you somewhere else.
@@ -95,7 +95,7 @@ fn a_key_pressed_over_the_map_leaves_the_view_alone() {
     press(&mut app, KeyCode::Char('4'));
 
     assert_eq!(app.tab(), crate::app::Tab::Connections);
-    assert!(app.help_is_open());
+    assert!(app.overlay().is_some());
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn ctrl_c_ends_it_even_with_the_map_open() {
 
 #[test]
 fn the_keys_are_offered_without_being_asked_for() {
-    let shown = screen(&App::default());
+    let shown = screen(&mut App::default());
     let last = shown.lines().last().expect("a hint line").to_owned();
 
     assert!(last.contains("quit"), "the hint line reads: {last}");
@@ -155,7 +155,7 @@ fn captured(app: &mut App, bytes: &[u8], at: Duration) {
 fn a_link_says_what_it_is_and_how_it_is_doing() {
     let mut app = App::default();
     linked(&mut app, "bus", ConnectionStatus::Connected);
-    let shown = screen(&app);
+    let shown = screen(&mut app);
 
     assert!(shown.contains("bus"), "{shown}");
     assert!(shown.contains("Connected"), "{shown}");
@@ -164,7 +164,7 @@ fn a_link_says_what_it_is_and_how_it_is_doing() {
 
 #[test]
 fn no_link_says_so_rather_than_showing_an_empty_box() {
-    let shown = screen(&App::default());
+    let shown = screen(&mut App::default());
     assert!(shown.contains("No link"), "{shown}");
 }
 
@@ -173,7 +173,7 @@ fn a_captured_frame_shows_its_bytes_and_its_characters() {
     let mut app = App::default();
     captured(&mut app, b"\xAA\x55ok", Duration::from_secs(1));
     press(&mut app, KeyCode::Char('2'));
-    let shown = screen(&app);
+    let shown = screen(&mut app);
 
     assert!(shown.contains("AA 55 6F 6B"), "{shown}");
     assert!(shown.contains(".Uok"), "{shown}");
@@ -192,7 +192,7 @@ fn a_full_buffer_shows_its_newest_rows() {
         );
     }
     press(&mut app, KeyCode::Char('2'));
-    let shown = screen(&app);
+    let shown = screen(&mut app);
 
     assert!(shown.contains("01 F3"), "the last row is drawn: {shown}");
     assert!(!shown.contains("00 00"), "the first is not: {shown}");
@@ -205,7 +205,7 @@ fn the_link_columns_keep_one_left_edge() {
     linked(&mut app, "drive", ConnectionStatus::Connected);
     linked(&mut app, "sensor-bus", ConnectionStatus::Disconnected);
 
-    let shown = screen(&app);
+    let shown = screen(&mut app);
     let starts: Vec<usize> = shown
         .lines()
         .filter(|line| line.contains("UDP"))
@@ -214,4 +214,132 @@ fn the_link_columns_keep_one_left_edge() {
 
     assert_eq!(starts.len(), 2, "{shown}");
     assert_eq!(starts[0], starts[1], "{shown}");
+}
+
+/// The frames a bench is watching, so a captured row has something to be read
+/// as.
+const STATUS: &str = r#"
+name = "Status"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+
+[[field]]
+name = "state"
+type = "enum"
+repr = "u8"
+variants = { IDLE = 0, RUNNING = 2 }
+
+[[field]]
+name = "rpm"
+type = "u16"
+"#;
+
+fn with_frames(app: &mut App) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("status.toml"), STATUS).expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+}
+
+#[test]
+fn a_row_is_read_field_by_field_once_it_is_picked() {
+    let mut app = App::default();
+    with_frames(&mut app);
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x02, 0x05, 0xDC],
+        Duration::from_secs(1),
+    );
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("read as Status"), "{shown}");
+    assert!(shown.contains("RUNNING"), "{shown}");
+    assert!(shown.contains("1500"), "the rpm is decoded: {shown}");
+    assert!(
+        shown.contains("2..3"),
+        "each field says where it sits: {shown}"
+    );
+}
+
+#[test]
+fn nothing_of_that_length_says_so_rather_than_guessing() {
+    let mut app = App::default();
+    with_frames(&mut app);
+    captured(&mut app, &[0x01, 0x02], Duration::from_secs(1));
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("No frame definition is 2 bytes"), "{shown}");
+}
+
+/// Reading a row and following the newest frame are opposite things.
+#[test]
+fn reading_a_row_stops_the_list_following() {
+    let mut app = App::default();
+    captured(&mut app, &[0x01], Duration::from_secs(1));
+    assert!(app.monitor().expect("a view").follow);
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+
+    assert!(!app.monitor().expect("a view").follow);
+    assert!(app.monitor().expect("a view").selected.is_some());
+}
+
+#[test]
+fn the_read_row_stays_on_screen_when_it_is_far_from_the_end() {
+    let mut app = App::default();
+    for n in 0..400u16 {
+        captured(
+            &mut app,
+            &n.to_be_bytes(),
+            Duration::from_millis(u64::from(n)),
+        );
+    }
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    for _ in 0..300 {
+        press(&mut app, KeyCode::Up);
+    }
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("00 63"), "row 99 is in view: {shown}");
+}
+
+#[test]
+fn escape_puts_the_fields_away() {
+    let mut app = App::default();
+    with_frames(&mut app);
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x02, 0x05, 0xDC],
+        Duration::from_secs(1),
+    );
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    assert!(screen(&mut app).contains("read as Status"));
+
+    press(&mut app, KeyCode::Esc);
+    assert!(!screen(&mut app).contains("read as Status"));
+}
+
+/// A key that only one view answers to is only offered there.
+#[test]
+fn the_hint_line_follows_the_view() {
+    let mut app = App::default();
+    let last = |shown: String| shown.lines().last().expect("a hint line").to_owned();
+
+    assert!(!last(screen(&mut app)).contains("read a row"));
+
+    press(&mut app, KeyCode::Char('2'));
+    assert!(last(screen(&mut app)).contains("read a row"));
 }
