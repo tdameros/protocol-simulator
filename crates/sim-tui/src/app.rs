@@ -57,6 +57,19 @@ impl Tab {
     }
 }
 
+/// Moves a cursor by `delta`, clamped to a list of `len` rows, starting from
+/// row zero when nothing is chosen yet. `None` when there is nothing to put
+/// the cursor on.
+///
+/// Written once because every list in this front end -- connections, frames,
+/// fields, scenarios -- moves its cursor the same way, and a rule that
+/// changes (wrapping at the ends, say) should not have to be found and
+/// changed four times.
+fn moved(current: Option<usize>, delta: isize, len: usize) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    Some(current.unwrap_or(0).saturating_add_signed(delta).min(last))
+}
+
 /// Which pane of the Frames view a key acts on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FramesFocus {
@@ -801,15 +814,7 @@ impl App {
     }
 
     fn pick_connection(&mut self, delta: isize) {
-        let Some(last) = self.session.connections.len().checked_sub(1) else {
-            return;
-        };
-        self.connection_at = Some(
-            self.connection_at
-                .unwrap_or(0)
-                .saturating_add_signed(delta)
-                .min(last),
-        );
+        self.connection_at = moved(self.connection_at, delta, self.session.connections.len());
     }
 
     /// The connection a key would act on: the one under the cursor, or the
@@ -916,14 +921,11 @@ impl App {
     }
 
     fn pick_frame_in_library(&mut self, delta: isize) {
-        let Some(last) = self.session.frames.entries.len().checked_sub(1) else {
-            return;
-        };
-        let at = match self.session.frames.selected {
-            Some(at) => at.saturating_add_signed(delta).min(last),
-            None => 0,
-        };
-        self.session.frames.selected = Some(at);
+        self.session.frames.selected = moved(
+            self.session.frames.selected,
+            delta,
+            self.session.frames.entries.len(),
+        );
     }
 
     /// The rows of the frame on show, resetting the cursor when it is not the
@@ -945,11 +947,11 @@ impl App {
         let Some((frame, rows)) = self.field_frame_rows() else {
             return;
         };
-        let Some(last) = rows.len().checked_sub(1) else {
+        let current = self.field_at.as_ref().map(|(_, at)| *at);
+        let Some(at) = moved(current, delta, rows.len()) else {
             return;
         };
-        let at = self.field_at.as_ref().map_or(0, |(_, at)| *at);
-        self.field_at = Some((frame.name, at.saturating_add_signed(delta).min(last)));
+        self.field_at = Some((frame.name, at));
     }
 
     /// Flips a single-bit flag under the cursor without going through an
@@ -1261,13 +1263,13 @@ impl App {
     }
 
     fn pick_scenario(&mut self, delta: isize) {
-        let held = self.session.scenarios.entries.len();
-        let Some(last) = held.checked_sub(1) else {
+        let at = moved(
+            self.session.scenarios.selected,
+            delta,
+            self.session.scenarios.entries.len(),
+        );
+        let Some(at) = at else {
             return;
-        };
-        let at = match self.session.scenarios.selected {
-            Some(at) => at.saturating_add_signed(delta).min(last),
-            None => 0,
         };
         self.session.scenarios.selected = Some(at);
     }

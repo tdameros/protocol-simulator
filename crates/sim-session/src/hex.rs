@@ -129,11 +129,17 @@ pub fn read_number(text: &str) -> Option<f64> {
     };
 
     let digits = rest.replace('_', "");
-    let radix = ["0x", "0b", "0o"]
-        .into_iter()
-        .zip([16, 2, 8])
-        .find(|(prefix, _)| {
-            digits.len() > prefix.len() && digits[..2].eq_ignore_ascii_case(prefix)
+    // Byte-indexed, not `.chars()`: a prefix is two ASCII bytes, and slicing by
+    // byte index panics the moment the string holds anything wider, which a
+    // pasted or mistyped character can put in front of a real prefix.
+    let radix = digits
+        .is_char_boundary(2)
+        .then(|| &digits[..2])
+        .and_then(|head| {
+            ["0x", "0b", "0o"]
+                .into_iter()
+                .zip([16, 2, 8])
+                .find(|(prefix, _)| head.eq_ignore_ascii_case(prefix))
         });
 
     let value = match radix {
@@ -147,7 +153,7 @@ pub fn read_number(text: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{packed, parse, printable, spaced, Problem};
+    use super::{packed, parse, printable, read_number, spaced, Problem};
 
     #[test]
     fn whitespace_anywhere_is_ignored() {
@@ -176,5 +182,26 @@ mod tests {
         assert_eq!(spaced(&[0xAA, 0x55]), "AA 55");
         assert_eq!(packed(&[0xAA, 0x55]), "AA55");
         assert_eq!(printable(b"ok\x00!"), "ok.!");
+    }
+
+    /// A prefix check done by byte index used to panic the moment a
+    /// multi-byte character sat across the boundary it sliced at.
+    #[test]
+    fn a_multi_byte_character_does_not_panic_the_prefix_check() {
+        assert_eq!(read_number("\u{20ac}1"), None);
+        assert_eq!(read_number("\u{20ac}"), None);
+        assert_eq!(read_number("0x\u{20ac}"), None);
+    }
+
+    #[test]
+    fn a_hexadecimal_prefix_with_nothing_after_it_reads_as_nothing() {
+        assert_eq!(read_number("0x"), None);
+    }
+
+    #[test]
+    fn prefixed_numbers_are_read_in_their_own_base() {
+        assert_eq!(read_number("0x1F"), Some(31.0));
+        assert_eq!(read_number("0b101"), Some(5.0));
+        assert_eq!(read_number("-0x0A"), Some(-10.0));
     }
 }

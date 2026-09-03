@@ -1347,3 +1347,17 @@ fn sending_to_a_target_that_dropped_is_refused() {
     let shown = screen(&mut app);
     assert!(shown.contains("is not connected"), "{shown}");
 }
+
+/// The label comes from `sim_session`, the single place the GUI reads it
+/// from too, so the two front ends cannot drift into calling the same
+/// transport by two different names.
+#[test]
+fn the_kind_label_matches_the_one_shared_definition() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Right);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("TCP (client)"), "{shown}");
+}

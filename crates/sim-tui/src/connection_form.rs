@@ -142,7 +142,7 @@ impl ConnectionForm {
 
     fn shown(&self, field: &Field) -> String {
         match field {
-            Field::Kind => kind_label(self.form.kind).to_owned(),
+            Field::Kind => self.form.kind.label().to_owned(),
             Field::Name => self.form.name.clone(),
             Field::UdpRemote => self.form.udp_remote.clone(),
             Field::UdpBind => self.form.udp_bind.clone(),
@@ -270,16 +270,5 @@ fn yes_no(value: bool) -> &'static str {
         "yes"
     } else {
         "no"
-    }
-}
-
-/// `TransportKindChoice` belongs to `sim_session`, so its label is a free
-/// function here rather than an inherent method the orphan rule would refuse.
-fn kind_label(kind: TransportKindChoice) -> &'static str {
-    match kind {
-        TransportKindChoice::Udp => "UDP",
-        TransportKindChoice::TcpClient => "TCP client",
-        TransportKindChoice::TcpServer => "TCP server",
-        TransportKindChoice::Serial => "Serial",
     }
 }
