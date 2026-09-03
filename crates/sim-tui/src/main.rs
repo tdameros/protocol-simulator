@@ -2,6 +2,7 @@
 #![warn(clippy::pedantic)]
 
 mod app;
+mod connection_form;
 mod ui;
 
 #[cfg(test)]

@@ -8,12 +8,15 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use sim_core::frame::codec;
+use sim_core::{ConnectionStatus, RetryPolicy};
+
+use crate::connection_form::ConnectionForm;
 use sim_session::engine_handle::EngineHandle;
 use sim_session::hex;
 use sim_session::project::Project;
 use sim_session::reading::{self, Reading};
 use sim_session::scenarios;
-use sim_session::state::{LogEntry, MonitorState, Session};
+use sim_session::state::{ConnectionEntry, LogEntry, MonitorState, Session};
 
 /// The same five views the window has, in the same order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,8 @@ pub enum Overlay {
     Pick(Picker),
     /// A file to be found on this machine.
     Browse(Browser),
+    /// A connection being described before it exists.
+    NewConnection(ConnectionForm),
 }
 
 /// Walking the disk to reach a file.
@@ -252,6 +257,8 @@ pub struct App {
     /// that is not there is usually a typo, and the folder around it is where
     /// the right name is.
     looked_in: Option<PathBuf>,
+    /// The connection under the cursor in the Connections view.
+    connection_at: Option<usize>,
 }
 
 impl Default for App {
@@ -269,6 +276,7 @@ impl Default for App {
             engine: EngineHandle::new(),
             path: None,
             looked_in: None,
+            connection_at: None,
         }
     }
 }
@@ -322,6 +330,12 @@ impl App {
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// The connection under the cursor in the Connections view.
+    #[must_use]
+    pub fn connection_at(&self) -> Option<usize> {
+        self.connection_at
     }
 
     #[cfg(test)]
@@ -445,6 +459,15 @@ impl App {
                 ("Esc", "back"),
             ];
         }
+        if let Some(Overlay::NewConnection(_)) = self.overlay {
+            return &[
+                ("Tab", "next field"),
+                ("left/right", "change"),
+                ("space", "toggle"),
+                ("Enter", "create"),
+                ("Esc", "cancel"),
+            ];
+        }
 
         match self.tab {
             Tab::Traffic => &[
@@ -456,7 +479,12 @@ impl App {
             Tab::Scenarios => &[("up/down", "choose"), ("Enter", "run"), ("x", "stop")],
             Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
             Tab::Frames => &[("up/down", "choose"), ("Enter", "send")],
-            Tab::Connections => &[],
+            Tab::Connections => &[
+                ("up/down", "choose"),
+                ("Enter", "toggle"),
+                ("n", "new"),
+                ("x", "remove"),
+            ],
         }
     }
 
@@ -499,7 +527,7 @@ impl App {
             Tab::Scenarios => self.running_scenarios(key.code),
             Tab::HexInject => self.injecting(key.code),
             Tab::Frames => self.framing(key.code),
-            Tab::Connections => false,
+            Tab::Connections => self.connecting(key.code),
         };
         if taken {
             return;
@@ -509,6 +537,9 @@ impl App {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('?') => self.overlay = Some(Overlay::Keys),
             KeyCode::Char('o') => self.browse(),
+            KeyCode::Char('n') if self.tab == Tab::Connections => {
+                self.overlay = Some(Overlay::NewConnection(ConnectionForm::default()));
+            }
             KeyCode::Tab => self.tab = Tab::at(self.tab.index() + 1),
             KeyCode::BackTab => self.tab = Tab::at(self.tab.index() + Tab::ALL.len() - 1),
             KeyCode::Char(digit @ '1'..='5') => {
@@ -530,6 +561,18 @@ impl App {
                     self.overlay = None;
                 }
             }
+            Overlay::NewConnection(form) => match code {
+                KeyCode::Tab | KeyCode::Down => form.next(),
+                KeyCode::BackTab | KeyCode::Up => form.previous(),
+                KeyCode::Left => form.cycle(-1),
+                KeyCode::Right => form.cycle(1),
+                KeyCode::Char(' ') => form.toggle(),
+                KeyCode::Backspace => form.backspace(),
+                KeyCode::Char(letter) => form.type_char(letter),
+                KeyCode::Esc => self.overlay = None,
+                KeyCode::Enter => self.submit_connection(),
+                _ => {}
+            },
             Overlay::Browse(browser) => match code {
                 KeyCode::Down => browser.picker.step(1),
                 KeyCode::Up => browser.picker.step(-1),
@@ -596,6 +639,101 @@ impl App {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("/"));
         self.overlay = Some(Overlay::Browse(Browser::opening(at)));
+    }
+
+    /// Validates the connection form under focus and, on success, opens it.
+    ///
+    /// Left open on failure, with the reason in the form's own trouble line:
+    /// the fields typed so far are worth keeping while it is fixed.
+    fn submit_connection(&mut self) {
+        let Some(Overlay::NewConnection(form)) = &mut self.overlay else {
+            return;
+        };
+        let Some((id, config)) = form.submit(&self.session.connections) else {
+            return;
+        };
+        let retry = form.auto_reconnect().then(RetryPolicy::standard);
+        let autoconnect = form.autoconnect();
+        self.engine.connect(id.clone(), config.clone(), retry);
+        self.session.connections.push((
+            id,
+            ConnectionEntry {
+                config,
+                status: ConnectionStatus::Connecting,
+                retry,
+                autoconnect,
+            },
+        ));
+        self.overlay = None;
+    }
+
+    /// The keys the connection list answers to, and whether it took this one.
+    fn connecting(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.pick_connection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.pick_connection(-1),
+            KeyCode::Enter => self.toggle_selected_connection(),
+            KeyCode::Char('a') => self.toggle_selected_autoconnect(),
+            KeyCode::Char('x') => self.remove_selected_connection(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn pick_connection(&mut self, delta: isize) {
+        let Some(last) = self.session.connections.len().checked_sub(1) else {
+            return;
+        };
+        self.connection_at = Some(
+            self.connection_at
+                .unwrap_or(0)
+                .saturating_add_signed(delta)
+                .min(last),
+        );
+    }
+
+    /// The connection a key would act on: the one under the cursor, or the
+    /// first one when nothing has been chosen yet.
+    fn selected_connection(&self) -> Option<sim_core::ConnectionId> {
+        let at = self.connection_at.unwrap_or(0);
+        self.session.connections.get(at).map(|(id, _)| id.clone())
+    }
+
+    /// Connects a disconnected link with the settings it already has, or
+    /// disconnects one that is up.
+    fn toggle_selected_connection(&mut self) {
+        let Some(id) = self.selected_connection() else {
+            return;
+        };
+        match self.session.status_of(&id) {
+            Some(ConnectionStatus::Disconnected) => {
+                if let Some((config, retry)) = self.session.begin_reconnect(&id) {
+                    self.engine.connect(id, config, retry);
+                }
+            }
+            Some(_) => self.engine.disconnect(id),
+            None => {}
+        }
+    }
+
+    fn toggle_selected_autoconnect(&mut self) {
+        let Some(id) = self.selected_connection() else {
+            return;
+        };
+        if let Some(entry) = self.session.connection_mut(&id) {
+            entry.autoconnect = !entry.autoconnect;
+        }
+    }
+
+    /// Removal only reaches a link that is down, the same as the window: one
+    /// still up has to be told to stop before it can be forgotten.
+    fn remove_selected_connection(&mut self) {
+        let Some(id) = self.selected_connection() else {
+            return;
+        };
+        if self.session.status_of(&id) == Some(ConnectionStatus::Disconnected) {
+            self.session.remove_connection(&id);
+        }
     }
 
     /// The keys the frame list answers to, and whether it took this one.

@@ -21,6 +21,7 @@ use sim_session::state::{Direction, LogEntry};
 use sim_session::{hex, links, traffic};
 
 use crate::app::{App, Browser, Overlay, Picker, Tab};
+use crate::connection_form::ConnectionForm;
 
 /// The two directions, told apart at a glance rather than read.
 const SENT: Color = Color::Rgb(90, 140, 220);
@@ -54,6 +55,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(Overlay::Keys) => key_map(frame, frame.area(), app),
         Some(Overlay::Pick(picker)) => list_over(frame, frame.area(), picker),
         Some(Overlay::Browse(browser)) => walk_over(frame, frame.area(), browser),
+        Some(Overlay::NewConnection(form)) => connection_form_over(frame, frame.area(), form),
         None => {}
     }
 }
@@ -108,7 +110,7 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(format!(" Connections ({}) ", links.len()));
 
     if links.is_empty() {
-        let empty = Paragraph::new("No link. Open a project that describes one.".dim())
+        let empty = Paragraph::new("No link. Press o to open a project, or n to add one.".dim())
             .wrap(Wrap { trim: true })
             .block(block);
         frame.render_widget(empty, area);
@@ -127,8 +129,12 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
 
     let rows: Vec<Line> = links
         .iter()
-        .map(|(id, entry)| {
-            Line::from(vec![
+        .enumerate()
+        .map(|(at, (id, entry))| {
+            let auto = if entry.autoconnect { "*" } else { " " };
+            let retry = if entry.retry.is_some() { "~" } else { " " };
+            let line = Line::from(vec![
+                Span::raw(format!("{auto} {retry} ")).dim(),
                 Span::styled(
                     format!("{:named$}", id.0),
                     Style::new().add_modifier(Modifier::BOLD),
@@ -137,11 +143,55 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(format!("{:stated$}", links::status(entry.status))),
                 Span::raw("  "),
                 Span::raw(links::summary(entry)).dim(),
-            ])
+            ]);
+            if app.connection_at() == Some(at) {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
         })
         .collect();
 
     frame.render_widget(Paragraph::new(rows).block(block), area);
+}
+
+/// Adding a connection, or fixing the one field it complained about.
+fn connection_form_over(frame: &mut Frame, area: Rect, form: &ConnectionForm) {
+    let lines = form.lines();
+    let widest = lines
+        .iter()
+        .map(|(label, _, _)| label.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut rendered: Vec<Line> = lines
+        .into_iter()
+        .map(|(label, value, focused)| {
+            let line = Line::from(vec![
+                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(value),
+            ]);
+            if focused {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    if let Some(trouble) = form.trouble() {
+        rendered.push(Line::from(""));
+        rendered.push(Line::from(Span::raw(trouble.to_owned()).fg(ERROR)));
+    }
+
+    let wanted = rendered.iter().map(Line::width).max().unwrap_or(0) + 4;
+    let popup = centred(area, wanted, rendered.len() + 4);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(rendered).block(Block::bordered().title(" New connection ")),
+        popup,
+    );
 }
 
 fn frames_view(frame: &mut Frame, area: Rect, app: &App) {

@@ -126,8 +126,22 @@ fn the_keys_are_offered_without_being_asked_for() {
     let shown = screen(&mut App::default());
     let last = shown.lines().last().expect("a hint line").to_owned();
 
+    // The way out and the way to the rest never give way to a view's own
+    // keys, whichever view is on show first.
     assert!(last.contains("quit"), "the hint line reads: {last}");
-    assert!(last.contains("Tab"));
+    assert!(last.contains("keys"), "{last}");
+}
+
+/// Moving between views is not always in the one-line hint, since a busy
+/// view crowds it out, but it is always in the full map.
+#[test]
+fn moving_between_views_is_always_in_the_full_map() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('?'));
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("next view"), "{shown}");
+    assert!(shown.contains("previous view"), "{shown}");
 }
 
 fn linked(app: &mut App, name: &str, status: ConnectionStatus) {
@@ -927,4 +941,118 @@ fn backing_out_of_the_walk_opens_nothing() {
 
     assert!(app.overlay().is_none());
     assert!(app.opened().is_none());
+}
+
+#[test]
+fn a_udp_connection_can_be_added_without_leaving_the_terminal() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('n'));
+    for letter in "bus".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("bus"), "{shown}");
+    assert!(shown.contains("UDP"), "{shown}");
+    assert!(app.overlay().is_none(), "the form closed on success");
+}
+
+#[test]
+fn a_name_is_required() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("required"), "{shown}");
+    assert!(app.overlay().is_some(), "the form stays open to fix it");
+}
+
+#[test]
+fn cycling_the_kind_changes_which_fields_are_asked_for() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Right);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Address"), "{shown}");
+    assert!(!shown.contains("Bind (local)"), "{shown}");
+}
+
+#[test]
+fn a_serial_connection_asks_for_serial_settings() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Right);
+    }
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("Baud rate"), "{shown}");
+    assert!(shown.contains("Parity"), "{shown}");
+}
+
+#[test]
+fn a_typed_multicast_address_asks_for_an_interface_instead_of_a_bind() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a')); // name
+    press(&mut app, KeyCode::Tab); // kind, still udp
+    press(&mut app, KeyCode::Tab); // remote, prefilled
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    for letter in "239.1.1.1:9000".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("Interface"), "{shown}");
+    assert!(!shown.contains("Bind (local)"), "{shown}");
+}
+
+#[test]
+fn cancelling_the_form_creates_nothing() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('n'));
+    for letter in "bus".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay().is_none());
+    assert!(app.session().connections.is_empty());
+}
+
+#[test]
+fn a_link_can_be_removed_once_it_is_down() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Disconnected);
+    press(&mut app, KeyCode::Char('x'));
+
+    assert!(app.session().connections.is_empty());
+}
+
+/// The window refuses this too: a link has to be told to stop before it can
+/// be forgotten.
+#[test]
+fn a_running_link_cannot_be_removed_out_from_under_itself() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('x'));
+
+    assert_eq!(app.session().connections.len(), 1);
+}
+
+#[test]
+fn autoconnect_can_be_flipped_from_the_list() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Disconnected);
+    assert!(!app.session().connections[0].1.autoconnect);
+
+    press(&mut app, KeyCode::Char('a'));
+    assert!(app.session().connections[0].1.autoconnect);
 }

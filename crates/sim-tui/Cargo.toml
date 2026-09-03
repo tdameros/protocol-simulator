@@ -14,3 +14,4 @@ path = "src/main.rs"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 sim-core = { path = "../sim-core" }
 sim-session = { path = "../sim-session" }
+tokio-serial = "5.5.0"
