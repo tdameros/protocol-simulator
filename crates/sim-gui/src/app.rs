@@ -125,13 +125,14 @@ impl SimApp {
                     self.engine.connect(id, config, retry);
                 }
                 let mut monitors = restored.monitors;
-                self.dock_state = project::layout_of(&read, &mut monitors);
+                let (dock, layout_warning) = project::layout_of(&read, &mut monitors);
+                self.dock_state = dock;
                 self.state.restore_monitors(monitors);
                 ctx.set_theme(project::theme_of(restored.theme));
                 self.path = Some(path.to_path_buf());
                 self.saved = self.snapshot(project::theme_of(restored.theme));
                 self.prefs.remember(path);
-                self.state.last_error = None;
+                self.state.last_error = layout_warning;
             }
             Err(error) => {
                 // A project that will not open is one that should stop being

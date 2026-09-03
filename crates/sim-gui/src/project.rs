@@ -46,22 +46,26 @@ pub fn capture(
 /// The arrangement a restored project opens with, and the monitors that go
 /// with it.
 ///
-/// A layout the file does not carry, or one this build cannot read, falls back
-/// to the default rather than refusing the project: panes are worth less than
-/// the settings beside them.
+/// A layout the file does not carry falls back to the default without
+/// comment, since there is nothing to have gone wrong. One this build cannot
+/// read also falls back rather than refusing the project, panes being worth
+/// less than the settings beside them, but says so: a project silently losing
+/// its arrangement on every open would never get noticed until someone asked
+/// where their panes went.
 #[must_use]
 pub fn layout_of(
     project: &Project,
     monitors: &mut BTreeMap<MonitorId, MonitorState>,
-) -> DockState<Tab> {
-    let stored = project
-        .ui
-        .layout
-        .clone()
-        .and_then(|value| value.try_into::<DockState<Tab>>().ok());
-    match stored {
-        Some(dock) => reconciled(dock, monitors),
-        None => default_layout(monitors),
+) -> (DockState<Tab>, Option<String>) {
+    match &project.ui.layout {
+        None => (default_layout(monitors), None),
+        Some(value) => match value.clone().try_into::<DockState<Tab>>() {
+            Ok(dock) => (reconciled(dock, monitors), None),
+            Err(error) => (
+                default_layout(monitors),
+                Some(format!("Could not restore the pane layout: {error:#}.")),
+            ),
+        },
     }
 }
 
@@ -197,7 +201,8 @@ mod tests {
         let mut state = Session::default();
         let restored = project.apply(&mut state, None).expect("should apply");
         let mut monitors = restored.monitors;
-        let dock = layout_of(&project, &mut monitors);
+        let (dock, warning) = layout_of(&project, &mut monitors);
+        assert!(warning.is_none(), "{warning:?}");
         state.restore_monitors(monitors);
 
         let shown: Vec<MonitorId> = dock
@@ -256,10 +261,47 @@ mod tests {
             .apply(&mut Session::default(), None)
             .expect("should apply")
             .monitors;
-        let back = layout_of(&read, &mut restored);
+        let (back, warning) = layout_of(&read, &mut restored);
+        assert!(warning.is_none(), "{warning:?}");
 
         let was: Vec<Tab> = dock.iter_all_tabs().map(|(_, tab)| *tab).collect();
         let now: Vec<Tab> = back.iter_all_tabs().map(|(_, tab)| *tab).collect();
         assert_eq!(now, was, "through:\n{text}");
+    }
+
+    /// A layout this build cannot read still opens the project, but says why
+    /// the panes came back to the default rather than doing so in silence.
+    #[test]
+    fn a_layout_this_build_cannot_read_says_so() {
+        let project = Project {
+            ui: UiSpec {
+                theme: ThemeSpec::Light,
+                hex_values: false,
+                layout: Some(toml::Value::String("not a dock".to_owned())),
+            },
+            ..Project::default()
+        };
+
+        let (dock, warning) = layout_of(&project, &mut BTreeMap::new());
+
+        assert_eq!(
+            dock.iter_all_tabs()
+                .map(|(_, tab)| *tab)
+                .collect::<Vec<_>>(),
+            default_layout(&mut BTreeMap::new())
+                .iter_all_tabs()
+                .map(|(_, tab)| *tab)
+                .collect::<Vec<_>>(),
+        );
+        assert!(warning.is_some(), "a dropped layout is worth a word");
+    }
+
+    /// No layout at all, which every fresh project starts as, is not a
+    /// problem worth a word.
+    #[test]
+    fn no_layout_at_all_is_not_a_warning() {
+        let project = Project::default();
+        let (_, warning) = layout_of(&project, &mut BTreeMap::new());
+        assert!(warning.is_none(), "{warning:?}");
     }
 }
