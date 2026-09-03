@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use sim_session::engine_handle::EngineHandle;
+use sim_session::hex;
 use sim_session::project::Project;
 use sim_session::reading::{self, Reading};
 use sim_session::scenarios;
@@ -143,6 +144,13 @@ impl Picker {
 pub struct App {
     tab: Tab,
     overlay: Option<Overlay>,
+    /// Whether a box has the keyboard.
+    ///
+    /// A box being typed into takes every letter, digits included, so while one
+    /// does the keys that move between views are not the view's to take. Said
+    /// as a state rather than left implicit, or the hint line would promise a
+    /// way out that types a `q` instead.
+    editing: bool,
     running: bool,
     session: Session,
     engine: EngineHandle,
@@ -159,6 +167,7 @@ impl Default for App {
         Self {
             tab: Tab::Connections,
             overlay: None,
+            editing: false,
             running: true,
             session,
             engine: EngineHandle::new(),
@@ -285,10 +294,23 @@ impl App {
 
     /// The way out, and the way to the rest.
     ///
-    /// Kept apart because these two are never dropped for want of room: not
-    /// knowing how to leave a terminal program is how a session gets killed
-    /// from another window.
+    /// Kept apart because these are never dropped for want of room: not knowing
+    /// how to leave a terminal program is how a session gets killed from
+    /// another window.
     pub const ESCAPES: [(&'static str, &'static str); 2] = [("?", "keys"), ("q", "quit")];
+
+    /// The way out of wherever the keyboard currently is.
+    ///
+    /// A box being typed into swallows `q`, so promising it there would be a
+    /// lie. What it does answer to is `Esc`.
+    #[must_use]
+    pub fn escapes(&self) -> &'static [(&'static str, &'static str)] {
+        if self.editing {
+            &[("Esc", "done")]
+        } else {
+            &Self::ESCAPES
+        }
+    }
 
     /// What the view on show adds to them.
     ///
@@ -298,6 +320,10 @@ impl App {
     pub fn view_keys(&self) -> &'static [(&'static str, &'static str)] {
         // An overlay has the keyboard, so it is its keys that are worth the
         // room: the view behind it answers to nothing while it is up.
+        if self.editing {
+            return &[("Enter", "send")];
+        }
+
         match self.overlay {
             Some(Overlay::Pick(_)) => {
                 return &[
@@ -319,6 +345,7 @@ impl App {
                 ("f", "follow"),
             ],
             Tab::Scenarios => &[("up/down", "choose"), ("Enter", "run"), ("x", "stop")],
+            Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
             _ => &[],
         }
     }
@@ -338,11 +365,17 @@ impl App {
             return;
         }
 
+        if self.editing {
+            self.typing(key.code);
+            return;
+        }
+
         // What the view does with a key comes first: a list has to have Up and
         // Down before anything else claims them.
         let taken = match self.tab {
             Tab::Traffic => self.watching(key.code),
             Tab::Scenarios => self.running_scenarios(key.code),
+            Tab::HexInject => self.injecting(key.code),
             _ => false,
         };
         if taken {
@@ -411,6 +444,55 @@ impl App {
         if !candidates.is_empty() {
             self.overlay = Some(Overlay::Pick(Picker::new("Read as", candidates)));
         }
+    }
+
+    /// Whether a box has the keyboard.
+    #[must_use]
+    pub fn is_editing(&self) -> bool {
+        self.editing
+    }
+
+    /// What the focused box does with a key. It takes all of them.
+    fn typing(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(letter) => self.session.hex_input.push(letter),
+            KeyCode::Backspace => {
+                self.session.hex_input.pop();
+            }
+            KeyCode::Esc => self.editing = false,
+            KeyCode::Enter => {
+                self.inject();
+                self.editing = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// The keys the injection view answers to while nothing is being typed.
+    fn injecting(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Enter | KeyCode::Char('i') => self.editing = true,
+            KeyCode::Char('x') => self.session.hex_input.clear(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Sends what is typed, to the link the project named.
+    fn inject(&mut self) {
+        let Ok(bytes) = hex::parse(&self.session.hex_input) else {
+            return;
+        };
+        let Some(id) = self
+            .session
+            .hex_target
+            .clone()
+            .or_else(|| self.session.connections.first().map(|(id, _)| id.clone()))
+        else {
+            self.session.last_error = Some("No link to send on.".to_owned());
+            return;
+        };
+        self.engine.send_raw(id, bytes);
     }
 
     /// The keys the scenario list answers to, and whether it took this one.

@@ -57,7 +57,7 @@ fn a_digit_goes_straight_to_its_view() {
     press(&mut app, KeyCode::Char('3'));
 
     assert_eq!(app.tab(), crate::app::Tab::HexInject);
-    assert!(screen(&mut app).contains("Bytes typed by hand"));
+    assert!(screen(&mut app).contains("Hex injection"));
 }
 
 #[test]
@@ -590,4 +590,76 @@ fn a_running_scenario_says_how_far_it_has_got() {
         !shown.contains("2 steps, once"),
         "the shape gives way: {shown}"
     );
+}
+
+#[test]
+fn bytes_typed_by_hand_are_counted_before_they_are_sent() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    for letter in "AA55".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("2 byte(s) ready"), "{shown}");
+    assert!(shown.contains("on bus"), "{shown}");
+}
+
+#[test]
+fn a_half_typed_byte_says_what_is_wrong_with_it() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('A'));
+
+    assert!(
+        screen(&mut app).contains("Odd number"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+/// A box being typed into swallows every letter, so the keys that move between
+/// views are not the view's to take while one does.
+#[test]
+fn a_digit_typed_into_the_box_does_not_change_the_view() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('2'));
+
+    assert_eq!(app.tab(), crate::app::Tab::HexInject);
+    assert!(screen(&mut app).contains("1 byte") || screen(&mut app).contains("Odd"));
+}
+
+/// And promising a way out that types a letter instead would be a lie.
+#[test]
+fn the_offered_way_out_is_the_one_that_works() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('3'));
+
+    let last = |app: &mut App| screen(app).lines().last().expect("a hint line").to_owned();
+    assert!(last(&mut app).contains("q quit"));
+
+    press(&mut app, KeyCode::Enter);
+    let hints = last(&mut app);
+    assert!(!hints.contains("q quit"), "{hints}");
+    assert!(hints.contains("Esc done"), "{hints}");
+}
+
+#[test]
+fn escape_gives_the_keyboard_back_to_the_view() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.is_editing());
+
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.is_editing());
+
+    press(&mut app, KeyCode::Char('1'));
+    assert_eq!(app.tab(), crate::app::Tab::Connections);
 }

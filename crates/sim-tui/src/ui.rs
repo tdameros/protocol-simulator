@@ -83,7 +83,8 @@ fn view(frame: &mut Frame, area: Rect, app: &mut App) {
         Tab::Connections => connections(frame, area, app),
         Tab::Traffic => watch(frame, area, app),
         Tab::Scenarios => scenarios_view(frame, area, app),
-        tab => pending(frame, area, tab),
+        Tab::HexInject => inject_view(frame, area, app),
+        tab @ Tab::Frames => pending(frame, area, tab),
     }
 }
 
@@ -138,6 +139,46 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     frame.render_widget(Paragraph::new(rows).block(block), area);
+}
+
+fn inject_view(frame: &mut Frame, area: Rect, app: &App) {
+    let typed = &app.session().hex_input;
+    let target = app
+        .session()
+        .hex_target
+        .clone()
+        .or_else(|| app.session().connections.first().map(|(id, _)| id.clone()));
+
+    let said = match hex::parse(typed) {
+        Ok(bytes) => Span::raw(format!("{} byte(s) ready to send.", bytes.len())),
+        // Nothing typed is not a mistake to point at, only a box not filled in.
+        Err(hex::Problem::Empty) => Span::raw("Type hexadecimal bytes.").dim(),
+        Err(problem) => Span::raw(problem.to_string()).fg(ERROR),
+    };
+
+    let on = match &target {
+        Some(id) => Span::raw(format!("on {}", id.0)),
+        None => Span::raw("No link to send on.").fg(ERROR),
+    };
+
+    // The cursor is drawn rather than left to the terminal: nothing else on
+    // screen says which box has the keyboard.
+    let box_text = if app.is_editing() {
+        format!("{typed}_")
+    } else {
+        typed.clone()
+    };
+
+    let body = Paragraph::new(vec![
+        Line::from(Span::raw(box_text)),
+        Line::from(""),
+        Line::from(said),
+        Line::from(on),
+    ])
+    .wrap(Wrap { trim: false })
+    .block(Block::bordered().title(" Hex injection "));
+
+    frame.render_widget(body, area);
 }
 
 fn scenarios_view(frame: &mut Frame, area: Rect, app: &App) {
@@ -391,7 +432,7 @@ fn hint_line(frame: &mut Frame, area: Rect, app: &App) {
     // The way out keeps its room whatever else has to go. What the view adds
     // comes next, being the keys the screen in front of you answers to, and
     // moving between views is what gets dropped first on a narrow terminal.
-    let escapes = hints(&App::ESCAPES, width);
+    let escapes = hints(app.escapes(), width);
     let room = width.saturating_sub(escapes.width() + 3);
     let offered: Vec<(&str, &str)> = app
         .view_keys()
@@ -439,7 +480,7 @@ fn key_map(frame: &mut Frame, area: Rect, app: &App) {
         .view_keys()
         .iter()
         .chain(App::KEYS.iter())
-        .chain(App::ESCAPES.iter())
+        .chain(app.escapes().iter())
         .copied()
         .collect();
 
