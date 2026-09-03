@@ -57,12 +57,64 @@ impl Tab {
     }
 }
 
+/// Which pane of the Frames view a key acts on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FramesFocus {
+    Library,
+    Fields,
+}
+
+/// One line of a frame's detail: a field on its own, or one flag inside a
+/// bitfield.
+///
+/// Flattened so navigation is one dimension: a bitfield's flags are things to
+/// move onto and edit exactly as a plain field is.
+#[derive(Clone, Copy)]
+pub enum FieldRow {
+    Field(usize),
+    Bit { field: usize, bit: usize },
+}
+
+/// Every row a frame's detail draws, in the order it draws them.
+pub fn field_rows(frame: &sim_core::frame::FrameDef) -> Vec<FieldRow> {
+    let mut rows = Vec::new();
+    for (index, field) in frame.fields.iter().enumerate() {
+        rows.push(FieldRow::Field(index));
+        if let sim_core::frame::FieldKind::Bits { bits, .. } = &field.kind {
+            rows.extend((0..bits.len()).map(|bit| FieldRow::Bit { field: index, bit }));
+        }
+    }
+    rows
+}
+
 /// What is laid over the view, taking the keys the view would otherwise get.
+/// What choosing an answer in [`Overlay::Pick`] does with it.
+pub enum PickPurpose {
+    /// Settles which definition a captured row is read through.
+    DecodeAs,
+    /// Settles the value of one enum field, by variant name.
+    EnumField { field: usize },
+}
+
+/// One value typed as text, and what it belongs to.
+pub struct EditBox {
+    pub title: String,
+    pub text: String,
+    target: EditTarget,
+}
+
+enum EditTarget {
+    Field(usize),
+    Bit { field: usize, bit: usize },
+}
+
 pub enum Overlay {
     /// The key map.
     Keys,
     /// One answer to be chosen from a list.
-    Pick(Picker),
+    Pick(Picker, PickPurpose),
+    /// One value typed as text: a number, some bytes, a run of characters.
+    EditText(EditBox),
     /// A file to be found on this machine.
     Browse(Browser),
     /// A connection being described before it exists.
@@ -259,6 +311,15 @@ pub struct App {
     looked_in: Option<PathBuf>,
     /// The connection under the cursor in the Connections view.
     connection_at: Option<usize>,
+    /// Which pane of the Frames view a key acts on.
+    frame_focus: FramesFocus,
+    /// The row under the cursor in the fields pane, and the frame it belongs
+    /// to.
+    ///
+    /// The frame is kept alongside the index so that switching to a
+    /// differently shaped frame resets the cursor rather than landing on
+    /// whatever row happened to share its number.
+    field_at: Option<(String, usize)>,
 }
 
 impl Default for App {
@@ -277,6 +338,8 @@ impl Default for App {
             path: None,
             looked_in: None,
             connection_at: None,
+            frame_focus: FramesFocus::Library,
+            field_at: None,
         }
     }
 }
@@ -336,6 +399,23 @@ impl App {
     #[must_use]
     pub fn connection_at(&self) -> Option<usize> {
         self.connection_at
+    }
+
+    /// Whether a key in the Frames view acts on the frame list or the fields
+    /// of the one chosen.
+    #[must_use]
+    pub fn frame_focus_is_fields(&self) -> bool {
+        self.frame_focus == FramesFocus::Fields
+    }
+
+    /// The row under the cursor in the fields pane, for the frame currently
+    /// on show.
+    #[must_use]
+    pub fn field_at(&self, frame: &str) -> Option<usize> {
+        match &self.field_at {
+            Some((name, at)) if name == frame => Some(*at),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -443,7 +523,7 @@ impl App {
         // A list has the keyboard, so its keys are the ones worth the room. The
         // key map does not: it is what you open to read the view's own keys, so
         // it falls through to them.
-        if let Some(Overlay::Pick(_)) = self.overlay {
+        if let Some(Overlay::Pick(_, _)) = self.overlay {
             return &[
                 ("up/down", "choose"),
                 ("type", "narrow"),
@@ -468,6 +548,9 @@ impl App {
                 ("Esc", "cancel"),
             ];
         }
+        if let Some(Overlay::EditText(_)) = self.overlay {
+            return &[("Enter", "apply"), ("Esc", "cancel")];
+        }
 
         match self.tab {
             Tab::Traffic => &[
@@ -478,7 +561,13 @@ impl App {
             ],
             Tab::Scenarios => &[("up/down", "choose"), ("Enter", "run"), ("x", "stop")],
             Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
-            Tab::Frames => &[("up/down", "choose"), ("Enter", "send")],
+            Tab::Frames if self.frame_focus == FramesFocus::Fields => &[
+                ("up/down", "choose"),
+                ("Enter", "edit"),
+                ("s", "send"),
+                ("Left", "list"),
+            ],
+            Tab::Frames => &[("up/down", "choose"), ("Right", "fields"), ("s", "send")],
             Tab::Connections => &[
                 ("up/down", "choose"),
                 ("Enter", "toggle"),
@@ -588,21 +677,29 @@ impl App {
                 KeyCode::Char(letter) => browser.picker.typing(letter),
                 _ => {}
             },
-            Overlay::Pick(picker) => match code {
+            Overlay::Pick(picker, purpose) => match code {
                 KeyCode::Down => picker.step(1),
                 KeyCode::Up => picker.step(-1),
                 KeyCode::Backspace => picker.rubbed_out(),
                 KeyCode::Esc => self.overlay = None,
                 KeyCode::Enter => {
                     let taken = picker.taken();
+                    let purpose = std::mem::replace(purpose, PickPurpose::DecodeAs);
                     self.overlay = None;
-                    if let (Some(name), Some(monitor)) =
-                        (taken, self.session.monitors.values_mut().next())
-                    {
-                        monitor.decode_as = Some(name);
+                    if let Some(name) = taken {
+                        self.take_picked(purpose, name);
                     }
                 }
                 KeyCode::Char(letter) => picker.typing(letter),
+                _ => {}
+            },
+            Overlay::EditText(edit) => match code {
+                KeyCode::Backspace => {
+                    edit.text.pop();
+                }
+                KeyCode::Esc => self.overlay = None,
+                KeyCode::Enter => self.submit_edit(),
+                KeyCode::Char(letter) => edit.text.push(letter),
                 _ => {}
             },
         }
@@ -624,7 +721,10 @@ impl App {
             .map(|frame| frame.name.clone())
             .collect();
         if !candidates.is_empty() {
-            self.overlay = Some(Overlay::Pick(Picker::new("Read as", candidates)));
+            self.overlay = Some(Overlay::Pick(
+                Picker::new("Read as", candidates),
+                PickPurpose::DecodeAs,
+            ));
         }
     }
 
@@ -736,15 +836,35 @@ impl App {
         }
     }
 
-    /// The keys the frame list answers to, and whether it took this one.
+    /// The keys the Frames view answers to, and whether it took this one.
     fn framing(&mut self, code: KeyCode) -> bool {
         match code {
-            KeyCode::Down | KeyCode::Char('j') => self.pick_frame_in_library(1),
-            KeyCode::Up | KeyCode::Char('k') => self.pick_frame_in_library(-1),
-            KeyCode::Enter => self.send_selected_frame(),
+            KeyCode::Left => self.frame_focus = FramesFocus::Library,
+            KeyCode::Right if self.session.frames.selected_frame().is_some() => {
+                self.frame_focus = FramesFocus::Fields;
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.frame_move(1),
+            KeyCode::Up | KeyCode::Char('k') => self.frame_move(-1),
+            KeyCode::Char(' ') if self.frame_focus == FramesFocus::Fields => self.toggle_bit(),
+            KeyCode::Enter => match self.frame_focus {
+                FramesFocus::Library => {
+                    if self.session.frames.selected_frame().is_some() {
+                        self.frame_focus = FramesFocus::Fields;
+                    }
+                }
+                FramesFocus::Fields => self.edit_selected_field(),
+            },
+            KeyCode::Char('s') => self.send_selected_frame(),
             _ => return false,
         }
         true
+    }
+
+    fn frame_move(&mut self, delta: isize) {
+        match self.frame_focus {
+            FramesFocus::Library => self.pick_frame_in_library(delta),
+            FramesFocus::Fields => self.pick_field(delta),
+        }
     }
 
     fn pick_frame_in_library(&mut self, delta: isize) {
@@ -756,6 +876,249 @@ impl App {
             None => 0,
         };
         self.session.frames.selected = Some(at);
+    }
+
+    /// The rows of the frame on show, resetting the cursor when it is not the
+    /// frame the cursor was last on.
+    fn field_frame_rows(&mut self) -> Option<(sim_core::frame::FrameDef, Vec<FieldRow>)> {
+        let frame = self.session.frames.selected_frame()?.clone();
+        let rows = field_rows(&frame);
+        let fresh = self
+            .field_at
+            .as_ref()
+            .is_none_or(|(name, _)| *name != frame.name);
+        if fresh {
+            self.field_at = Some((frame.name.clone(), 0));
+        }
+        Some((frame, rows))
+    }
+
+    fn pick_field(&mut self, delta: isize) {
+        let Some((frame, rows)) = self.field_frame_rows() else {
+            return;
+        };
+        let Some(last) = rows.len().checked_sub(1) else {
+            return;
+        };
+        let at = self.field_at.as_ref().map_or(0, |(_, at)| *at);
+        self.field_at = Some((frame.name, at.saturating_add_signed(delta).min(last)));
+    }
+
+    /// Flips a single-bit flag under the cursor without going through an
+    /// editor: there is nothing to type for a value that is only ever 0 or 1.
+    fn toggle_bit(&mut self) {
+        let Some((frame, rows)) = self.field_frame_rows() else {
+            return;
+        };
+        let Some(&FieldRow::Bit { field, bit }) =
+            self.field_at.as_ref().and_then(|(_, at)| rows.get(*at))
+        else {
+            return;
+        };
+        let sim_core::frame::FieldKind::Bits { bits, .. } = &frame.fields[field].kind else {
+            return;
+        };
+        if bits[bit].width != 1 {
+            return;
+        }
+        let name = bits[bit].name.clone();
+        let values = self.session.frames.values_mut(&frame);
+        let held = values
+            .entry(frame.fields[field].name.clone())
+            .or_insert_with(|| {
+                sim_core::frame::value::Value::Bits(std::collections::BTreeMap::new())
+            });
+        if let sim_core::frame::value::Value::Bits(set) = held {
+            let slot = set.entry(name).or_insert(0);
+            *slot = u64::from(*slot == 0);
+        }
+    }
+
+    /// Opens the right editor for the row under the cursor: a list for an
+    /// enum, a toggle already done for a one-bit flag, a box to type into for
+    /// everything else. A checksum is computed, not edited.
+    fn edit_selected_field(&mut self) {
+        let Some((frame, rows)) = self.field_frame_rows() else {
+            return;
+        };
+        let Some(&row) = self.field_at.as_ref().and_then(|(_, at)| rows.get(*at)) else {
+            return;
+        };
+
+        match row {
+            FieldRow::Field(index) => {
+                let field = &frame.fields[index];
+                match &field.kind {
+                    sim_core::frame::FieldKind::Checksum { .. } => {
+                        self.session.last_error =
+                            Some("Computed automatically, on send.".to_owned());
+                    }
+                    sim_core::frame::FieldKind::Enum { variants, .. } => {
+                        let options: Vec<String> = variants
+                            .iter()
+                            .map(|variant| format!("{} = {}", variant.name, variant.value))
+                            .collect();
+                        self.overlay = Some(Overlay::Pick(
+                            Picker::new(field.name.clone(), options),
+                            PickPurpose::EnumField { field: index },
+                        ));
+                    }
+                    _ => {
+                        let values = self.session.frames.values_mut(&frame);
+                        let current = values.get(&field.name).cloned();
+                        let text = current.map_or_else(String::new, |value| match &field.kind {
+                            sim_core::frame::FieldKind::Bytes { .. } => {
+                                value.as_bytes().map_or_else(String::new, hex::packed)
+                            }
+                            sim_core::frame::FieldKind::Text { .. } => {
+                                value.as_text().unwrap_or_default().to_owned()
+                            }
+                            _ => reading::describe(field, &value, false),
+                        });
+                        self.overlay = Some(Overlay::EditText(EditBox {
+                            title: field.name.clone(),
+                            text,
+                            target: EditTarget::Field(index),
+                        }));
+                    }
+                }
+            }
+            FieldRow::Bit { field, bit } => {
+                let sim_core::frame::FieldKind::Bits { bits, .. } = &frame.fields[field].kind
+                else {
+                    return;
+                };
+                if bits[bit].width == 1 {
+                    self.toggle_bit();
+                    return;
+                }
+                let values = self.session.frames.values_mut(&frame);
+                let held = values
+                    .get(&frame.fields[field].name)
+                    .and_then(sim_core::frame::value::Value::as_bits)
+                    .and_then(|set| set.get(&bits[bit].name))
+                    .copied()
+                    .unwrap_or(0);
+                self.overlay = Some(Overlay::EditText(EditBox {
+                    title: bits[bit].name.clone(),
+                    text: held.to_string(),
+                    target: EditTarget::Bit { field, bit },
+                }));
+            }
+        }
+    }
+
+    /// Applies what a picker settled: which frame a row reads as, or which
+    /// enum variant a field now holds.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "consumed by one arm and not the other, moving it in either way"
+    )]
+    fn take_picked(&mut self, purpose: PickPurpose, taken: String) {
+        match purpose {
+            PickPurpose::DecodeAs => {
+                if let Some(monitor) = self.session.monitors.values_mut().next() {
+                    monitor.decode_as = Some(taken);
+                }
+            }
+            PickPurpose::EnumField { field } => {
+                let Some(frame) = self.session.frames.selected_frame().cloned() else {
+                    return;
+                };
+                // The label carries the value after " = ", which is the part
+                // that means something to the encoder.
+                let Some(value) = taken.rsplit(" = ").next().and_then(|v| v.parse().ok()) else {
+                    return;
+                };
+                self.session.frames.values_mut(&frame).insert(
+                    frame.fields[field].name.clone(),
+                    sim_core::frame::value::Value::Uint(value),
+                );
+            }
+        }
+    }
+
+    /// Reads what was typed into the box on show, and writes it into the
+    /// field or flag it belongs to.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a typed number is clamped to the field's own width by the encoder, \
+                  which is a truer check than one done here on the way in"
+    )]
+    fn submit_edit(&mut self) {
+        let Some(Overlay::EditText(edit)) = &self.overlay else {
+            return;
+        };
+        let text = edit.text.clone();
+        let target = match &edit.target {
+            EditTarget::Field(index) => EditTarget::Field(*index),
+            EditTarget::Bit { field, bit } => EditTarget::Bit {
+                field: *field,
+                bit: *bit,
+            },
+        };
+        let Some(frame) = self.session.frames.selected_frame().cloned() else {
+            self.overlay = None;
+            return;
+        };
+
+        match target {
+            EditTarget::Field(index) => {
+                let field = frame.fields[index].clone();
+                let written = match &field.kind {
+                    sim_core::frame::FieldKind::Scalar(scalar) if scalar.is_unsigned_integer() => {
+                        hex::read_number(&text)
+                            .map(|value| sim_core::frame::value::Value::Uint(value.max(0.0) as u64))
+                    }
+                    sim_core::frame::FieldKind::Scalar(
+                        sim_core::frame::ScalarType::F32 | sim_core::frame::ScalarType::F64,
+                    ) => hex::read_number(&text).map(sim_core::frame::value::Value::Float),
+                    sim_core::frame::FieldKind::Scalar(_) => hex::read_number(&text)
+                        .map(|value| sim_core::frame::value::Value::Int(value as i64)),
+                    sim_core::frame::FieldKind::Bytes { len } => {
+                        hex::parse(&text).ok().map(|mut bytes| {
+                            bytes.resize(*len, 0);
+                            sim_core::frame::value::Value::Bytes(bytes)
+                        })
+                    }
+                    sim_core::frame::FieldKind::Text { len } => {
+                        let mut text = text.clone();
+                        text.truncate(*len);
+                        Some(sim_core::frame::value::Value::Text(text))
+                    }
+                    sim_core::frame::FieldKind::Enum { .. }
+                    | sim_core::frame::FieldKind::Bits { .. }
+                    | sim_core::frame::FieldKind::Checksum { .. } => None,
+                };
+                if let Some(value) = written {
+                    self.session
+                        .frames
+                        .values_mut(&frame)
+                        .insert(field.name, value);
+                }
+            }
+            EditTarget::Bit { field, bit } => {
+                let sim_core::frame::FieldKind::Bits { bits, .. } = &frame.fields[field].kind
+                else {
+                    self.overlay = None;
+                    return;
+                };
+                if let Some(value) = hex::read_number(&text) {
+                    let name = bits[bit].name.clone();
+                    let values = self.session.frames.values_mut(&frame);
+                    let held = values
+                        .entry(frame.fields[field].name.clone())
+                        .or_insert_with(|| {
+                            sim_core::frame::value::Value::Bits(std::collections::BTreeMap::new())
+                        });
+                    if let sim_core::frame::value::Value::Bits(set) = held {
+                        set.insert(name, value.max(0.0) as u64);
+                    }
+                }
+            }
+        }
+        self.overlay = None;
     }
 
     /// Encodes the chosen frame from the values on show and sends it.

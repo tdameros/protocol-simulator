@@ -1056,3 +1056,189 @@ fn autoconnect_can_be_flipped_from_the_list() {
     press(&mut app, KeyCode::Char('a'));
     assert!(app.session().connections[0].1.autoconnect);
 }
+
+/// The whole point of the Frames view: a value typed by hand, sent as
+/// something other than zero.
+#[test]
+fn a_scalar_field_can_be_edited_before_sending() {
+    let mut app = App::default();
+    with_frames(&mut app, "a_scalar_field_can_be_edited_before_sending");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Down); // Status
+    press(&mut app, KeyCode::Right); // into its fields
+    press(&mut app, KeyCode::Enter); // edit sync
+    for letter in "1500".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("1500"), "{shown}");
+    assert!(
+        shown.contains("05 DC 00 00 00"),
+        "the bytes follow: {shown}"
+    );
+}
+
+#[test]
+fn an_enum_field_is_chosen_from_its_variants() {
+    let mut app = App::default();
+    with_frames(&mut app, "an_enum_field_is_chosen_from_its_variants");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Down); // Status
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Down); // state
+    press(&mut app, KeyCode::Enter);
+    let shown = screen(&mut app);
+    assert!(shown.contains("IDLE = 0"), "{shown}");
+    assert!(shown.contains("RUNNING = 2"), "{shown}");
+
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("RUNNING (2)"), "{shown}");
+    assert!(shown.contains("00 00 02 00 00"), "{shown}");
+}
+
+/// A flag that is only ever 0 or 1 flips on the spot: there is nothing to
+/// type.
+#[test]
+fn a_single_bit_flag_toggles_without_an_editor() {
+    let mut app = App::default();
+    with_bits(&mut app, "a_single_bit_flag_toggles_without_an_editor");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Down); // armed
+    press(&mut app, KeyCode::Char(' '));
+
+    let shown = screen(&mut app);
+    assert!(app.overlay().is_none(), "no editor was needed");
+    assert!(shown.contains("80"), "{shown}");
+}
+
+/// A flag wider than one bit is a number, and needs a box.
+#[test]
+fn a_wide_bit_field_is_typed_into_a_box() {
+    let mut app = App::default();
+    with_bits(&mut app, "a_wide_bit_field_is_typed_into_a_box");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Right);
+    // Rows: the field, then armed, link_up, fault, spare.
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay().is_some(), "spare is wider than one bit");
+    for letter in "9".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("09"), "{shown}");
+}
+
+#[test]
+fn escape_leaves_a_field_edit_unapplied() {
+    let mut app = App::default();
+    with_frames(&mut app, "escape_leaves_a_field_edit_unapplied");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Enter);
+    for letter in "1500".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Esc);
+
+    let shown = screen(&mut app);
+    assert!(!shown.contains("1500"), "{shown}");
+    assert!(shown.contains("00 00 00 00 00"), "{shown}");
+}
+
+/// Left steps back out to the frame list, and up/down there chooses a
+/// different frame rather than a different field.
+#[test]
+fn left_returns_focus_to_the_frame_list() {
+    let mut app = App::default();
+    with_frames(&mut app, "left_returns_focus_to_the_frame_list");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Right);
+    assert!(app.frame_focus_is_fields());
+
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Down);
+
+    assert!(
+        !app.frame_focus_is_fields(),
+        "left handed the keyboard back"
+    );
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("Status"),
+        "the second frame is now chosen: {shown}"
+    );
+}
+
+/// Switching to a differently shaped frame does not leave the cursor on
+/// whatever row happened to share its number.
+#[test]
+fn switching_frames_resets_the_field_cursor() {
+    let mut app = App::default();
+    with_frames(&mut app, "switching_frames_resets_the_field_cursor");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Down); // seq, row 1 of Heartbeat
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Down); // Status
+    press(&mut app, KeyCode::Right);
+    // Row 1 of Status is "state", an enum. Landing there would open a
+    // picker; the cursor resetting to row 0 opens a text box for "sync"
+    // instead.
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("┌ sync"),
+        "the box on sync, not state: {shown}"
+    );
+}
+
+/// The one field a person does not write: it is worked out on send.
+const GUARDED: &str = r#"
+name = "Guarded"
+endian = "big"
+
+[[field]]
+name = "id"
+type = "u8"
+
+[[field]]
+name = "crc"
+type = "xor8"
+covers = { from = "id", to = "id" }
+"#;
+
+fn with_checksum(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-crc-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("guarded.toml"), GUARDED).expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+}
+
+/// The one field a person does not write: it is worked out on send.
+#[test]
+fn a_checksum_field_cannot_be_edited() {
+    let mut app = App::default();
+    with_checksum(&mut app, "a_checksum_field_cannot_be_edited");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Down); // crc
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay().is_none(), "no box was opened");
+    let shown = screen(&mut app);
+    assert!(shown.contains("Computed automatically"), "{shown}");
+}

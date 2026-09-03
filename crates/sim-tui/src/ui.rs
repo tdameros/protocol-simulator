@@ -13,7 +13,7 @@ use ratatui::Frame;
 use sim_core::frame::codec;
 use sim_core::frame::value::seed_values;
 use sim_core::frame::value::Value;
-use sim_core::frame::{FieldDef, FieldKind};
+use sim_core::frame::{FieldDef, FieldKind, FrameDef};
 use sim_session::kinds;
 use sim_session::reading;
 use sim_session::scenarios;
@@ -53,8 +53,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match app.overlay() {
         Some(Overlay::Keys) => key_map(frame, frame.area(), app),
-        Some(Overlay::Pick(picker)) => list_over(frame, frame.area(), picker),
+        Some(Overlay::Pick(picker, _)) => list_over(frame, frame.area(), picker),
         Some(Overlay::Browse(browser)) => walk_over(frame, frame.area(), browser),
+        Some(Overlay::EditText(edit)) => edit_over(frame, frame.area(), edit),
         Some(Overlay::NewConnection(form)) => connection_form_over(frame, frame.area(), form),
         None => {}
     }
@@ -243,7 +244,7 @@ fn frames_view(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The chosen definition, its values, and the bytes they encode to.
 fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(chosen) = app.session().frames.selected_frame() else {
+    let Some(chosen) = app.session().frames.selected_frame().cloned() else {
         let hint = Paragraph::new("Choose a frame to see its fields.".dim())
             .block(Block::bordered().title(" Fields "));
         frame.render_widget(hint, area);
@@ -256,7 +257,7 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
         .saved_values()
         .get(&chosen.name)
         .cloned()
-        .unwrap_or_else(|| seed_values(chosen));
+        .unwrap_or_else(|| seed_values(&chosen));
 
     let widest = chosen
         .fields
@@ -266,39 +267,99 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or(0);
 
     let hex_values = app.session().hex_values;
-    let mut lines: Vec<Line> = Vec::new();
-    for field in &chosen.fields {
-        let held = values.get(&field.name);
-        let said = held.map_or_else(String::new, |value| {
-            reading::describe(field, value, hex_values)
-        });
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{:widest$}", field.name),
-                Style::new().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::raw(kinds::label_of(&field.kind)).dim(),
-            Span::raw("  "),
-            Span::raw(said),
-        ]));
-        lines.extend(bit_rows(field, held, hex_values));
-    }
+    let focused = app.frame_focus_is_fields();
+    let cursor = app.field_at(&chosen.name);
+    let rows = crate::app::field_rows(&chosen);
+
+    let mut lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(at, row)| {
+            let line = field_row_line(&chosen, row, &values, widest, hex_values);
+            if focused && cursor == Some(at) {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
 
     lines.push(Line::from(""));
     // What would go out, which is the answer the fields above are working
     // towards.
-    lines.push(match codec::encode(chosen, &values) {
+    lines.push(match codec::encode(&chosen, &values) {
         Ok(bytes) => Line::from(Span::raw(hex::spaced(&bytes))),
         Err(error) => Line::from(Span::raw(error.to_string()).fg(ERROR)),
     });
 
+    let title = if focused {
+        format!(" {} (fields) ", chosen.name)
+    } else {
+        format!(" {} ", chosen.name)
+    };
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(format!(" {} ", chosen.name))),
+            .block(Block::bordered().title(title)),
         area,
     );
+}
+
+/// One row of a frame's detail, field or single bit alike.
+fn field_row_line(
+    frame: &FrameDef,
+    row: &crate::app::FieldRow,
+    values: &sim_core::frame::value::FieldValues,
+    widest: usize,
+    hex: bool,
+) -> Line<'static> {
+    match *row {
+        crate::app::FieldRow::Field(index) => {
+            let field = &frame.fields[index];
+            let held = values.get(&field.name);
+            let said = held.map_or_else(String::new, |value| reading::describe(field, value, hex));
+            Line::from(vec![
+                Span::styled(
+                    format!("{:widest$}", field.name),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(kinds::label_of(&field.kind)).dim(),
+                Span::raw("  "),
+                Span::raw(said),
+            ])
+        }
+        crate::app::FieldRow::Bit { field, bit } => {
+            let FieldKind::Bits { repr, bits } = &frame.fields[field].kind else {
+                return Line::from("");
+            };
+            let bit_def = &bits[bit];
+            let position = kinds::bit_positions(*repr, bits)
+                .get(bit)
+                .cloned()
+                .flatten()
+                .unwrap_or_default();
+            let held = values
+                .get(&frame.fields[field].name)
+                .and_then(Value::as_bits)
+                .and_then(|set| set.get(&bit_def.name))
+                .copied()
+                .unwrap_or(0);
+            let said = reading::unsigned(held, bit_def.width.div_ceil(4) as usize, hex);
+            let tint = if held == 0 {
+                Style::new().add_modifier(Modifier::DIM)
+            } else {
+                Style::new().add_modifier(Modifier::BOLD)
+            };
+            Line::from(vec![
+                Span::raw(format!("  {}", bit_def.name)).dim(),
+                Span::raw("  "),
+                Span::raw(position).dim(),
+                Span::raw("  "),
+                Span::styled(said, tint),
+            ])
+        }
+    }
 }
 
 fn inject_view(frame: &mut Frame, area: Rect, app: &App) {
@@ -785,6 +846,20 @@ fn walk_over(frame: &mut Frame, area: Rect, browser: &Browser) {
         area,
         browser.picker(),
         &browser.at().display().to_string(),
+    );
+}
+
+/// One value, typed as text, over whatever the view was showing.
+fn edit_over(frame: &mut Frame, area: Rect, edit: &crate::app::EditBox) {
+    let box_text = format!("{}_", edit.text);
+    let lines = vec![Line::from(Span::raw(box_text))];
+    let wanted = (lines[0].width() + 4).max(edit.title.len() + 4);
+    let popup = centred(area, wanted, 3);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(format!(" {} ", edit.title))),
+        popup,
     );
 }
 
