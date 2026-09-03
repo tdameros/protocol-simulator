@@ -3953,6 +3953,7 @@ dependencies = [
  "sim-core",
  "tokio",
  "tokio-serial",
+ "toml",
 ]
 
 [[package]]

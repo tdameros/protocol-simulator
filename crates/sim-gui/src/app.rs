@@ -9,9 +9,10 @@ use egui_phosphor::regular as icons;
 
 use crate::panels::{AppTabViewer, Tab};
 use crate::prefs::Preferences;
-use crate::project::{self, Project, DEFAULT_FILE_NAME};
+use crate::project;
 use crate::theme;
 use sim_session::engine_handle::EngineHandle;
+use sim_session::project::{Project, DEFAULT_FILE_NAME};
 use sim_session::state::{Direction, LogEntry, Session};
 
 const APP_NAME: &str = "Protocol Simulator";
@@ -88,7 +89,11 @@ impl SimApp {
     }
 
     fn snapshot(&self, theme: Theme) -> Project {
-        Project::capture_settings(&self.state, theme, self.path.as_deref())
+        Project::capture_settings(
+            &self.state,
+            project::theme_spec(theme),
+            self.path.as_deref(),
+        )
     }
 
     fn is_dirty(&self, theme: Theme) -> bool {
@@ -111,20 +116,22 @@ impl SimApp {
 
     fn open(&mut self, ctx: &Context, path: &Path) {
         self.stop_everything();
-        let loaded = Project::read(path).and_then(|project| {
-            let restored = project.apply(&mut self.state, Some(path))?;
-            Ok(restored)
+        let loaded = Project::read(path).and_then(|read| {
+            let restored = read.apply(&mut self.state, Some(path))?;
+            Ok((read, restored))
         });
 
         match loaded {
-            Ok(restored) => {
+            Ok((read, restored)) => {
                 for (id, config, retry) in restored.connect {
                     self.engine.connect(id, config, retry);
                 }
-                self.dock_state = restored.layout;
-                ctx.set_theme(restored.theme);
+                let mut monitors = restored.monitors;
+                self.dock_state = project::layout_of(&read, &mut monitors);
+                self.state.restore_monitors(monitors);
+                ctx.set_theme(project::theme_of(restored.theme));
                 self.path = Some(path.to_path_buf());
-                self.saved = self.snapshot(restored.theme);
+                self.saved = self.snapshot(project::theme_of(restored.theme));
                 self.prefs.remember(path);
                 self.state.last_error = None;
             }
@@ -171,9 +178,10 @@ impl SimApp {
         // Set first: what the file holds depends on where it sits, paths inside
         // it being relative to it.
         self.path = Some(path.to_path_buf());
-        let project = Project::capture(&self.state, &self.dock_state, ctx.theme(), Some(path));
+        let described = project::capture(&self.state, &self.dock_state, ctx.theme(), Some(path));
+        let written = described.and_then(|project| project.write(path));
 
-        match project.write(path) {
+        match written {
             Ok(()) => {
                 self.saved = self.snapshot(ctx.theme());
                 self.prefs.remember(path);

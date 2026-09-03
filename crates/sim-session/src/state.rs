@@ -323,6 +323,7 @@ impl CompiledFilter<'_> {
     }
 }
 
+#[derive(Debug)]
 pub struct MonitorState {
     pub title: String,
     pub filter: TrafficFilter,
