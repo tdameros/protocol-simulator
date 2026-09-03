@@ -223,6 +223,23 @@ fn the_link_columns_keep_one_left_edge() {
 
 /// The frames a bench is watching, so a captured row has something to be read
 /// as.
+const HEARTBEAT: &str = r#"
+name = "Heartbeat"
+endian = "big"
+
+[[field]]
+name = "sync"
+type = "u16"
+
+[[field]]
+name = "seq"
+type = "u8"
+
+[[field]]
+name = "uptime"
+type = "u16"
+"#;
+
 const STATUS: &str = r#"
 name = "Status"
 endian = "big"
@@ -242,17 +259,24 @@ name = "rpm"
 type = "u16"
 "#;
 
-fn with_frames(app: &mut App) {
-    let dir = std::env::temp_dir().join(format!("sim-tui-{}", std::process::id()));
+/// A folder of definitions, one per test.
+///
+/// Named, because the tests in a binary share a process and run at once: a
+/// folder named after the process alone would have one test clearing what
+/// another is reading.
+fn with_frames(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch folder");
     std::fs::write(dir.join("status.toml"), STATUS).expect("a frame file");
+    std::fs::write(dir.join("heartbeat.toml"), HEARTBEAT).expect("a frame file");
     app.session_mut().frames.load_from(dir);
 }
 
 #[test]
 fn a_row_is_read_field_by_field_once_it_is_picked() {
     let mut app = App::default();
-    with_frames(&mut app);
+    with_frames(&mut app, "a_row_is_read_field_by_field_once_it_is_picked");
     captured(
         &mut app,
         &[0xAA, 0x55, 0x02, 0x05, 0xDC],
@@ -261,6 +285,10 @@ fn a_row_is_read_field_by_field_once_it_is_picked() {
 
     press(&mut app, KeyCode::Char('2'));
     press(&mut app, KeyCode::Down);
+    // Two definitions are five bytes, so which one is a question, not a guess.
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('S'));
+    press(&mut app, KeyCode::Enter);
     let shown = screen(&mut app);
 
     assert!(shown.contains("read as Status"), "{shown}");
@@ -275,7 +303,10 @@ fn a_row_is_read_field_by_field_once_it_is_picked() {
 #[test]
 fn nothing_of_that_length_says_so_rather_than_guessing() {
     let mut app = App::default();
-    with_frames(&mut app);
+    with_frames(
+        &mut app,
+        "nothing_of_that_length_says_so_rather_than_guessing",
+    );
     captured(&mut app, &[0x01, 0x02], Duration::from_secs(1));
 
     press(&mut app, KeyCode::Char('2'));
@@ -322,7 +353,7 @@ fn the_read_row_stays_on_screen_when_it_is_far_from_the_end() {
 #[test]
 fn escape_puts_the_fields_away() {
     let mut app = App::default();
-    with_frames(&mut app);
+    with_frames(&mut app, "escape_puts_the_fields_away");
     captured(
         &mut app,
         &[0xAA, 0x55, 0x02, 0x05, 0xDC],
@@ -331,6 +362,9 @@ fn escape_puts_the_fields_away() {
 
     press(&mut app, KeyCode::Char('2'));
     press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('S'));
+    press(&mut app, KeyCode::Enter);
     assert!(screen(&mut app).contains("read as Status"));
 
     press(&mut app, KeyCode::Esc);
@@ -361,4 +395,98 @@ fn the_way_out_is_offered_however_narrow_the_terminal() {
         let last = shown.lines().last().expect("a hint line").to_owned();
         assert!(last.contains("q quit"), "at {width} columns: {last}");
     }
+}
+
+#[test]
+fn a_row_several_definitions_could_be_asks_which() {
+    let mut app = App::default();
+    with_frames(&mut app, "a_row_several_definitions_could_be_asks_which");
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x02, 0x05, 0xDC],
+        Duration::from_secs(1),
+    );
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+    assert!(shown.contains("Pick the frame"), "{shown}");
+
+    press(&mut app, KeyCode::Enter);
+    let shown = screen(&mut app);
+    assert!(shown.contains("Read as"), "{shown}");
+    assert!(shown.contains("Status"), "{shown}");
+    assert!(shown.contains("Heartbeat"), "{shown}");
+}
+
+/// A folder with many frames in it is what typing is for.
+#[test]
+fn typing_narrows_the_list() {
+    let mut app = App::default();
+    with_frames(&mut app, "typing_narrows_the_list");
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x02, 0x05, 0xDC],
+        Duration::from_secs(1),
+    );
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('h'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Heartbeat"), "{shown}");
+    assert!(!shown.contains("Status"), "the other is gone: {shown}");
+}
+
+#[test]
+fn a_list_backed_out_of_changes_nothing() {
+    let mut app = App::default();
+    with_frames(&mut app, "a_list_backed_out_of_changes_nothing");
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x02, 0x05, 0xDC],
+        Duration::from_secs(1),
+    );
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Esc);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Pick the frame"), "{shown}");
+    assert!(app.overlay().is_none());
+}
+
+/// The answer holds, so stepping down a run of the same message does not ask
+/// again at every row.
+#[test]
+fn a_choice_survives_the_next_row_of_the_same_shape() {
+    let mut app = App::default();
+    with_frames(&mut app, "a_choice_survives_the_next_row_of_the_same_shape");
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x02, 0x05, 0xDC],
+        Duration::from_secs(1),
+    );
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x00, 0x00, 0x01],
+        Duration::from_secs(2),
+    );
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('S'));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Up);
+
+    // The row above is the same shape, so it is read without being asked about.
+    let shown = screen(&mut app);
+    assert!(shown.contains("read as Status"), "{shown}");
+    assert!(!shown.contains("Pick the frame"), "{shown}");
+    assert!(shown.contains("RUNNING"), "{shown}");
 }

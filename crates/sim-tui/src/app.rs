@@ -64,10 +64,79 @@ impl Tab {
 }
 
 /// What is laid over the view, taking the keys the view would otherwise get.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     /// The key map.
     Keys,
+    /// One answer to be chosen from a list.
+    Pick(Picker),
+}
+
+/// A list to choose one line from, narrowed by what is typed.
+///
+/// The window has combo boxes. A terminal has this, and it is the same idea:
+/// the choice is offered rather than spelled, so a name that does not exist
+/// cannot be given.
+pub struct Picker {
+    pub title: &'static str,
+    options: Vec<String>,
+    typed: String,
+    at: usize,
+}
+
+impl Picker {
+    fn new(title: &'static str, options: Vec<String>) -> Self {
+        Self {
+            title,
+            options,
+            typed: String::new(),
+            at: 0,
+        }
+    }
+
+    /// What is typed so far, shown so that a narrowed list explains itself.
+    #[must_use]
+    pub fn typed(&self) -> &str {
+        &self.typed
+    }
+
+    /// The lines still on offer, and which of them is under the cursor.
+    #[must_use]
+    pub fn shown(&self) -> (Vec<&str>, usize) {
+        let wanted = self.typed.to_lowercase();
+        let shown: Vec<&str> = self
+            .options
+            .iter()
+            .filter(|option| option.to_lowercase().contains(&wanted))
+            .map(String::as_str)
+            .collect();
+        let at = self.at.min(shown.len().saturating_sub(1));
+        (shown, at)
+    }
+
+    fn step(&mut self, delta: isize) {
+        let (shown, at) = self.shown();
+        let Some(last) = shown.len().checked_sub(1) else {
+            return;
+        };
+        self.at = at.saturating_add_signed(delta).min(last);
+    }
+
+    fn taken(&self) -> Option<String> {
+        let (shown, at) = self.shown();
+        shown.get(at).map(|name| (*name).to_owned())
+    }
+
+    /// Typing narrows the list and puts the cursor back at the top, since the
+    /// line it was on is usually not the line still wanted.
+    fn typing(&mut self, letter: char) {
+        self.typed.push(letter);
+        self.at = 0;
+    }
+
+    fn rubbed_out(&mut self) {
+        self.typed.pop();
+        self.at = 0;
+    }
 }
 
 pub struct App {
@@ -197,8 +266,8 @@ impl App {
     }
 
     #[must_use]
-    pub fn overlay(&self) -> Option<Overlay> {
-        self.overlay
+    pub fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
     }
 
     #[must_use]
@@ -229,6 +298,7 @@ impl App {
         match self.tab {
             Tab::Traffic => &[
                 ("up/down", "read a row"),
+                ("Enter", "read as"),
                 ("Esc", "put it away"),
                 ("f", "follow"),
             ],
@@ -245,11 +315,9 @@ impl App {
         }
 
         // An overlay takes the keys it knows and swallows the rest, so that
-        // reading the key map cannot change the view behind it.
+        // reading a list cannot change the view behind it.
         if self.overlay.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.overlay = None;
-            }
+            self.over(key.code);
             return;
         }
 
@@ -272,6 +340,57 @@ impl App {
         }
     }
 
+    /// What an overlay does with a key. Everything else it swallows.
+    fn over(&mut self, code: KeyCode) {
+        let Some(overlay) = &mut self.overlay else {
+            return;
+        };
+        match overlay {
+            Overlay::Keys => {
+                if matches!(code, KeyCode::Esc | KeyCode::Char('?')) {
+                    self.overlay = None;
+                }
+            }
+            Overlay::Pick(picker) => match code {
+                KeyCode::Down => picker.step(1),
+                KeyCode::Up => picker.step(-1),
+                KeyCode::Backspace => picker.rubbed_out(),
+                KeyCode::Esc => self.overlay = None,
+                KeyCode::Enter => {
+                    let taken = picker.taken();
+                    self.overlay = None;
+                    if let (Some(name), Some(monitor)) =
+                        (taken, self.session.monitors.values_mut().next())
+                    {
+                        monitor.decode_as = Some(name);
+                    }
+                }
+                KeyCode::Char(letter) => picker.typing(letter),
+                _ => {}
+            },
+        }
+    }
+
+    /// Offers the definitions the read row could be, when there is a choice.
+    fn pick_frame(&mut self) {
+        let Some(seq) = self.monitor().and_then(|monitor| monitor.selected) else {
+            return;
+        };
+        let Some(entry) = self.session.log.iter().find(|entry| entry.seq == seq) else {
+            return;
+        };
+        let candidates: Vec<String> = self
+            .session
+            .frames
+            .frames()
+            .filter(|frame| frame.size() == entry.bytes.len())
+            .map(|frame| frame.name.clone())
+            .collect();
+        if !candidates.is_empty() {
+            self.overlay = Some(Overlay::Pick(Picker::new("Read as", candidates)));
+        }
+    }
+
     /// The keys the traffic list answers to, and whether it took this one.
     fn watching(&mut self, code: KeyCode) -> bool {
         match code {
@@ -282,6 +401,7 @@ impl App {
                     monitor.selected = None;
                 }
             }
+            KeyCode::Enter | KeyCode::Char('d') => self.pick_frame(),
             KeyCode::Char('f') => {
                 if let Some(monitor) = self.session.monitors.values_mut().next() {
                     monitor.follow = !monitor.follow;

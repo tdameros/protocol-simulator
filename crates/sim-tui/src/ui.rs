@@ -15,7 +15,7 @@ use sim_session::reading;
 use sim_session::state::{Direction, LogEntry};
 use sim_session::{hex, links, traffic};
 
-use crate::app::{App, Overlay, Tab};
+use crate::app::{App, Overlay, Picker, Tab};
 
 /// The two directions, told apart at a glance rather than read.
 const SENT: Color = Color::Rgb(90, 140, 220);
@@ -35,8 +35,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     view(frame, body, app);
     hint_line(frame, hints, app);
 
-    if app.overlay() == Some(Overlay::Keys) {
-        key_map(frame, frame.area(), app);
+    match app.overlay() {
+        Some(Overlay::Keys) => key_map(frame, frame.area(), app),
+        Some(Overlay::Pick(picker)) => list_over(frame, frame.area(), picker),
+        None => {}
     }
 }
 
@@ -370,6 +372,46 @@ fn key_map(frame: &mut Frame, area: Rect, app: &App) {
                 .title(" Keys ")
                 .padding(ratatui::widgets::Padding::symmetric(1, 1)),
         ),
+        popup,
+    );
+}
+
+/// One answer chosen from a list, over whatever the view was showing.
+fn list_over(frame: &mut Frame, area: Rect, picker: &Picker) {
+    let (shown, at) = picker.shown();
+
+    let lines: Vec<Line> = shown
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let line = Line::from(format!("  {option}  "));
+            if index == at {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    // What is typed goes in the title, where it explains a list that has just
+    // become shorter without anything else changing.
+    let title = if picker.typed().is_empty() {
+        format!(" {} ", picker.title)
+    } else {
+        format!(" {} · {} ", picker.title, picker.typed())
+    };
+
+    let widest = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(title.len());
+    let popup = centred(area, widest + 2, lines.len() + 2);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(title)),
         popup,
     );
 }
