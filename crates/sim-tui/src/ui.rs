@@ -59,6 +59,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(Overlay::EditText(edit)) => edit_over(frame, frame.area(), edit),
         Some(Overlay::NewConnection(form)) => connection_form_over(frame, frame.area(), form),
         Some(Overlay::Filter(edit)) => filter_editor_over(frame, frame.area(), edit, app),
+        Some(Overlay::Step(edit)) => step_editor_over(frame, frame.area(), edit, app),
         None => {}
     }
 }
@@ -237,6 +238,55 @@ fn filter_editor_over(frame: &mut Frame, area: Rect, edit: &crate::app::FilterEd
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(rendered).block(Block::bordered().title(" Filter ")),
+        popup,
+    );
+}
+
+/// The step under the cursor, its own fields laid out the same way every
+/// other form in this front end is.
+fn step_editor_over(frame: &mut Frame, area: Rect, edit: &crate::app::StepEdit, app: &App) {
+    let Some(draft) = &app.session().scenarios.draft else {
+        return;
+    };
+    let Some(step) = draft.scenario.steps.get(edit.step_index()) else {
+        return;
+    };
+    let names: Vec<String> = app
+        .session()
+        .connections
+        .iter()
+        .map(|(id, _)| id.0.clone())
+        .collect();
+    let frames: Vec<sim_core::frame::FrameDef> = app.session().frames.frames().cloned().collect();
+
+    let lines = edit.lines(step, &names, &frames);
+    let widest = lines
+        .iter()
+        .map(|(label, _, _)| label.len())
+        .max()
+        .unwrap_or(0);
+
+    let rendered: Vec<Line> = lines
+        .into_iter()
+        .map(|(label, value, focused)| {
+            let line = Line::from(vec![
+                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(value),
+            ]);
+            if focused {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    let wanted = rendered.iter().map(Line::width).max().unwrap_or(0) + 4;
+    let popup = centred(area, wanted, rendered.len() + 4);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(rendered).block(Block::bordered().title(" Step ")),
         popup,
     );
 }
@@ -463,6 +513,10 @@ fn inject_view(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn scenarios_view(frame: &mut Frame, area: Rect, app: &App) {
+    if app.session().scenarios.draft.is_some() {
+        scenario_editor_view(frame, area, app);
+        return;
+    }
     let library = &app.session().scenarios;
     let block = Block::bordered().title(format!(" Scenarios ({}) ", library.entries.len()));
 
@@ -525,6 +579,88 @@ fn scenarios_view(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// What the chosen scenario does, step by step, as its file spells it.
+/// The header and the steps of the scenario being built, as one navigable
+/// list.
+fn scenario_editor_view(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(draft) = &app.session().scenarios.draft else {
+        return;
+    };
+    let scenario = &draft.scenario;
+    let rows = crate::app::scenario_rows(scenario);
+    let cursor = app.scenario_row();
+
+    let widest = 14; // "Repeat times" plus room, the widest label in the header.
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(at, row)| {
+            let (label, value) = match row {
+                crate::app::ScenarioRow::Name => ("Name".to_owned(), scenario.name.clone()),
+                crate::app::ScenarioRow::Description => (
+                    "Description".to_owned(),
+                    scenario.description.clone().unwrap_or_default(),
+                ),
+                crate::app::ScenarioRow::Repeat => (
+                    "Repeat".to_owned(),
+                    if scenario.repeat.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                    .to_owned(),
+                ),
+                crate::app::ScenarioRow::RepeatEvery => (
+                    "  Every (ms)".to_owned(),
+                    scenario
+                        .repeat
+                        .map_or_else(String::new, |repeat| repeat.every.as_millis().to_string()),
+                ),
+                crate::app::ScenarioRow::RepeatTimes => (
+                    "  Times".to_owned(),
+                    scenario
+                        .repeat
+                        .and_then(|repeat| repeat.times)
+                        .map_or_else(|| "forever".to_owned(), |times| times.to_string()),
+                ),
+                crate::app::ScenarioRow::Step(index) => {
+                    let step = &scenario.steps[*index];
+                    let targets = step
+                        .targets
+                        .iter()
+                        .map(|id| id.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (
+                        format!("{}.", index + 1),
+                        format!("{}  {}", scenarios::describe(step), targets),
+                    )
+                }
+            };
+            let line = Line::from(vec![
+                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(value),
+            ]);
+            if cursor == Some(at) {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    let dirty = if draft.problem().is_some() {
+        " · invalid"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(format!(" {}{dirty} ", scenario.name))),
+        area,
+    );
+}
+
 fn steps_view(frame: &mut Frame, area: Rect, app: &App) {
     let Some(scenario) = app.session().scenarios.selected_scenario() else {
         let hint = Paragraph::new("Choose a scenario to see its steps.".dim())

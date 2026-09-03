@@ -1538,3 +1538,403 @@ fn opening_a_row_in_frames_decodes_it_into_the_chosen_definition() {
     let shown = screen(&mut app);
     assert!(shown.contains("RUNNING"), "{shown}");
 }
+
+fn with_scenario_frames(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-scnfr-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("status.toml"), STATUS).expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+}
+
+fn with_scenarios_on_disk(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-scn2-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("bring-up.toml"), BRING_UP).expect("a scenario file");
+    app.session_mut().scenarios.load_from(dir);
+}
+
+#[test]
+fn new_starts_a_scenario_from_scratch() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("New scenario"), "{shown}");
+    assert!(
+        shown.contains("wait 100 ms"),
+        "the one step it starts with: {shown}"
+    );
+}
+
+#[test]
+fn the_name_can_be_edited() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    for letter in "Bring-up".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        screen(&mut app).contains("Bring-up"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn a_step_can_be_added_and_removed() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a'));
+    assert!(screen(&mut app).contains("2."), "{}", screen(&mut app));
+
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down); // Name, Description, Repeat, step 1, step 2
+    }
+    press(&mut app, KeyCode::Char('x'));
+    assert!(!screen(&mut app).contains("2."), "{}", screen(&mut app));
+}
+
+#[test]
+fn a_step_can_be_reordered() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // onto step 1
+    }
+    press(&mut app, KeyCode::Char(']')); // moves step 1 down, past step 2
+
+    let shown = screen(&mut app);
+    let lines: Vec<&str> = shown.lines().filter(|l| l.contains("wait")).collect();
+    assert_eq!(lines.len(), 2, "{shown}");
+}
+
+#[test]
+fn repeat_reveals_its_own_two_fields_once_switched_on() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down); // Repeat row
+    assert!(!screen(&mut app).contains("Every"));
+
+    press(&mut app, KeyCode::Char(' '));
+    let shown = screen(&mut app);
+    assert!(shown.contains("Every"), "{shown}");
+    assert!(shown.contains("Times"), "{shown}");
+}
+
+#[test]
+fn cycling_the_kind_changes_the_step_body() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(screen(&mut app).contains("Delay (ms)"));
+
+    press(&mut app, KeyCode::Right); // Wait -> WaitFor
+    assert!(
+        screen(&mut app).contains("Wait for"),
+        "{}",
+        screen(&mut app)
+    );
+
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left); // WaitFor -> Send -> Raw
+    assert!(screen(&mut app).contains("Bytes"), "{}", screen(&mut app));
+}
+
+#[test]
+fn a_second_target_can_be_ticked_on() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    linked(&mut app, "spare", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait needs no connection; move to Raw first
+    press(&mut app, KeyCode::Down); // onto the first target row
+    press(&mut app, KeyCode::Down); // onto the second
+    press(&mut app, KeyCode::Char(' ')); // tick spare on too
+
+    let step = &app
+        .session()
+        .scenarios
+        .draft
+        .as_ref()
+        .expect("a draft")
+        .scenario
+        .steps[0];
+    assert_eq!(step.targets.len(), 2, "{:?}", step.targets);
+}
+
+/// A step aimed at nothing is a step the loader refuses, so the only
+/// target left cannot be unticked.
+#[test]
+fn the_last_target_cannot_be_unticked() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait -> Raw, which needs a connection
+    press(&mut app, KeyCode::Down); // onto the bus target row
+    press(&mut app, KeyCode::Char(' ')); // try to untick the only target
+
+    let step = &app
+        .session()
+        .scenarios
+        .draft
+        .as_ref()
+        .expect("a draft")
+        .scenario
+        .steps[0];
+    assert_eq!(step.targets.len(), 1, "{:?}", step.targets);
+}
+
+#[test]
+fn sending_a_frame_shows_its_fields_to_override() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_scenario_frames(&mut app, "sending_a_frame_shows_its_fields_to_override");
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left); // Wait -> Raw -> Send
+
+    press(&mut app, KeyCode::Down); // bus target
+    press(&mut app, KeyCode::Down); // Frame row
+    press(&mut app, KeyCode::Right); // choose Status, the only frame
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("sync"), "{shown}");
+    assert!(
+        shown.contains("frame default"),
+        "not overridden yet: {shown}"
+    );
+}
+
+#[test]
+fn an_overridden_field_can_be_given_a_value() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_scenario_frames(&mut app, "an_overridden_field_can_be_given_a_value");
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left); // Wait -> Raw -> Send
+    press(&mut app, KeyCode::Down); // bus
+    press(&mut app, KeyCode::Down); // Frame
+    press(&mut app, KeyCode::Right); // Status
+    press(&mut app, KeyCode::Down); // sync
+    press(&mut app, KeyCode::Char(' ')); // override it
+    for letter in "1500".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("1500"), "{shown}");
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        screen(&mut app).contains("send Status with sync"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn waiting_for_a_frame_only_offers_to_tick_its_fields() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_scenario_frames(
+        &mut app,
+        "waiting_for_a_frame_only_offers_to_tick_its_fields",
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait -> WaitFor, starts by frame
+
+    // Rows so far: Kind, bus target, wait-by-frame toggle, Frame.
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Right); // choose Status
+    press(&mut app, KeyCode::Down); // sync
+    press(&mut app, KeyCode::Char(' ')); // match it
+
+    let shown = screen(&mut app);
+    let sync_line = shown.lines().find(|l| l.contains("sync")).unwrap_or("");
+    assert!(
+        !sync_line.contains("any value"),
+        "sync is now matched: {sync_line}"
+    );
+    let state_line = shown.lines().find(|l| l.contains("state")).unwrap_or("");
+    assert!(
+        state_line.contains("any value"),
+        "state is untouched: {state_line}"
+    );
+}
+
+#[test]
+fn switching_wait_mode_replaces_the_body() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // WaitFor, by frame
+
+    press(&mut app, KeyCode::Down); // bus target
+    press(&mut app, KeyCode::Down); // Wait for (mode) row
+    press(&mut app, KeyCode::Char(' ')); // switch to bytes
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Pattern"), "{shown}");
+    // The tab bar always names the Frames view; only the step popup's own
+    // "Frame" row is what switching away from frame mode should drop.
+    assert!(!shown.contains("  Frame "), "{shown}");
+}
+
+#[test]
+fn a_timeout_can_be_set_and_cleared() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // WaitFor, which starts with a timeout
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Timeout (ms)"), "{shown}");
+
+    // Rows: Kind, bus target, wait-by-frame, Frame, Give up after.
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Char(' ')); // clears it
+    assert!(
+        !screen(&mut app).contains("Timeout"),
+        "{}",
+        screen(&mut app)
+    );
+
+    press(&mut app, KeyCode::Char(' ')); // sets it again
+    assert!(
+        screen(&mut app).contains("Timeout (ms)"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn escape_closes_the_step_editor() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay().is_some());
+
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay().is_none());
+    assert_eq!(app.tab(), crate::app::Tab::Scenarios);
+}
+
+#[test]
+fn cancel_discards_the_whole_draft() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Esc);
+
+    assert!(
+        screen(&mut app).contains("No scenario"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn edit_opens_an_existing_scenario() {
+    let mut app = App::default();
+    with_scenarios_on_disk(&mut app, "edit_opens_an_existing_scenario");
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('e'));
+
+    assert!(
+        screen(&mut app).contains("Bring-up"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn a_running_scenario_cannot_be_edited_or_deleted() {
+    let mut app = App::default();
+    with_scenarios_on_disk(&mut app, "a_running_scenario_cannot_be_edited_or_deleted");
+    app.session_mut().running.insert(
+        "Bring-up".to_owned(),
+        sim_session::state::ScenarioRun { step: 1, pass: 0 },
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('e'));
+
+    assert!(app.session().scenarios.draft.is_none());
+    assert!(
+        screen(&mut app).contains("Stop it before editing it"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn delete_removes_a_scenario_from_disk() {
+    let mut app = App::default();
+    with_scenarios_on_disk(&mut app, "delete_removes_a_scenario_from_disk");
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('d'));
+
+    assert!(app.session().scenarios.entries.is_empty());
+}

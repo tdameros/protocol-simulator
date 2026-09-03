@@ -4,10 +4,12 @@
 //! terminal, the same way the panels are tested without a window.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use sim_core::frame::codec;
+use sim_core::frame::{codec, FieldKind, FrameDef};
+use sim_core::scenario::{Action, Expect, Scenario, Step};
 use sim_core::{ConnectionStatus, RetryPolicy};
 
 use crate::connection_form::ConnectionForm;
@@ -15,7 +17,7 @@ use sim_session::engine_handle::EngineHandle;
 use sim_session::hex;
 use sim_session::project::Project;
 use sim_session::reading::{self, Reading};
-use sim_session::scenarios;
+use sim_session::scenarios::{self, ActionKind};
 use sim_session::state::{ConnectionEntry, LogEntry, MonitorState, Session, TrafficFilter};
 
 /// The same five views the window has, in the same order.
@@ -118,9 +120,14 @@ pub struct EditBox {
     target: EditTarget,
 }
 
+#[derive(Clone)]
 enum EditTarget {
     Field(usize),
     Bit { field: usize, bit: usize },
+    ScenarioName,
+    ScenarioDescription,
+    RepeatEvery,
+    RepeatTimes,
 }
 
 pub enum Overlay {
@@ -133,6 +140,8 @@ pub enum Overlay {
     /// A traffic view's name and filter, changed live as each field is
     /// touched: there is nothing to submit.
     Filter(FilterEdit),
+    /// One scenario step, opened for its own editor.
+    Step(StepEdit),
     /// A file to be found on this machine.
     Browse(Browser),
     /// A connection being described before it exists.
@@ -367,6 +376,47 @@ fn edit_text(code: KeyCode, text: &mut String) {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a typed number is clamped to the field's own width by the encoder, \
+              which is a truer check than one done here on the way in"
+)]
+fn typed_override_value(kind: &FieldKind, text: &str) -> Option<sim_core::frame::value::Value> {
+    match kind {
+        FieldKind::Bytes { len } => {
+            let mut bytes = hex::parse(text).ok()?;
+            bytes.resize(*len, 0);
+            Some(sim_core::frame::value::Value::Bytes(bytes))
+        }
+        FieldKind::Text { len } => {
+            let mut held = text.to_owned();
+            held.truncate(*len);
+            Some(sim_core::frame::value::Value::Text(held))
+        }
+        FieldKind::Scalar(scalar) => {
+            let value = hex::read_number(text)?;
+            Some(
+                if matches!(
+                    scalar,
+                    sim_core::frame::ScalarType::F32 | sim_core::frame::ScalarType::F64
+                ) {
+                    sim_core::frame::value::Value::Float(value)
+                } else if scalar.is_unsigned_integer() {
+                    sim_core::frame::value::Value::Uint(value.max(0.0) as u64)
+                } else {
+                    sim_core::frame::value::Value::Int(value as i64)
+                },
+            )
+        }
+        FieldKind::Enum { .. } => {
+            let value = hex::read_number(text)?;
+            Some(sim_core::frame::value::Value::Uint(value.max(0.0) as u64))
+        }
+        FieldKind::Bits { .. } | FieldKind::Checksum { .. } => None,
+    }
+}
+
 fn edit_digits(code: KeyCode, text: &mut String) {
     match code {
         KeyCode::Char(digit) if digit.is_ascii_digit() => text.push(digit),
@@ -374,6 +424,484 @@ fn edit_digits(code: KeyCode, text: &mut String) {
             text.pop();
         }
         _ => {}
+    }
+}
+
+/// One row of the scenario editor: the header, or a step.
+pub(crate) enum ScenarioRow {
+    Name,
+    Description,
+    Repeat,
+    RepeatEvery,
+    RepeatTimes,
+    Step(usize),
+}
+
+pub(crate) fn scenario_rows(scenario: &Scenario) -> Vec<ScenarioRow> {
+    let mut rows = vec![
+        ScenarioRow::Name,
+        ScenarioRow::Description,
+        ScenarioRow::Repeat,
+    ];
+    if scenario.repeat.is_some() {
+        rows.push(ScenarioRow::RepeatEvery);
+        rows.push(ScenarioRow::RepeatTimes);
+    }
+    rows.extend((0..scenario.steps.len()).map(ScenarioRow::Step));
+    rows
+}
+
+/// One field of the step editor: what it is, and how a key changes it.
+enum StepField {
+    Kind,
+    /// One row per connection known to the project, ticked on or off the
+    /// step's targets.
+    Target(usize),
+    Delay,
+    Bytes,
+    SendFrame,
+    /// Index into the chosen frame's fields, checksums already filtered out.
+    SendField(usize),
+    WaitByFrame,
+    WaitPattern,
+    WaitAnchored,
+    WaitOffset,
+    WaitFrame,
+    WaitField(usize),
+    Limited,
+    TimeoutMs,
+}
+
+/// One step, opened for its own editor.
+///
+/// Text fields share one scratch buffer rather than one each: only the field
+/// under the cursor is ever being typed into, and reseeding it from the model
+/// when the cursor moves is simpler than keeping a buffer per field that
+/// mostly sits unused.
+pub struct StepEdit {
+    step: usize,
+    focus: usize,
+    text: String,
+}
+
+impl StepEdit {
+    fn opening(step: usize) -> Self {
+        Self {
+            step,
+            focus: 0,
+            text: String::new(),
+        }
+    }
+
+    /// The fields worth asking for, given the step's own action kind, and
+    /// whether waiting is by pattern or by frame.
+    fn fields(step: &Step, names: &[String]) -> Vec<StepField> {
+        let kind = ActionKind::of(&step.action);
+        let mut fields = vec![StepField::Kind];
+        if kind.needs_a_connection() {
+            fields.extend((0..names.len()).map(StepField::Target));
+        }
+        match &step.action {
+            Action::Wait { .. } => fields.push(StepField::Delay),
+            Action::Raw { .. } => fields.push(StepField::Bytes),
+            Action::Send { with, .. } => {
+                fields.push(StepField::SendFrame);
+                // The frame's own field count is not known here without the
+                // library; the caller expands `SendField` once it has one.
+                let _ = with;
+            }
+            Action::WaitFor { expect, timeout } => {
+                fields.push(StepField::WaitByFrame);
+                match expect {
+                    Expect::Pattern { anchor, .. } => {
+                        fields.push(StepField::WaitPattern);
+                        fields.push(StepField::WaitAnchored);
+                        if matches!(anchor, sim_core::pattern::Anchor::At(_)) {
+                            fields.push(StepField::WaitOffset);
+                        }
+                    }
+                    Expect::Frame { .. } => fields.push(StepField::WaitFrame),
+                }
+                fields.push(StepField::Limited);
+                if timeout.is_some() {
+                    fields.push(StepField::TimeoutMs);
+                }
+            }
+        }
+        fields
+    }
+
+    /// The same list, with `SendField`/`WaitField` rows expanded once the
+    /// chosen frame is known.
+    fn fields_with_frame(step: &Step, names: &[String], frames: &[FrameDef]) -> Vec<StepField> {
+        let mut fields = Self::fields(step, names);
+        let expand = |name: &str| -> Vec<usize> {
+            frames
+                .iter()
+                .find(|frame| frame.name == name)
+                .map(|frame| {
+                    (0..frame.fields.len())
+                        .filter(|&i| !matches!(frame.fields[i].kind, FieldKind::Checksum { .. }))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        match &step.action {
+            Action::Send { frame, .. } => {
+                let at = fields
+                    .iter()
+                    .position(|f| matches!(f, StepField::SendFrame));
+                if let Some(at) = at {
+                    let indices = expand(frame);
+                    fields.splice((at + 1)..=at, indices.into_iter().map(StepField::SendField));
+                }
+            }
+            Action::WaitFor {
+                expect: Expect::Frame { frame, .. },
+                ..
+            } => {
+                let at = fields
+                    .iter()
+                    .position(|f| matches!(f, StepField::WaitFrame));
+                if let Some(at) = at {
+                    let indices = expand(frame);
+                    fields.splice((at + 1)..=at, indices.into_iter().map(StepField::WaitField));
+                }
+            }
+            _ => {}
+        }
+        fields
+    }
+}
+
+impl StepEdit {
+    /// Which step of the draft this is open on.
+    #[must_use]
+    pub fn step_index(&self) -> usize {
+        self.step
+    }
+
+    #[must_use]
+    pub fn lines(
+        &self,
+        step: &Step,
+        names: &[String],
+        frames: &[FrameDef],
+    ) -> Vec<(String, String, bool)> {
+        let fields = Self::fields_with_frame(step, names, frames);
+        let focus = self.focus.min(fields.len().saturating_sub(1));
+        fields
+            .iter()
+            .enumerate()
+            .map(|(at, field)| {
+                let (label, value) = Self::render(field, step, names, frames);
+                (label, value, at == focus)
+            })
+            .collect()
+    }
+
+    fn render(
+        field: &StepField,
+        step: &Step,
+        names: &[String],
+        frames: &[FrameDef],
+    ) -> (String, String) {
+        match field {
+            StepField::Kind
+            | StepField::Target(_)
+            | StepField::Delay
+            | StepField::Bytes
+            | StepField::SendFrame
+            | StepField::SendField(_) => Self::render_send_side(field, step, names, frames),
+            _ => Self::render_wait_side(field, step, frames),
+        }
+    }
+
+    fn render_send_side(
+        field: &StepField,
+        step: &Step,
+        names: &[String],
+        frames: &[FrameDef],
+    ) -> (String, String) {
+        match field {
+            StepField::Kind => (
+                "Action".to_owned(),
+                ActionKind::of(&step.action).label().to_owned(),
+            ),
+            StepField::Target(i) => (
+                format!("  {}", names[*i]),
+                yes_no(step.targets.iter().any(|id| id.0 == names[*i])).to_owned(),
+            ),
+            StepField::Delay => {
+                let Action::Wait { delay } = &step.action else {
+                    return (String::new(), String::new());
+                };
+                ("Delay (ms)".to_owned(), delay.as_millis().to_string())
+            }
+            StepField::Bytes => {
+                let Action::Raw { bytes } = &step.action else {
+                    return (String::new(), String::new());
+                };
+                ("Bytes".to_owned(), hex::spaced(bytes))
+            }
+            StepField::SendFrame => {
+                let Action::Send { frame, .. } = &step.action else {
+                    return (String::new(), String::new());
+                };
+                (
+                    "Frame".to_owned(),
+                    if frame.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        frame.clone()
+                    },
+                )
+            }
+            StepField::SendField(i) => {
+                let Action::Send {
+                    frame,
+                    with,
+                    counters,
+                    ..
+                } = &step.action
+                else {
+                    return (String::new(), String::new());
+                };
+                let definition = frames.iter().find(|f| &f.name == frame);
+                let Some(field_def) = definition.and_then(|d| d.fields.get(*i)) else {
+                    return (String::new(), String::new());
+                };
+                let overridden = with.get(&field_def.name);
+                let counted = counters.contains_key(&field_def.name);
+                let value = if let Some(value) = overridden {
+                    reading::describe(field_def, value, false)
+                } else if counted {
+                    "counted".to_owned()
+                } else {
+                    "frame default".to_owned()
+                };
+                (format!("  {}", field_def.name), value)
+            }
+            _ => (String::new(), String::new()),
+        }
+    }
+
+    fn render_wait_side(field: &StepField, step: &Step, frames: &[FrameDef]) -> (String, String) {
+        match field {
+            StepField::WaitByFrame
+            | StepField::WaitPattern
+            | StepField::WaitAnchored
+            | StepField::WaitOffset => Self::render_wait_pattern(field, step),
+            _ => Self::render_wait_frame(field, step, frames),
+        }
+    }
+
+    fn render_wait_pattern(field: &StepField, step: &Step) -> (String, String) {
+        match field {
+            StepField::WaitByFrame => {
+                let Action::WaitFor { expect, .. } = &step.action else {
+                    return (String::new(), String::new());
+                };
+                (
+                    "Wait for".to_owned(),
+                    if matches!(expect, Expect::Frame { .. }) {
+                        "a frame".to_owned()
+                    } else {
+                        "these bytes".to_owned()
+                    },
+                )
+            }
+            StepField::WaitPattern => {
+                let Action::WaitFor {
+                    expect: Expect::Pattern { pattern, .. },
+                    ..
+                } = &step.action
+                else {
+                    return (String::new(), String::new());
+                };
+                ("  Pattern".to_owned(), pattern.to_hex())
+            }
+            StepField::WaitAnchored => {
+                let Action::WaitFor {
+                    expect: Expect::Pattern { anchor, .. },
+                    ..
+                } = &step.action
+                else {
+                    return (String::new(), String::new());
+                };
+                (
+                    "  At offset".to_owned(),
+                    yes_no(matches!(anchor, sim_core::pattern::Anchor::At(_))).to_owned(),
+                )
+            }
+            StepField::WaitOffset => {
+                let Action::WaitFor {
+                    expect:
+                        Expect::Pattern {
+                            anchor: sim_core::pattern::Anchor::At(offset),
+                            ..
+                        },
+                    ..
+                } = &step.action
+                else {
+                    return (String::new(), String::new());
+                };
+                ("    Offset".to_owned(), offset.to_string())
+            }
+            _ => (String::new(), String::new()),
+        }
+    }
+
+    fn render_wait_frame(field: &StepField, step: &Step, frames: &[FrameDef]) -> (String, String) {
+        match field {
+            StepField::WaitFrame => {
+                let Action::WaitFor {
+                    expect: Expect::Frame { frame, .. },
+                    ..
+                } = &step.action
+                else {
+                    return (String::new(), String::new());
+                };
+                (
+                    "  Frame".to_owned(),
+                    if frame.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        frame.clone()
+                    },
+                )
+            }
+            StepField::WaitField(i) => {
+                let Action::WaitFor {
+                    expect: Expect::Frame { frame, values },
+                    ..
+                } = &step.action
+                else {
+                    return (String::new(), String::new());
+                };
+                let definition = frames.iter().find(|f| &f.name == frame);
+                let Some(field_def) = definition.and_then(|d| d.fields.get(*i)) else {
+                    return (String::new(), String::new());
+                };
+                let matched = values.contains_key(&field_def.name);
+                let value = if matched {
+                    values
+                        .get(&field_def.name)
+                        .map_or_else(String::new, |v| reading::describe(field_def, v, false))
+                } else {
+                    "any value".to_owned()
+                };
+                (format!("  {}", field_def.name), value)
+            }
+            StepField::Limited => {
+                let Action::WaitFor { timeout, .. } = &step.action else {
+                    return (String::new(), String::new());
+                };
+                (
+                    "Give up after".to_owned(),
+                    yes_no(timeout.is_some()).to_owned(),
+                )
+            }
+            StepField::TimeoutMs => {
+                let Action::WaitFor {
+                    timeout: Some(timeout),
+                    ..
+                } = &step.action
+                else {
+                    return (String::new(), String::new());
+                };
+                ("  Timeout (ms)".to_owned(), timeout.as_millis().to_string())
+            }
+            _ => (String::new(), String::new()),
+        }
+    }
+
+    /// Reseeds the scratch text from the field under the cursor, when it has
+    /// text worth continuing to type into.
+    fn reseed(&mut self, step: &Step, names: &[String], frames: &[FrameDef]) {
+        let fields = Self::fields_with_frame(step, names, frames);
+        let Some(field) = fields.get(self.focus.min(fields.len().saturating_sub(1))) else {
+            self.text.clear();
+            return;
+        };
+        self.text = match field {
+            StepField::Delay => {
+                if let Action::Wait { delay } = &step.action {
+                    delay.as_millis().to_string()
+                } else {
+                    String::new()
+                }
+            }
+            StepField::Bytes => {
+                if let Action::Raw { bytes } = &step.action {
+                    hex::packed(bytes)
+                } else {
+                    String::new()
+                }
+            }
+            StepField::WaitPattern => {
+                if let Action::WaitFor {
+                    expect: Expect::Pattern { pattern, .. },
+                    ..
+                } = &step.action
+                {
+                    pattern.to_hex()
+                } else {
+                    String::new()
+                }
+            }
+            StepField::WaitOffset => {
+                if let Action::WaitFor {
+                    expect:
+                        Expect::Pattern {
+                            anchor: sim_core::pattern::Anchor::At(offset),
+                            ..
+                        },
+                    ..
+                } = &step.action
+                {
+                    offset.to_string()
+                } else {
+                    String::new()
+                }
+            }
+            StepField::TimeoutMs => {
+                if let Action::WaitFor {
+                    timeout: Some(timeout),
+                    ..
+                } = &step.action
+                {
+                    timeout.as_millis().to_string()
+                } else {
+                    String::new()
+                }
+            }
+            StepField::SendField(i) => {
+                if let Action::Send { frame, with, .. } = &step.action {
+                    let field_def = frames
+                        .iter()
+                        .find(|f| &f.name == frame)
+                        .and_then(|d| d.fields.get(*i));
+                    if let Some(field_def) = field_def {
+                        with.get(&field_def.name)
+                            .map_or_else(String::new, |value| match &field_def.kind {
+                                FieldKind::Bytes { .. } => {
+                                    value.as_bytes().map_or_else(String::new, hex::packed)
+                                }
+                                FieldKind::Text { .. } => {
+                                    value.as_text().unwrap_or_default().to_owned()
+                                }
+                                _ => reading::describe(field_def, value, false),
+                            })
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
     }
 }
 
@@ -577,6 +1105,9 @@ pub struct App {
     status: Option<String>,
     /// The traffic view on show, when there is more than one.
     current_monitor: Option<sim_session::state::MonitorId>,
+    /// The row under the cursor in the scenario editor's header and step
+    /// list, while a draft is open.
+    scenario_row: Option<usize>,
     /// Which pane of the Frames view a key acts on.
     frame_focus: FramesFocus,
     /// The row under the cursor in the fields pane, and the frame it belongs
@@ -606,6 +1137,7 @@ impl Default for App {
             connection_at: None,
             status: None,
             current_monitor: None,
+            scenario_row: None,
             frame_focus: FramesFocus::Library,
             field_at: None,
         }
@@ -667,6 +1199,13 @@ impl App {
     #[must_use]
     pub fn connection_at(&self) -> Option<usize> {
         self.connection_at
+    }
+
+    /// The row under the cursor in the scenario editor, while a draft is
+    /// open.
+    #[must_use]
+    pub fn scenario_row(&self) -> Option<usize> {
+        self.scenario_row
     }
 
     /// Whether a key in the Frames view acts on the frame list or the fields
@@ -852,6 +1391,15 @@ impl App {
                 ("Esc", "done"),
             ];
         }
+        if let Some(Overlay::Step(_)) = self.overlay {
+            return &[
+                ("Tab", "next field"),
+                ("left/right", "change"),
+                ("space", "toggle"),
+                ("type", "edit"),
+                ("Esc", "done"),
+            ];
+        }
         if let Some(Overlay::EditText(_)) = self.overlay {
             return &[("Enter", "apply"), ("Esc", "cancel")];
         }
@@ -864,7 +1412,21 @@ impl App {
                 ("f", "follow"),
                 ("/", "filter"),
             ],
-            Tab::Scenarios => &[("up/down", "choose"), ("Enter", "run"), ("x", "stop")],
+            Tab::Scenarios if self.session.scenarios.draft.is_some() => &[
+                ("up/down", "choose"),
+                ("Enter", "edit"),
+                ("a", "add step"),
+                ("x", "remove step"),
+                ("s", "save"),
+                ("Esc", "cancel"),
+            ],
+            Tab::Scenarios => &[
+                ("up/down", "choose"),
+                ("Enter", "run"),
+                ("x", "stop"),
+                ("n", "new"),
+                ("e", "edit"),
+            ],
             Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
             Tab::Frames if self.frame_focus == FramesFocus::Fields => &[
                 ("up/down", "choose"),
@@ -962,6 +1524,10 @@ impl App {
             self.filter_key(code);
             return;
         }
+        if matches!(self.overlay, Some(Overlay::Step(_))) {
+            self.step_key(code);
+            return;
+        }
         let Some(overlay) = &mut self.overlay else {
             return;
         };
@@ -1026,7 +1592,7 @@ impl App {
             // Handled apart, before this match: it changes the model as it
             // goes, which reads awkwardly from inside a match already holding
             // the overlay itself borrowed.
-            Overlay::Filter(_) => {}
+            Overlay::Filter(_) | Overlay::Step(_) => {}
         }
     }
 
@@ -1420,6 +1986,44 @@ impl App {
         }
     }
 
+    /// Applies an edit that belongs to the scenario header rather than to a
+    /// frame field. Returns whether the target was one of those.
+    fn apply_scenario_edit(&mut self, target: &EditTarget, text: &str) -> bool {
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return matches!(
+                target,
+                EditTarget::ScenarioName
+                    | EditTarget::ScenarioDescription
+                    | EditTarget::RepeatEvery
+                    | EditTarget::RepeatTimes
+            );
+        };
+        match target {
+            EditTarget::ScenarioName => text.clone_into(&mut draft.scenario.name),
+            EditTarget::ScenarioDescription => {
+                draft.scenario.description = (!text.trim().is_empty()).then(|| text.to_owned());
+            }
+            EditTarget::RepeatEvery => {
+                let millis: u64 = text.parse().unwrap_or(100).max(1);
+                let repeat = draft
+                    .scenario
+                    .repeat
+                    .get_or_insert(sim_core::scenario::Repeat {
+                        every: Duration::from_millis(100),
+                        times: None,
+                    });
+                repeat.every = Duration::from_millis(millis);
+            }
+            EditTarget::RepeatTimes => {
+                if let Some(repeat) = &mut draft.scenario.repeat {
+                    repeat.times = text.parse().ok();
+                }
+            }
+            EditTarget::Field(_) | EditTarget::Bit { .. } => return false,
+        }
+        true
+    }
+
     /// Reads what was typed into the box on show, and writes it into the
     /// field or flag it belongs to.
     #[expect(
@@ -1433,13 +2037,13 @@ impl App {
             return;
         };
         let text = edit.text.clone();
-        let target = match &edit.target {
-            EditTarget::Field(index) => EditTarget::Field(*index),
-            EditTarget::Bit { field, bit } => EditTarget::Bit {
-                field: *field,
-                bit: *bit,
-            },
-        };
+        let target = edit.target.clone();
+
+        if self.apply_scenario_edit(&target, &text) {
+            self.overlay = None;
+            return;
+        }
+
         let Some(frame) = self.session.frames.selected_frame().cloned() else {
             self.overlay = None;
             return;
@@ -1499,6 +2103,10 @@ impl App {
                     }
                 }
             }
+            EditTarget::ScenarioName
+            | EditTarget::ScenarioDescription
+            | EditTarget::RepeatEvery
+            | EditTarget::RepeatTimes => unreachable!("handled and returned above"),
         }
         self.overlay = None;
     }
@@ -1580,15 +2188,714 @@ impl App {
     }
 
     /// The keys the scenario list answers to, and whether it took this one.
+    /// The keys the scenario view answers to, and whether it took this one.
     fn running_scenarios(&mut self, code: KeyCode) -> bool {
+        if self.session.scenarios.draft.is_some() {
+            return self.editing_scenario(code);
+        }
         match code {
             KeyCode::Down | KeyCode::Char('j') => self.pick_scenario(1),
             KeyCode::Up | KeyCode::Char('k') => self.pick_scenario(-1),
             KeyCode::Enter => self.start_selected(),
             KeyCode::Char('x') => self.stop_selected(),
+            KeyCode::Char('n') => {
+                self.session.scenarios.begin_new(scenarios::blank());
+                self.scenario_row = Some(0);
+            }
+            KeyCode::Char('e') => {
+                let running = self.selected_scenario_running();
+                if running {
+                    self.session.last_error = Some("Stop it before editing it.".to_owned());
+                } else {
+                    self.session.scenarios.begin_edit();
+                    self.scenario_row = Some(0);
+                }
+            }
+            KeyCode::Char('d') => {
+                if self.selected_scenario_running() {
+                    self.session.last_error = Some("Stop it before deleting it.".to_owned());
+                } else if let Err(error) = self.session.scenarios.delete_selected() {
+                    self.session.last_error = Some(format!("{error:#}"));
+                }
+            }
+            KeyCode::Char('r') => self.session.scenarios.reload(),
             _ => return false,
         }
         true
+    }
+
+    fn selected_scenario_running(&self) -> bool {
+        self.session
+            .scenarios
+            .selected_scenario()
+            .is_some_and(|scenario| self.session.running.contains_key(&scenario.name))
+    }
+
+    /// The keys the scenario editor answers to while a draft is open.
+    fn editing_scenario(&mut self, code: KeyCode) -> bool {
+        if matches!(self.overlay, Some(Overlay::Step(_))) {
+            self.step_key(code);
+            return true;
+        }
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.move_scenario_row(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_scenario_row(-1),
+            KeyCode::Enter => self.enter_scenario_row(),
+            KeyCode::Char(' ') => self.toggle_scenario_row(),
+            KeyCode::Char('a') => self.add_step(),
+            KeyCode::Char('x') => self.remove_scenario_step(),
+            KeyCode::Char('[') => self.move_scenario_step(false),
+            KeyCode::Char(']') => self.move_scenario_step(true),
+            KeyCode::Char('s') => scenarios::save(&mut self.session),
+            KeyCode::Esc => self.session.scenarios.cancel_edit(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn scenario_row_count(&self) -> usize {
+        self.session
+            .scenarios
+            .draft
+            .as_ref()
+            .map_or(0, |draft| scenario_rows(&draft.scenario).len())
+    }
+
+    fn move_scenario_row(&mut self, delta: isize) {
+        self.scenario_row = moved(self.scenario_row, delta, self.scenario_row_count());
+    }
+
+    fn enter_scenario_row(&mut self) {
+        let Some(draft) = &self.session.scenarios.draft else {
+            return;
+        };
+        let rows = scenario_rows(&draft.scenario);
+        let Some(row) = self.scenario_row.and_then(|at| rows.get(at)) else {
+            return;
+        };
+        match row {
+            ScenarioRow::Name => {
+                self.overlay = Some(Overlay::EditText(EditBox {
+                    title: "Name".to_owned(),
+                    text: draft.scenario.name.clone(),
+                    target: EditTarget::ScenarioName,
+                }));
+            }
+            ScenarioRow::Description => {
+                self.overlay = Some(Overlay::EditText(EditBox {
+                    title: "Description".to_owned(),
+                    text: draft.scenario.description.clone().unwrap_or_default(),
+                    target: EditTarget::ScenarioDescription,
+                }));
+            }
+            ScenarioRow::RepeatEvery => {
+                let text = draft
+                    .scenario
+                    .repeat
+                    .map_or_else(String::new, |repeat| repeat.every.as_millis().to_string());
+                self.overlay = Some(Overlay::EditText(EditBox {
+                    title: "Repeat every (ms)".to_owned(),
+                    text,
+                    target: EditTarget::RepeatEvery,
+                }));
+            }
+            ScenarioRow::RepeatTimes => {
+                let text = draft
+                    .scenario
+                    .repeat
+                    .and_then(|repeat| repeat.times)
+                    .map_or_else(String::new, |times| times.to_string());
+                self.overlay = Some(Overlay::EditText(EditBox {
+                    title: "Repeat times (blank: forever)".to_owned(),
+                    text,
+                    target: EditTarget::RepeatTimes,
+                }));
+            }
+            ScenarioRow::Repeat => {}
+            ScenarioRow::Step(index) => {
+                self.overlay = Some(Overlay::Step(StepEdit::opening(*index)));
+            }
+        }
+    }
+
+    fn toggle_scenario_row(&mut self) {
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return;
+        };
+        let rows = scenario_rows(&draft.scenario);
+        if matches!(
+            self.scenario_row.and_then(|at| rows.get(at)),
+            Some(ScenarioRow::Repeat)
+        ) {
+            draft.scenario.repeat =
+                draft
+                    .scenario
+                    .repeat
+                    .is_none()
+                    .then(|| sim_core::scenario::Repeat {
+                        every: Duration::from_millis(100),
+                        times: None,
+                    });
+        }
+    }
+
+    fn add_step(&mut self) {
+        let links: Vec<sim_core::ConnectionId> = self
+            .session
+            .connections
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        let first_frame: Option<String> =
+            self.session.frames.frames().next().map(|f| f.name.clone());
+        if let Some(draft) = self.session.scenarios.draft.as_mut() {
+            draft.add_step(&links, first_frame.as_deref());
+            self.scenario_row = Some(scenario_rows(&draft.scenario).len() - 1);
+        }
+    }
+
+    fn selected_step_index(&self) -> Option<usize> {
+        let draft = self.session.scenarios.draft.as_ref()?;
+        let rows = scenario_rows(&draft.scenario);
+        match rows.get(self.scenario_row?)? {
+            ScenarioRow::Step(index) => Some(*index),
+            _ => None,
+        }
+    }
+
+    fn remove_scenario_step(&mut self) {
+        let Some(index) = self.selected_step_index() else {
+            return;
+        };
+        if let Some(draft) = self.session.scenarios.draft.as_mut() {
+            draft.remove_step(index);
+        }
+    }
+
+    /// Moves the step under the cursor one place earlier or later.
+    fn move_scenario_step(&mut self, down: bool) {
+        let Some(index) = self.selected_step_index() else {
+            return;
+        };
+        if let Some(draft) = self.session.scenarios.draft.as_mut() {
+            draft.move_step(index, down);
+        }
+        let at = self.scenario_row.unwrap_or(0);
+        self.scenario_row = Some(if down { at + 1 } else { at.saturating_sub(1) });
+    }
+
+    /// Applies a key to the step editor.
+    ///
+    /// Rewritten against the live draft each time, rather than through an
+    /// owned copy: `self.overlay` and `self.session` are different fields of
+    /// `self`, and the only thing worth extracting first is the editor's own
+    /// cursor and scratch text.
+    fn step_key(&mut self, code: KeyCode) {
+        let Some(Overlay::Step(edit)) = &self.overlay else {
+            return;
+        };
+        let index = edit.step;
+        let mut focus = edit.focus;
+        let mut text = edit.text.clone();
+
+        let names: Vec<String> = self
+            .session
+            .connections
+            .iter()
+            .map(|(id, _)| id.0.clone())
+            .collect();
+        let frames: Vec<FrameDef> = self.session.frames.frames().cloned().collect();
+        let links: Vec<sim_core::ConnectionId> = self
+            .session
+            .connections
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let Some(step) = self
+            .session
+            .scenarios
+            .draft
+            .as_ref()
+            .and_then(|draft| draft.scenario.steps.get(index).cloned())
+        else {
+            self.overlay = None;
+            return;
+        };
+
+        let mut close = false;
+        match code {
+            KeyCode::Esc | KeyCode::Enter => close = true,
+            KeyCode::Tab | KeyCode::Down => {
+                let held = StepEdit::fields_with_frame(&step, &names, &frames)
+                    .len()
+                    .max(1);
+                focus = (focus + 1) % held;
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                let held = StepEdit::fields_with_frame(&step, &names, &frames)
+                    .len()
+                    .max(1);
+                focus = (focus + held - 1) % held;
+            }
+            _ => {
+                let fields = StepEdit::fields_with_frame(&step, &names, &frames);
+                let at = focus.min(fields.len().saturating_sub(1));
+                if let Some(field) = fields.into_iter().nth(at) {
+                    self.act_on_step(index, &field, code, &names, &frames, &links, &mut text);
+                }
+            }
+        }
+
+        // The field under the cursor may have changed shape (a toggle just
+        // flipped, say), so the scratch text is refreshed from whatever is
+        // there now rather than carried over from before the key.
+        if !matches!(code, KeyCode::Esc | KeyCode::Enter) {
+            if let Some(step) = self
+                .session
+                .scenarios
+                .draft
+                .as_ref()
+                .and_then(|draft| draft.scenario.steps.get(index).cloned())
+            {
+                let fields = StepEdit::fields_with_frame(&step, &names, &frames);
+                let at = focus.min(fields.len().saturating_sub(1));
+                let reseed_kinds = matches!(
+                    fields.get(at),
+                    Some(
+                        StepField::Delay
+                            | StepField::Bytes
+                            | StepField::WaitPattern
+                            | StepField::WaitOffset
+                            | StepField::TimeoutMs
+                    )
+                );
+                if reseed_kinds
+                    && matches!(
+                        code,
+                        KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up
+                    )
+                {
+                    let mut fresh = StepEdit {
+                        step: index,
+                        focus,
+                        text: String::new(),
+                    };
+                    fresh.reseed(&step, &names, &frames);
+                    text = fresh.text;
+                }
+            }
+        }
+
+        if close {
+            self.overlay = None;
+        } else {
+            self.overlay = Some(Overlay::Step(StepEdit {
+                step: index,
+                focus,
+                text,
+            }));
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a step touches the project, the draft and its own scratch text at once"
+    )]
+    fn act_on_step(
+        &mut self,
+        index: usize,
+        field: &StepField,
+        code: KeyCode,
+        names: &[String],
+        frames: &[FrameDef],
+        links: &[sim_core::ConnectionId],
+        text: &mut String,
+    ) {
+        match field {
+            StepField::Kind | StepField::Target(_) => {
+                self.act_on_kind_or_target(index, field, code, names, links);
+            }
+            StepField::Delay
+            | StepField::Bytes
+            | StepField::SendFrame
+            | StepField::SendField(_) => {
+                self.act_on_send(index, field, code, frames, text);
+            }
+            _ => self.act_on_wait(index, field, code, frames, text),
+        }
+    }
+
+    fn act_on_kind_or_target(
+        &mut self,
+        index: usize,
+        field: &StepField,
+        code: KeyCode,
+        names: &[String],
+        links: &[sim_core::ConnectionId],
+    ) {
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return;
+        };
+        match field {
+            StepField::Kind => {
+                if let Some(delta) = arrow_delta(code) {
+                    if let Some(step) = draft.scenario.steps.get(index) {
+                        let current = ActionKind::of(&step.action);
+                        let next = crate::connection_form::cycle(&ActionKind::ALL, current, delta);
+                        if next.needs_a_connection() && links.is_empty() {
+                            return;
+                        }
+                        draft.set_action(index, next, links);
+                    }
+                }
+            }
+            StepField::Target(i) => {
+                if matches!(code, KeyCode::Char(' ')) {
+                    if let Some(step) = draft.scenario.steps.get_mut(index) {
+                        let id = sim_core::ConnectionId(names[*i].clone());
+                        if step.targets.contains(&id) {
+                            // The last target cannot be unticked: a step aimed
+                            // at nothing is a step the loader refuses.
+                            if step.targets.len() > 1 {
+                                step.targets.retain(|held| held != &id);
+                            }
+                        } else {
+                            step.targets.push(id);
+                        }
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    fn act_on_send_field(
+        &mut self,
+        index: usize,
+        i: usize,
+        code: KeyCode,
+        frames: &[FrameDef],
+        text: &mut String,
+    ) {
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return;
+        };
+        let Some(step) = draft.scenario.steps.get(index).cloned() else {
+            return;
+        };
+        let Action::Send { frame, .. } = &step.action else {
+            return;
+        };
+        let Some(field_def) = frames
+            .iter()
+            .find(|f| &f.name == frame)
+            .and_then(|d| d.fields.get(i))
+            .cloned()
+        else {
+            return;
+        };
+        if matches!(code, KeyCode::Char(' ')) {
+            let Action::Send { with, .. } = &step.action else {
+                return;
+            };
+            let on = !with.contains_key(&field_def.name);
+            let Some(definition) = frames.iter().find(|f| f.name == *frame) else {
+                return;
+            };
+            scenarios::set_override(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                definition,
+                &field_def.name,
+                on,
+            );
+            return;
+        }
+        // Editing only reaches a value already ticked in: an
+        // untouched field still means the frame's own default.
+        let Action::Send { with, .. } = &step.action else {
+            return;
+        };
+        if !with.contains_key(&field_def.name) {
+            return;
+        }
+        edit_text(code, text);
+        let Some(value) = typed_override_value(&field_def.kind, text) else {
+            return;
+        };
+        if let Some(Step {
+            action: Action::Send { with, .. },
+            ..
+        }) = draft.scenario.steps.get_mut(index)
+        {
+            with.insert(field_def.name.clone(), value);
+        }
+    }
+
+    fn act_on_send(
+        &mut self,
+        index: usize,
+        field: &StepField,
+        code: KeyCode,
+        frames: &[FrameDef],
+        text: &mut String,
+    ) {
+        if let StepField::SendField(i) = field {
+            self.act_on_send_field(index, *i, code, frames, text);
+            return;
+        }
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return;
+        };
+        match field {
+            StepField::Delay => {
+                edit_digits(code, text);
+                if let Some(Step {
+                    action: Action::Wait { delay },
+                    ..
+                }) = draft.scenario.steps.get_mut(index)
+                {
+                    *delay = Duration::from_millis(text.parse().unwrap_or(0));
+                }
+            }
+            StepField::Bytes => {
+                edit_text(code, text);
+                if let Ok(bytes) = hex::parse(text) {
+                    if let Some(Step {
+                        action: Action::Raw { bytes: held },
+                        ..
+                    }) = draft.scenario.steps.get_mut(index)
+                    {
+                        *held = bytes;
+                    }
+                }
+            }
+            StepField::SendFrame => {
+                if let Some(delta) = arrow_delta(code) {
+                    if !frames.is_empty() {
+                        if let Some(Step {
+                            action: Action::Send { frame, .. },
+                            ..
+                        }) = draft.scenario.steps.get_mut(index)
+                        {
+                            let names: Vec<String> =
+                                frames.iter().map(|f| f.name.clone()).collect();
+                            let current = names.iter().position(|n| n == frame).unwrap_or(0);
+                            let at = i32::try_from(current).unwrap_or(0)
+                                + i32::try_from(delta).unwrap_or(0);
+                            let at = at.rem_euclid(i32::try_from(names.len()).unwrap_or(1));
+                            let picked = names[usize::try_from(at).unwrap_or(0)].clone();
+                            frame.clone_from(&picked);
+                        }
+                        if let Some(step) = draft.scenario.steps.get(index).cloned() {
+                            if let Action::Send { frame, .. } = &step.action {
+                                scenarios::set_frame(
+                                    draft.scenario.steps.get_mut(index).expect("just read"),
+                                    frame,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    fn act_on_wait(
+        &mut self,
+        index: usize,
+        field: &StepField,
+        code: KeyCode,
+        frames: &[FrameDef],
+        text: &mut String,
+    ) {
+        match field {
+            StepField::WaitByFrame
+            | StepField::WaitPattern
+            | StepField::WaitAnchored
+            | StepField::WaitOffset => {
+                self.act_on_wait_pattern(index, field, code, frames, text);
+            }
+            _ => self.act_on_wait_frame(index, field, code, frames, text),
+        }
+    }
+
+    fn act_on_wait_pattern(
+        &mut self,
+        index: usize,
+        field: &StepField,
+        code: KeyCode,
+        frames: &[FrameDef],
+        text: &mut String,
+    ) {
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return;
+        };
+        match field {
+            StepField::WaitByFrame => {
+                if matches!(code, KeyCode::Char(' ')) {
+                    if let Some(step) = draft.scenario.steps.get(index) {
+                        let by_frame = !matches!(
+                            step.action,
+                            Action::WaitFor {
+                                expect: Expect::Frame { .. },
+                                ..
+                            }
+                        );
+                        scenarios::set_wait_by_frame(
+                            draft.scenario.steps.get_mut(index).expect("just read"),
+                            by_frame,
+                            frames.first().map(|f| f.name.as_str()),
+                        );
+                    }
+                }
+            }
+            StepField::WaitPattern => {
+                edit_text(code, text);
+                if let Some(parsed) = sim_core::HexPattern::parse(text) {
+                    if let Some(Step {
+                        action:
+                            Action::WaitFor {
+                                expect: Expect::Pattern { pattern, .. },
+                                ..
+                            },
+                        ..
+                    }) = draft.scenario.steps.get_mut(index)
+                    {
+                        *pattern = parsed;
+                    }
+                }
+            }
+            StepField::WaitAnchored => {
+                if matches!(code, KeyCode::Char(' ')) {
+                    if let Some(Step {
+                        action:
+                            Action::WaitFor {
+                                expect: Expect::Pattern { anchor, .. },
+                                ..
+                            },
+                        ..
+                    }) = draft.scenario.steps.get_mut(index)
+                    {
+                        *anchor = if matches!(anchor, sim_core::pattern::Anchor::At(_)) {
+                            sim_core::pattern::Anchor::Anywhere
+                        } else {
+                            sim_core::pattern::Anchor::At(0)
+                        };
+                    }
+                }
+            }
+            StepField::WaitOffset => {
+                edit_digits(code, text);
+                if let Some(Step {
+                    action:
+                        Action::WaitFor {
+                            expect: Expect::Pattern { anchor, .. },
+                            ..
+                        },
+                    ..
+                }) = draft.scenario.steps.get_mut(index)
+                {
+                    *anchor = sim_core::pattern::Anchor::At(text.parse().unwrap_or(0));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn act_on_wait_frame(
+        &mut self,
+        index: usize,
+        field: &StepField,
+        code: KeyCode,
+        frames: &[FrameDef],
+        text: &mut String,
+    ) {
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return;
+        };
+        match field {
+            StepField::WaitFrame => {
+                if let Some(delta) = arrow_delta(code) {
+                    if !frames.is_empty() {
+                        if let Some(Step {
+                            action:
+                                Action::WaitFor {
+                                    expect: Expect::Frame { frame, values },
+                                    ..
+                                },
+                            ..
+                        }) = draft.scenario.steps.get_mut(index)
+                        {
+                            let names: Vec<String> =
+                                frames.iter().map(|f| f.name.clone()).collect();
+                            let current = names.iter().position(|n| n == frame).unwrap_or(0);
+                            let at = i32::try_from(current).unwrap_or(0)
+                                + i32::try_from(delta).unwrap_or(0);
+                            let at = at.rem_euclid(i32::try_from(names.len()).unwrap_or(1));
+                            frame.clone_from(&names[usize::try_from(at).unwrap_or(0)]);
+                            values.clear();
+                        }
+                    }
+                }
+            }
+            StepField::WaitField(i) => {
+                let Some(step) = draft.scenario.steps.get(index).cloned() else {
+                    return;
+                };
+                let Action::WaitFor {
+                    expect: Expect::Frame { frame, values },
+                    ..
+                } = &step.action
+                else {
+                    return;
+                };
+                let Some(definition) = frames.iter().find(|f| f.name == *frame) else {
+                    return;
+                };
+                let Some(field_def) = definition.fields.get(*i) else {
+                    return;
+                };
+                if matches!(code, KeyCode::Char(' ')) {
+                    let on = !values.contains_key(&field_def.name);
+                    scenarios::set_match(
+                        draft.scenario.steps.get_mut(index).expect("just read"),
+                        definition,
+                        &field_def.name,
+                        on,
+                    );
+                }
+            }
+            StepField::Limited => {
+                if matches!(code, KeyCode::Char(' ')) {
+                    if let Some(Step {
+                        action: Action::WaitFor { timeout, .. },
+                        ..
+                    }) = draft.scenario.steps.get_mut(index)
+                    {
+                        *timeout = timeout.is_none().then(|| Duration::from_millis(500));
+                    }
+                }
+            }
+            StepField::TimeoutMs => {
+                edit_digits(code, text);
+                if let Some(Step {
+                    action:
+                        Action::WaitFor {
+                            timeout: Some(timeout),
+                            ..
+                        },
+                    ..
+                }) = draft.scenario.steps.get_mut(index)
+                {
+                    *timeout = Duration::from_millis(text.parse().unwrap_or(1));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn pick_scenario(&mut self, delta: isize) {
