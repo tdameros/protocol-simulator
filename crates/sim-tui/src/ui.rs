@@ -103,19 +103,26 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // The widest name, so the two columns after it keep one left edge.
-    let widest = links.iter().map(|(id, _)| id.0.len()).max().unwrap_or(0);
+    // Measured on what is shown rather than on the longest either column could
+    // ever hold: "Port open, waiting for a peer" would push the summary off a
+    // narrow terminal for the sake of a state nothing is in.
+    let named = links.iter().map(|(id, _)| id.0.len()).max().unwrap_or(0);
+    let stated = links
+        .iter()
+        .map(|(_, entry)| links::status(entry.status).len())
+        .max()
+        .unwrap_or(0);
 
     let rows: Vec<Line> = links
         .iter()
         .map(|(id, entry)| {
             Line::from(vec![
                 Span::styled(
-                    format!("{:widest$}", id.0),
+                    format!("{:named$}", id.0),
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::raw(links::status(entry.status)),
+                Span::raw(format!("{:stated$}", links::status(entry.status))),
                 Span::raw("  "),
                 Span::raw(links::summary(entry)).dim(),
             ])

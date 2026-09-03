@@ -197,3 +197,21 @@ fn a_full_buffer_shows_its_newest_rows() {
     assert!(shown.contains("01 F3"), "the last row is drawn: {shown}");
     assert!(!shown.contains("00 00"), "the first is not: {shown}");
 }
+
+/// Ragged columns make a list of links unreadable at a glance.
+#[test]
+fn the_link_columns_keep_one_left_edge() {
+    let mut app = App::default();
+    linked(&mut app, "drive", ConnectionStatus::Connected);
+    linked(&mut app, "sensor-bus", ConnectionStatus::Disconnected);
+
+    let shown = screen(&app);
+    let starts: Vec<usize> = shown
+        .lines()
+        .filter(|line| line.contains("UDP"))
+        .map(|line| line.find("UDP").expect("the summary"))
+        .collect();
+
+    assert_eq!(starts.len(), 2, "{shown}");
+    assert_eq!(starts[0], starts[1], "{shown}");
+}
