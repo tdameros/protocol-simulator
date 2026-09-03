@@ -1361,3 +1361,180 @@ fn the_kind_label_matches_the_one_shared_definition() {
     let shown = screen(&mut app);
     assert!(shown.contains("TCP (client)"), "{shown}");
 }
+
+#[test]
+fn pausing_freezes_the_view_but_not_the_buffer() {
+    let mut app = App::default();
+    captured(&mut app, &[0x01], Duration::from_secs(1));
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('p'));
+    assert!(screen(&mut app).contains("paused"));
+
+    captured(&mut app, &[0x02], Duration::from_secs(2));
+    let shown = screen(&mut app);
+    assert!(shown.contains("(1, following, paused)"), "{shown}");
+
+    press(&mut app, KeyCode::Char('p'));
+    let shown = screen(&mut app);
+    assert!(!shown.contains("paused"), "{shown}");
+    assert!(
+        shown.contains("(2, following)"),
+        "the buffered frame catches up: {shown}"
+    );
+}
+
+#[test]
+fn clearing_hides_what_was_captured_before_it() {
+    let mut app = App::default();
+    captured(&mut app, &[0x01], Duration::from_secs(1));
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('c'));
+
+    assert!(screen(&mut app).contains("Nothing captured yet"));
+    captured(&mut app, &[0x02], Duration::from_secs(2));
+    assert!(screen(&mut app).contains("(1,"), "{}", screen(&mut app));
+}
+
+#[test]
+fn a_new_monitor_watches_the_same_buffer_on_its_own() {
+    let mut app = App::default();
+    captured(&mut app, &[0x01], Duration::from_secs(1));
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('m'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("[2/2]"), "{shown}");
+    assert!(
+        shown.contains("Nothing captured yet"),
+        "a fresh view starts empty: {shown}"
+    );
+
+    press(&mut app, KeyCode::Char('['));
+    let shown = screen(&mut app);
+    assert!(shown.contains("[1/2]"), "{shown}");
+    assert!(
+        !shown.contains("Nothing captured yet"),
+        "the first view keeps its history: {shown}"
+    );
+}
+
+#[test]
+fn the_last_monitor_cannot_be_closed() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('x'));
+
+    assert_eq!(app.session().monitors.len(), 1);
+    assert!(
+        screen(&mut app).contains("cannot be closed"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+#[test]
+fn closing_a_monitor_falls_back_to_another_one() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('m'));
+    press(&mut app, KeyCode::Char('x'));
+
+    assert_eq!(app.session().monitors.len(), 1);
+    let shown = screen(&mut app);
+    assert!(
+        !shown.contains("[1/2]") && !shown.contains("[2/2]"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn the_filter_narrows_what_is_shown() {
+    let mut app = App::default();
+    captured(&mut app, b"AT+", Duration::from_secs(1));
+    captured(&mut app, b"OK", Duration::from_secs(2));
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('/'));
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Tab); // title, direction, hex, at-offset, source
+    }
+    for letter in "AT".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Esc);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("AT+"), "{shown}");
+    assert!(!shown.contains("4F 4B"), "OK is filtered out: {shown}");
+}
+
+#[test]
+fn the_tab_name_can_be_changed() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('/'));
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    for letter in "Uplink".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Esc);
+
+    assert!(screen(&mut app).contains("Uplink"), "{}", screen(&mut app));
+}
+
+#[test]
+fn a_connection_can_be_ticked_into_the_filter() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('/'));
+    press(&mut app, KeyCode::Tab); // off Title, onto the "bus" row
+    let shown = screen(&mut app);
+    assert!(shown.contains("bus"), "{shown}");
+
+    press(&mut app, KeyCode::Char(' '));
+    let shown = screen(&mut app);
+    assert!(app
+        .monitor()
+        .expect("a view")
+        .filter
+        .connections
+        .contains("bus"));
+    assert!(shown.contains("yes"), "{shown}");
+}
+
+#[test]
+fn sending_a_row_to_hex_switches_there_with_the_bytes() {
+    let mut app = App::default();
+    captured(&mut app, &[0xAA, 0x55], Duration::from_secs(1));
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('h'));
+
+    assert_eq!(app.tab(), crate::app::Tab::HexInject);
+    assert_eq!(app.session().hex_input, "AA 55");
+}
+
+#[test]
+fn opening_a_row_in_frames_decodes_it_into_the_chosen_definition() {
+    let mut app = App::default();
+    with_frames(
+        &mut app,
+        "opening_a_row_in_frames_decodes_it_into_the_chosen_definition",
+    );
+    captured(
+        &mut app,
+        &[0xAA, 0x55, 0x02, 0x05, 0xDC],
+        Duration::from_secs(1),
+    );
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Down); // choose Status
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('F'));
+
+    assert_eq!(app.tab(), crate::app::Tab::Frames);
+    let shown = screen(&mut app);
+    assert!(shown.contains("RUNNING"), "{shown}");
+}

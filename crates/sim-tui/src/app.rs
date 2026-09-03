@@ -16,7 +16,7 @@ use sim_session::hex;
 use sim_session::project::Project;
 use sim_session::reading::{self, Reading};
 use sim_session::scenarios;
-use sim_session::state::{ConnectionEntry, LogEntry, MonitorState, Session};
+use sim_session::state::{ConnectionEntry, LogEntry, MonitorState, Session, TrafficFilter};
 
 /// The same five views the window has, in the same order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +130,9 @@ pub enum Overlay {
     Pick(Picker, PickPurpose),
     /// One value typed as text: a number, some bytes, a run of characters.
     EditText(EditBox),
+    /// A traffic view's name and filter, changed live as each field is
+    /// touched: there is nothing to submit.
+    Filter(FilterEdit),
     /// A file to be found on this machine.
     Browse(Browser),
     /// A connection being described before it exists.
@@ -141,6 +144,247 @@ pub enum Overlay {
 /// The window opens a desktop file dialog. A board reached over ssh has no
 /// desktop to put one on, so the walk is here: a folder at a time, with the
 /// same keys as every other list.
+/// One field of the filter editor: what it changes, and how a key changes it.
+enum FilterField {
+    Title,
+    /// One row per connection the project knows, toggled on or off the
+    /// filter's set. Empty means every connection, so this is the only field
+    /// whose absence still means something.
+    Connection(usize),
+    Direction,
+    Hex,
+    Anchored,
+    Offset,
+    Source,
+    Text,
+    MinLen,
+    MaxLen,
+    Invert,
+}
+
+/// A traffic view's name and filter, edited live.
+///
+/// Unlike the connection form, there is nothing to validate and nothing to
+/// submit: every field the window offers here applies to the buffer the
+/// moment it changes, so the terminal does the same.
+pub struct FilterEdit {
+    focus: usize,
+    /// Typed text for the three numeric fields, kept apart from the model
+    /// because a person mid-keystroke on "12" is not yet the number 12 or
+    /// the number 1.
+    min_len_text: String,
+    max_len_text: String,
+    offset_text: String,
+}
+
+impl FilterEdit {
+    fn new(filter: &TrafficFilter) -> Self {
+        Self {
+            focus: 0,
+            min_len_text: filter.min_len.map_or_else(String::new, |n| n.to_string()),
+            max_len_text: filter.max_len.map_or_else(String::new, |n| n.to_string()),
+            offset_text: match filter.anchor {
+                sim_session::state::HexAnchor::At(offset) => offset.to_string(),
+                sim_session::state::HexAnchor::Anywhere => String::new(),
+            },
+        }
+    }
+
+    fn fields(names: &[String], filter: &TrafficFilter) -> Vec<FilterField> {
+        let mut fields = vec![FilterField::Title];
+        fields.extend((0..names.len()).map(FilterField::Connection));
+        fields.push(FilterField::Direction);
+        fields.push(FilterField::Hex);
+        fields.push(FilterField::Anchored);
+        if matches!(filter.anchor, sim_session::state::HexAnchor::At(_)) {
+            fields.push(FilterField::Offset);
+        }
+        fields.push(FilterField::Source);
+        fields.push(FilterField::Text);
+        fields.push(FilterField::MinLen);
+        fields.push(FilterField::MaxLen);
+        fields.push(FilterField::Invert);
+        fields
+    }
+
+    /// Each field as a line: its label, what it holds, and whether it is the
+    /// one a key would change.
+    #[must_use]
+    pub fn lines(
+        &self,
+        title: &str,
+        filter: &TrafficFilter,
+        names: &[String],
+    ) -> Vec<(String, String, bool)> {
+        let fields = Self::fields(names, filter);
+        let focus = self.focus.min(fields.len().saturating_sub(1));
+        fields
+            .iter()
+            .enumerate()
+            .map(|(at, field)| {
+                let label = match field {
+                    FilterField::Title => "Tab name".to_owned(),
+                    FilterField::Connection(i) => format!("  {}", names[*i]),
+                    FilterField::Direction => "Direction".to_owned(),
+                    FilterField::Hex => "Hex pattern".to_owned(),
+                    FilterField::Anchored => "At offset".to_owned(),
+                    FilterField::Offset => "  Offset".to_owned(),
+                    FilterField::Source => "Source contains".to_owned(),
+                    FilterField::Text => "Text contains".to_owned(),
+                    FilterField::MinLen => "Min length".to_owned(),
+                    FilterField::MaxLen => "Max length".to_owned(),
+                    FilterField::Invert => "Hide matches".to_owned(),
+                };
+                let value = match field {
+                    FilterField::Title => title.to_owned(),
+                    FilterField::Connection(i) => {
+                        yes_no(filter.connections.contains(&names[*i])).to_owned()
+                    }
+                    FilterField::Direction => filter.direction.label().to_owned(),
+                    FilterField::Hex => filter.hex.clone(),
+                    FilterField::Anchored => yes_no(matches!(
+                        filter.anchor,
+                        sim_session::state::HexAnchor::At(_)
+                    ))
+                    .to_owned(),
+                    FilterField::Offset => self.offset_text.clone(),
+                    FilterField::Source => filter.source.clone(),
+                    FilterField::Text => filter.text.clone(),
+                    FilterField::MinLen => self.min_len_text.clone(),
+                    FilterField::MaxLen => self.max_len_text.clone(),
+                    FilterField::Invert => yes_no(filter.invert).to_owned(),
+                };
+                (label, value, at == focus)
+            })
+            .collect()
+    }
+
+    /// What a key does to the field under focus. Moving between fields never
+    /// touches the model; everything else does, straight away.
+    fn handle(
+        &mut self,
+        code: KeyCode,
+        names: &[String],
+        title: &mut String,
+        filter: &mut TrafficFilter,
+        close: &mut bool,
+    ) {
+        let held = Self::fields(names, filter).len().max(1);
+        match code {
+            KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1) % held,
+            KeyCode::BackTab | KeyCode::Up => self.focus = (self.focus + held - 1) % held,
+            KeyCode::Esc | KeyCode::Enter => *close = true,
+            _ => {
+                let fields = Self::fields(names, filter);
+                let focus = self.focus.min(fields.len().saturating_sub(1));
+                if let Some(field) = fields.into_iter().nth(focus) {
+                    self.act(&field, code, names, title, filter);
+                }
+            }
+        }
+    }
+
+    fn act(
+        &mut self,
+        field: &FilterField,
+        code: KeyCode,
+        names: &[String],
+        title: &mut String,
+        filter: &mut TrafficFilter,
+    ) {
+        match field {
+            FilterField::Title => edit_text(code, title),
+            FilterField::Connection(i) => {
+                if matches!(code, KeyCode::Char(' ')) {
+                    let name = &names[*i];
+                    if filter.connections.contains(name) {
+                        filter.connections.remove(name);
+                    } else {
+                        filter.connections.insert(name.clone());
+                    }
+                }
+            }
+            FilterField::Direction => {
+                if let Some(delta) = arrow_delta(code) {
+                    filter.direction = crate::connection_form::cycle(
+                        &sim_session::state::DirectionFilter::ALL,
+                        filter.direction,
+                        delta,
+                    );
+                }
+            }
+            FilterField::Hex => edit_text(code, &mut filter.hex),
+            FilterField::Anchored => {
+                if matches!(code, KeyCode::Char(' ')) {
+                    filter.anchor = if matches!(filter.anchor, sim_session::state::HexAnchor::At(_))
+                    {
+                        sim_session::state::HexAnchor::Anywhere
+                    } else {
+                        sim_session::state::HexAnchor::At(self.offset_text.parse().unwrap_or(0))
+                    };
+                }
+            }
+            FilterField::Offset => {
+                edit_digits(code, &mut self.offset_text);
+                filter.anchor =
+                    sim_session::state::HexAnchor::At(self.offset_text.parse().unwrap_or(0));
+            }
+            FilterField::Source => edit_text(code, &mut filter.source),
+            FilterField::Text => edit_text(code, &mut filter.text),
+            FilterField::MinLen => {
+                edit_digits(code, &mut self.min_len_text);
+                filter.min_len = self.min_len_text.parse().ok();
+            }
+            FilterField::MaxLen => {
+                edit_digits(code, &mut self.max_len_text);
+                filter.max_len = self.max_len_text.parse().ok();
+            }
+            FilterField::Invert => {
+                if matches!(code, KeyCode::Char(' ')) {
+                    filter.invert = !filter.invert;
+                }
+            }
+        }
+    }
+}
+
+/// `Right` steps forward, `Left` steps back, anything else does nothing.
+fn arrow_delta(code: KeyCode) -> Option<isize> {
+    match code {
+        KeyCode::Right => Some(1),
+        KeyCode::Left => Some(-1),
+        _ => None,
+    }
+}
+
+fn edit_text(code: KeyCode, text: &mut String) {
+    match code {
+        KeyCode::Char(letter) => text.push(letter),
+        KeyCode::Backspace => {
+            text.pop();
+        }
+        _ => {}
+    }
+}
+
+fn edit_digits(code: KeyCode, text: &mut String) {
+    match code {
+        KeyCode::Char(digit) if digit.is_ascii_digit() => text.push(digit),
+        KeyCode::Backspace => {
+            text.pop();
+        }
+        _ => {}
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 pub struct Browser {
     at: PathBuf,
     picker: Picker,
@@ -331,6 +575,8 @@ pub struct App {
     /// Apart from `session.last_error`, which is for what did not: the two
     /// never compete for the one line reserved above the hints.
     status: Option<String>,
+    /// The traffic view on show, when there is more than one.
+    current_monitor: Option<sim_session::state::MonitorId>,
     /// Which pane of the Frames view a key acts on.
     frame_focus: FramesFocus,
     /// The row under the cursor in the fields pane, and the frame it belongs
@@ -359,6 +605,7 @@ impl Default for App {
             looked_in: None,
             connection_at: None,
             status: None,
+            current_monitor: None,
             frame_focus: FramesFocus::Library,
             field_at: None,
         }
@@ -449,9 +696,36 @@ impl App {
     /// The window has a tab per view. A terminal has one screen, so it shows
     /// the first the project described, which is where its filter and its
     /// follow setting come from.
+    /// The id of the traffic view on show, falling back to the first one held
+    /// once the one last shown has been closed.
+    fn monitor_id(&mut self) -> Option<sim_session::state::MonitorId> {
+        let live = self
+            .current_monitor
+            .filter(|id| self.session.monitors.contains_key(id));
+        let id = live.or_else(|| self.session.monitors.keys().next().copied());
+        self.current_monitor = id;
+        id
+    }
+
     #[must_use]
     pub fn monitor(&self) -> Option<&MonitorState> {
-        self.session.monitors.values().next()
+        let id = self
+            .current_monitor
+            .filter(|id| self.session.monitors.contains_key(id))
+            .or_else(|| self.session.monitors.keys().next().copied())?;
+        self.session.monitors.get(&id)
+    }
+
+    /// Where the tab strip says the current view sits, one-based, and how
+    /// many there are: `(2, 3)` reads "the second of three".
+    #[must_use]
+    pub fn monitor_position(&self) -> Option<(usize, usize)> {
+        let id = self
+            .current_monitor
+            .filter(|id| self.session.monitors.contains_key(id))
+            .or_else(|| self.session.monitors.keys().next().copied())?;
+        let at = self.session.monitors.keys().position(|k| *k == id)?;
+        Some((at + 1, self.session.monitors.len()))
     }
 
     /// The row being read, and what it reads as.
@@ -459,9 +733,10 @@ impl App {
     /// Settling which definition to use is part of the answer, hence the
     /// mutable borrow: a row with one candidate takes it without asking.
     pub fn selected_reading(&mut self) -> Option<(&LogEntry, Reading<'_>)> {
-        let seq = self.session.monitors.values().next()?.selected?;
+        let id = self.monitor_id()?;
+        let seq = self.session.monitors.get(&id)?.selected?;
         let entry = self.session.log.iter().find(|entry| entry.seq == seq)?;
-        let decode_as = &mut self.session.monitors.values_mut().next()?.decode_as;
+        let decode_as = &mut self.session.monitors.get_mut(&id)?.decode_as;
         let reading = reading::read(&self.session.frames, entry, decode_as);
         Some((entry, reading))
     }
@@ -569,6 +844,14 @@ impl App {
                 ("Esc", "cancel"),
             ];
         }
+        if let Some(Overlay::Filter(_)) = self.overlay {
+            return &[
+                ("Tab", "next field"),
+                ("left/right", "change"),
+                ("space", "toggle"),
+                ("Esc", "done"),
+            ];
+        }
         if let Some(Overlay::EditText(_)) = self.overlay {
             return &[("Enter", "apply"), ("Esc", "cancel")];
         }
@@ -577,8 +860,9 @@ impl App {
             Tab::Traffic => &[
                 ("up/down", "read a row"),
                 ("Enter", "read as"),
-                ("Esc", "put it away"),
+                ("p", "pause"),
                 ("f", "follow"),
+                ("/", "filter"),
             ],
             Tab::Scenarios => &[("up/down", "choose"), ("Enter", "run"), ("x", "stop")],
             Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
@@ -674,6 +958,10 @@ impl App {
 
     /// What an overlay does with a key. Everything else it swallows.
     fn over(&mut self, code: KeyCode) {
+        if matches!(self.overlay, Some(Overlay::Filter(_))) {
+            self.filter_key(code);
+            return;
+        }
         let Some(overlay) = &mut self.overlay else {
             return;
         };
@@ -735,6 +1023,45 @@ impl App {
                 KeyCode::Char(letter) => edit.text.push(letter),
                 _ => {}
             },
+            // Handled apart, before this match: it changes the model as it
+            // goes, which reads awkwardly from inside a match already holding
+            // the overlay itself borrowed.
+            Overlay::Filter(_) => {}
+        }
+    }
+
+    /// Applies a key to the filter editor, mutating the view's title and
+    /// filter directly rather than through the overlay: the two live in
+    /// different fields of `self`, and both need touching here.
+    fn filter_key(&mut self, code: KeyCode) {
+        let names: Vec<String> = self
+            .session
+            .connections
+            .iter()
+            .map(|(id, _)| id.0.clone())
+            .collect();
+        let Some(id) = self.monitor_id() else {
+            self.overlay = None;
+            return;
+        };
+        let Some(monitor) = self.session.monitors.get(&id) else {
+            self.overlay = None;
+            return;
+        };
+        let mut title = monitor.title.clone();
+        let mut filter = monitor.filter.clone();
+
+        let mut close = false;
+        if let Some(Overlay::Filter(edit)) = &mut self.overlay {
+            edit.handle(code, &names, &mut title, &mut filter, &mut close);
+        }
+
+        if let Some(monitor) = self.session.monitors.get_mut(&id) {
+            monitor.title = title;
+            monitor.filter = filter;
+        }
+        if close {
+            self.overlay = None;
         }
     }
 
@@ -1067,8 +1394,10 @@ impl App {
     fn take_picked(&mut self, purpose: PickPurpose, taken: String) {
         match purpose {
             PickPurpose::DecodeAs => {
-                if let Some(monitor) = self.session.monitors.values_mut().next() {
-                    monitor.decode_as = Some(taken);
+                if let Some(id) = self.monitor_id() {
+                    if let Some(monitor) = self.session.monitors.get_mut(&id) {
+                        monitor.decode_as = Some(taken);
+                    }
                 }
             }
             PickPurpose::EnumField { field } => {
@@ -1301,20 +1630,123 @@ impl App {
         match code {
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
             KeyCode::Up | KeyCode::Char('k') => self.step(-1),
-            KeyCode::Esc => {
-                if let Some(monitor) = self.session.monitors.values_mut().next() {
-                    monitor.selected = None;
-                }
-            }
+            KeyCode::Esc => self.with_monitor(|monitor| monitor.selected = None),
             KeyCode::Enter | KeyCode::Char('d') => self.pick_frame(),
-            KeyCode::Char('f') => {
-                if let Some(monitor) = self.session.monitors.values_mut().next() {
-                    monitor.follow = !monitor.follow;
-                }
+            KeyCode::Char('f') => self.with_monitor(|monitor| monitor.follow = !monitor.follow),
+            KeyCode::Char('p') => self.toggle_paused(),
+            KeyCode::Char('c') => self.clear_monitor(),
+            KeyCode::Char('/') => self.open_filter(),
+            KeyCode::Char('m') => {
+                let id = self.session.open_monitor();
+                self.current_monitor = Some(id);
             }
+            KeyCode::Char('x') => self.close_current_monitor(),
+            KeyCode::Char('[') => self.switch_monitor(-1),
+            KeyCode::Char(']') => self.switch_monitor(1),
+            KeyCode::Char('h') => self.send_row_to_hex(),
+            KeyCode::Char('F') => self.open_row_in_frames(),
             _ => return false,
         }
         true
+    }
+
+    /// Applies `change` to the view on show, if there is one.
+    fn with_monitor(&mut self, change: impl FnOnce(&mut MonitorState)) {
+        if let Some(id) = self.monitor_id() {
+            if let Some(monitor) = self.session.monitors.get_mut(&id) {
+                change(monitor);
+            }
+        }
+    }
+
+    /// Freezes the view on the newest row admitted so far, or lets it run
+    /// again. Frames keep arriving in the shared buffer either way.
+    fn toggle_paused(&mut self) {
+        let next_seq = self.session.next_seq();
+        self.with_monitor(|monitor| {
+            monitor.paused_at = monitor
+                .paused_at
+                .is_none()
+                .then(|| next_seq.saturating_sub(1));
+        });
+    }
+
+    /// Hides everything logged so far, in this view only.
+    fn clear_monitor(&mut self) {
+        let next_seq = self.session.next_seq();
+        self.with_monitor(|monitor| {
+            monitor.since = next_seq;
+            monitor.paused_at = None;
+        });
+    }
+
+    /// Moves the tab strip by `delta`, wrapping at either end.
+    fn switch_monitor(&mut self, delta: isize) {
+        let ids: Vec<sim_session::state::MonitorId> =
+            self.session.monitors.keys().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        let Some(current) = self.monitor_id() else {
+            return;
+        };
+        self.current_monitor = Some(crate::connection_form::cycle(&ids, current, delta));
+    }
+
+    /// Closes the view on show. Refused on the last one: a bench with no
+    /// traffic view at all has nowhere for a captured frame to land.
+    fn close_current_monitor(&mut self) {
+        if self.session.monitors.len() <= 1 {
+            self.session.last_error = Some("The last traffic view cannot be closed.".to_owned());
+            return;
+        }
+        if let Some(id) = self.monitor_id() {
+            self.session.close_monitor(id);
+            self.current_monitor = None;
+        }
+    }
+
+    /// Opens the filter editor for the view on show.
+    fn open_filter(&mut self) {
+        if self.monitor_id().is_some() {
+            let filter = self.monitor().map(|monitor| monitor.filter.clone());
+            self.overlay = filter.map(|filter| Overlay::Filter(FilterEdit::new(&filter)));
+        }
+    }
+
+    /// Copies the selected row's bytes into the hex injection box and
+    /// switches to it, ready to be sent back or tweaked first.
+    fn send_row_to_hex(&mut self) {
+        let Some((entry, _)) = self.selected_reading() else {
+            return;
+        };
+        self.session.hex_input = hex::spaced(&entry.bytes);
+        self.tab = Tab::HexInject;
+    }
+
+    /// Hands the selected row's bytes to the frame editor, decoded into
+    /// whichever definition is chosen there.
+    fn open_row_in_frames(&mut self) {
+        let Some((entry, _)) = self.selected_reading() else {
+            return;
+        };
+        self.session.pending_frame_hex = Some(entry.bytes.clone());
+        self.tab = Tab::Frames;
+        self.apply_pending_frame_hex();
+    }
+
+    /// Decodes bytes handed over from Traffic into the frame currently
+    /// selected in the Frames view, the same way the window does.
+    fn apply_pending_frame_hex(&mut self) {
+        let Some(bytes) = self.session.pending_frame_hex.take() else {
+            return;
+        };
+        let Some(frame) = self.session.frames.selected_frame().cloned() else {
+            self.session.last_error = Some("Choose a frame first.".to_owned());
+            return;
+        };
+        let typed = hex::spaced(&bytes);
+        self.session.last_error = sim_session::frames::apply_hex(&mut self.session, &frame, &typed);
     }
 
     /// Moves the read row by `delta`, stopping at either end.
@@ -1327,7 +1759,10 @@ impl App {
         let Some(last) = seqs.len().checked_sub(1) else {
             return;
         };
-        let Some(monitor) = self.session.monitors.values_mut().next() else {
+        let Some(id) = self.monitor_id() else {
+            return;
+        };
+        let Some(monitor) = self.session.monitors.get_mut(&id) else {
             return;
         };
 

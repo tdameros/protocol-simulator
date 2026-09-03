@@ -58,6 +58,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(Overlay::Browse(browser)) => walk_over(frame, frame.area(), browser),
         Some(Overlay::EditText(edit)) => edit_over(frame, frame.area(), edit),
         Some(Overlay::NewConnection(form)) => connection_form_over(frame, frame.area(), form),
+        Some(Overlay::Filter(edit)) => filter_editor_over(frame, frame.area(), edit, app),
         None => {}
     }
 }
@@ -192,6 +193,50 @@ fn connection_form_over(frame: &mut Frame, area: Rect, form: &ConnectionForm) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(rendered).block(Block::bordered().title(" New connection ")),
+        popup,
+    );
+}
+
+/// The current view's name and filter, changed live.
+fn filter_editor_over(frame: &mut Frame, area: Rect, edit: &crate::app::FilterEdit, app: &App) {
+    let names: Vec<String> = app
+        .session()
+        .connections
+        .iter()
+        .map(|(id, _)| id.0.clone())
+        .collect();
+    let Some(monitor) = app.monitor() else {
+        return;
+    };
+
+    let lines = edit.lines(&monitor.title, &monitor.filter, &names);
+    let widest = lines
+        .iter()
+        .map(|(label, _, _)| label.len())
+        .max()
+        .unwrap_or(0);
+
+    let rendered: Vec<Line> = lines
+        .into_iter()
+        .map(|(label, value, focused)| {
+            let line = Line::from(vec![
+                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(value),
+            ]);
+            if focused {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    let wanted = rendered.iter().map(Line::width).max().unwrap_or(0) + 4;
+    let popup = centred(area, wanted, rendered.len() + 4);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(rendered).block(Block::bordered().title(" Filter ")),
         popup,
     );
 }
@@ -635,7 +680,23 @@ fn rows_view(frame: &mut Frame, area: Rect, app: &App) {
         || " Traffic ".to_owned(),
         |monitor| {
             let following = if monitor.follow { ", following" } else { "" };
-            format!(" {} ({}{}) ", monitor.title, rows.len(), following)
+            let paused = if monitor.paused_at.is_some() {
+                ", paused"
+            } else {
+                ""
+            };
+            let tab = app
+                .monitor_position()
+                .filter(|(_, of)| *of > 1)
+                .map_or_else(String::new, |(at, of)| format!(" [{at}/{of}]"));
+            format!(
+                " {}{} ({}{}{}) ",
+                monitor.title,
+                tab,
+                rows.len(),
+                following,
+                paused
+            )
         },
     );
     let block = Block::bordered().title(title);

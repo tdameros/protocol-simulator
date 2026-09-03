@@ -71,7 +71,7 @@ const FLOW_CONTROL: [FlowControl; 3] = [
     clippy::cast_sign_loss,
     reason = "every list this cycles is a handful of transport or serial settings"
 )]
-fn cycle<T: Copy + PartialEq>(options: &[T], current: T, delta: isize) -> T {
+pub(crate) fn cycle<T: Copy + PartialEq>(options: &[T], current: T, delta: isize) -> T {
     let at = options
         .iter()
         .position(|option| *option == current)
