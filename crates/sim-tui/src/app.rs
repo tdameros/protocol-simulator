@@ -206,14 +206,19 @@ impl App {
         self.running
     }
 
-    /// The keys every view answers to, in the order they are shown.
-    pub const KEYS: [(&'static str, &'static str); 5] = [
+    /// Moving between views, which every view answers to.
+    pub const KEYS: [(&'static str, &'static str); 3] = [
         ("1-5", "go to a view"),
         ("Tab", "next view"),
         ("Shift+Tab", "previous view"),
-        ("?", "keys"),
-        ("q", "quit"),
     ];
+
+    /// The way out, and the way to the rest.
+    ///
+    /// Kept apart because these two are never dropped for want of room: not
+    /// knowing how to leave a terminal program is how a session gets killed
+    /// from another window.
+    pub const ESCAPES: [(&'static str, &'static str); 2] = [("?", "keys"), ("q", "quit")];
 
     /// What the view on show adds to them.
     ///

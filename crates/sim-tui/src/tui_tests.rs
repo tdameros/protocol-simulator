@@ -17,7 +17,12 @@ use crate::ui;
 
 /// The screen as one string, one line per row.
 fn screen(app: &mut App) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("a test terminal");
+    narrow(app, 80)
+}
+
+/// The same screen at a chosen width, since a serial console is not 80 columns.
+fn narrow(app: &mut App, width: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("a test terminal");
     terminal.draw(|frame| ui::draw(frame, app)).expect("a draw");
 
     let buffer = terminal.backend().buffer().clone();
@@ -342,4 +347,18 @@ fn the_hint_line_follows_the_view() {
 
     press(&mut app, KeyCode::Char('2'));
     assert!(last(screen(&mut app)).contains("read a row"));
+}
+
+/// Not knowing how to leave a terminal program is how a session gets killed
+/// from another window.
+#[test]
+fn the_way_out_is_offered_however_narrow_the_terminal() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+
+    for width in [80u16, 60, 40, 30] {
+        let shown = narrow(&mut app, width);
+        let last = shown.lines().last().expect("a hint line").to_owned();
+        assert!(last.contains("q quit"), "at {width} columns: {last}");
+    }
 }

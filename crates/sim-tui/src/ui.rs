@@ -285,20 +285,52 @@ fn row(entry: &LogEntry, previous: Option<&LogEntry>) -> Line<'static> {
 }
 
 fn hint_line(frame: &mut Frame, area: Rect, app: &App) {
+    let width = area.width as usize;
+
+    // The way out keeps its room whatever else has to go. What the view adds
+    // comes next, being the keys the screen in front of you answers to, and
+    // moving between views is what gets dropped first on a narrow terminal.
+    let escapes = hints(&App::ESCAPES, width);
+    let room = width.saturating_sub(escapes.width() + 3);
+    let offered: Vec<(&str, &str)> = app
+        .view_keys()
+        .iter()
+        .chain(App::KEYS.iter())
+        .copied()
+        .collect();
+
+    let mut line = hints(&offered, room);
+    if !line.spans.is_empty() {
+        line.push_span(Span::raw("   "));
+    }
+    line.spans.extend(escapes.spans);
+
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// As many of `keys` as fit in `room`, dropped whole rather than cut: half a
+/// word reads as a mistake.
+fn hints(keys: &[(&str, &str)], room: usize) -> Line<'static> {
     let mut spans = Vec::new();
-    let keys = app.view_keys().iter().chain(App::KEYS.iter());
-    for (at, (key, does)) in keys.enumerate() {
-        if at > 0 {
+    let mut used = 0usize;
+    for (key, does) in keys {
+        let gap = usize::from(!spans.is_empty()) * 3;
+        let wanted = gap + key.len() + 1 + does.len();
+        if used + wanted > room {
+            break;
+        }
+        used += wanted;
+        if gap > 0 {
             spans.push(Span::raw("   "));
         }
         spans.push(Span::styled(
-            *key,
+            (*key).to_owned(),
             Style::new().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
-        spans.push(Span::raw(*does).dim());
+        spans.push(Span::raw((*does).to_owned()).dim());
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    Line::from(spans)
 }
 
 fn key_map(frame: &mut Frame, area: Rect, app: &App) {
@@ -306,6 +338,7 @@ fn key_map(frame: &mut Frame, area: Rect, app: &App) {
         .view_keys()
         .iter()
         .chain(App::KEYS.iter())
+        .chain(App::ESCAPES.iter())
         .copied()
         .collect();
 
