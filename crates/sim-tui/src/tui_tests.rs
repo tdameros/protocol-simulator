@@ -511,3 +511,83 @@ fn the_hints_follow_the_list_that_is_open() {
     assert!(last.contains("narrow"), "{last}");
     assert!(!last.contains("read a row"), "{last}");
 }
+
+const BRING_UP: &str = r#"
+[[scenario]]
+name = "Bring-up"
+on = "drive"
+
+[[scenario.step]]
+send = "Status"
+
+[[scenario.step]]
+wait_ms = 100
+"#;
+
+fn with_scenarios(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-scn-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("bring-up.toml"), BRING_UP).expect("a scenario file");
+    app.session_mut().scenarios.load_from(dir);
+}
+
+#[test]
+fn a_scenario_says_what_it_does_before_it_is_run() {
+    let mut app = App::default();
+    with_scenarios(&mut app, "a_scenario_says_what_it_does_before_it_is_run");
+
+    press(&mut app, KeyCode::Char('5'));
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("Bring-up"), "{shown}");
+    assert!(shown.contains("2 steps, once"), "{shown}");
+}
+
+#[test]
+fn choosing_a_scenario_shows_its_steps() {
+    let mut app = App::default();
+    with_scenarios(&mut app, "choosing_a_scenario_shows_its_steps");
+
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("send Status"), "{shown}");
+    assert!(shown.contains("wait 100 ms"), "{shown}");
+    assert!(
+        shown.contains("drive"),
+        "the link each step runs on: {shown}"
+    );
+}
+
+#[test]
+fn no_scenario_says_so_rather_than_showing_an_empty_box() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('5'));
+    assert!(
+        screen(&mut app).contains("No scenario"),
+        "{}",
+        screen(&mut app)
+    );
+}
+
+/// What a bench looks at while something is running.
+#[test]
+fn a_running_scenario_says_how_far_it_has_got() {
+    let mut app = App::default();
+    with_scenarios(&mut app, "a_running_scenario_says_how_far_it_has_got");
+    app.session_mut().running.insert(
+        "Bring-up".to_owned(),
+        sim_session::state::ScenarioRun { step: 2, pass: 0 },
+    );
+
+    press(&mut app, KeyCode::Char('5'));
+    let shown = screen(&mut app);
+
+    assert!(shown.contains("step 2 pass 1"), "{shown}");
+    assert!(
+        !shown.contains("2 steps, once"),
+        "the shape gives way: {shown}"
+    );
+}

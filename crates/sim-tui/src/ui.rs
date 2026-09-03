@@ -12,6 +12,7 @@ use ratatui::Frame;
 
 use sim_core::frame::codec;
 use sim_session::reading;
+use sim_session::scenarios;
 use sim_session::state::{Direction, LogEntry};
 use sim_session::{hex, links, traffic};
 
@@ -81,6 +82,7 @@ fn view(frame: &mut Frame, area: Rect, app: &mut App) {
     match app.tab() {
         Tab::Connections => connections(frame, area, app),
         Tab::Traffic => watch(frame, area, app),
+        Tab::Scenarios => scenarios_view(frame, area, app),
         tab => pending(frame, area, tab),
     }
 }
@@ -136,6 +138,103 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     frame.render_widget(Paragraph::new(rows).block(block), area);
+}
+
+fn scenarios_view(frame: &mut Frame, area: Rect, app: &App) {
+    let library = &app.session().scenarios;
+    let block = Block::bordered().title(format!(" Scenarios ({}) ", library.entries.len()));
+
+    if library.entries.is_empty() {
+        let empty =
+            Paragraph::new("No scenario. Open a project, or pass a folder that holds some.".dim())
+                .wrap(Wrap { trim: true })
+                .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let [list, steps] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Min(3)]).areas(area);
+
+    let widest = library
+        .entries
+        .iter()
+        .map(|entry| entry.scenario.name.len())
+        .max()
+        .unwrap_or(0);
+
+    let lines: Vec<Line> = library
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(at, entry)| {
+            let scenario = &entry.scenario;
+            let run = app.session().running.get(&scenario.name);
+            let state = match run {
+                // Counted as the file numbers them, which is what a person
+                // reading the file alongside is looking at.
+                Some(run) => format!("step {} pass {}", run.step, run.pass + 1),
+                None => scenarios::shape(scenario),
+            };
+            let tint = if run.is_some() {
+                Style::new().fg(RECEIVED)
+            } else {
+                Style::new().add_modifier(Modifier::DIM)
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{:widest$}", scenario.name),
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(state, tint),
+            ]);
+            if library.selected == Some(at) {
+                line.style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines).block(block), list);
+    steps_view(frame, steps, app);
+}
+
+/// What the chosen scenario does, step by step, as its file spells it.
+fn steps_view(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(scenario) = app.session().scenarios.selected_scenario() else {
+        let hint = Paragraph::new("Choose a scenario to see its steps.".dim())
+            .block(Block::bordered().title(" Steps "));
+        frame.render_widget(hint, area);
+        return;
+    };
+
+    let lines: Vec<Line> = scenario
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(at, step)| {
+            let links = step
+                .targets
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Line::from(vec![
+                Span::raw(format!("{:>3}  ", at + 1)).dim(),
+                Span::raw(scenarios::describe(step)),
+                Span::raw("  "),
+                Span::raw(links).dim(),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(format!(" {} ", scenario.name))),
+        area,
+    );
 }
 
 fn watch(frame: &mut Frame, area: Rect, app: &mut App) {

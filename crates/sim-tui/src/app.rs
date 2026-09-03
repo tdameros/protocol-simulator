@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sim_session::engine_handle::EngineHandle;
 use sim_session::project::Project;
 use sim_session::reading::{self, Reading};
+use sim_session::scenarios;
 use sim_session::state::{LogEntry, MonitorState, Session};
 
 /// The same five views the window has, in the same order.
@@ -317,6 +318,7 @@ impl App {
                 ("Esc", "put it away"),
                 ("f", "follow"),
             ],
+            Tab::Scenarios => &[("up/down", "choose"), ("Enter", "run"), ("x", "stop")],
             _ => &[],
         }
     }
@@ -338,7 +340,12 @@ impl App {
 
         // What the view does with a key comes first: a list has to have Up and
         // Down before anything else claims them.
-        if self.tab == Tab::Traffic && self.watching(key.code) {
+        let taken = match self.tab {
+            Tab::Traffic => self.watching(key.code),
+            Tab::Scenarios => self.running_scenarios(key.code),
+            _ => false,
+        };
+        if taken {
             return;
         }
 
@@ -403,6 +410,52 @@ impl App {
             .collect();
         if !candidates.is_empty() {
             self.overlay = Some(Overlay::Pick(Picker::new("Read as", candidates)));
+        }
+    }
+
+    /// The keys the scenario list answers to, and whether it took this one.
+    fn running_scenarios(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => self.pick_scenario(1),
+            KeyCode::Up | KeyCode::Char('k') => self.pick_scenario(-1),
+            KeyCode::Enter => self.start_selected(),
+            KeyCode::Char('x') => self.stop_selected(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn pick_scenario(&mut self, delta: isize) {
+        let held = self.session.scenarios.entries.len();
+        let Some(last) = held.checked_sub(1) else {
+            return;
+        };
+        let at = match self.session.scenarios.selected {
+            Some(at) => at.saturating_add_signed(delta).min(last),
+            None => 0,
+        };
+        self.session.scenarios.selected = Some(at);
+    }
+
+    fn start_selected(&mut self) {
+        let Some(scenario) = self.session.scenarios.selected_scenario().cloned() else {
+            return;
+        };
+        scenarios::start(&mut self.session, &self.engine, &scenario);
+    }
+
+    /// Stopping is by name, which is what the engine answers to.
+    fn stop_selected(&mut self) {
+        let Some(name) = self
+            .session
+            .scenarios
+            .selected_scenario()
+            .map(|scenario| scenario.name.clone())
+        else {
+            return;
+        };
+        if self.session.running.contains_key(&name) {
+            self.engine.stop_scenario(name);
         }
     }
 
