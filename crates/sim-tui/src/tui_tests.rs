@@ -1242,3 +1242,16 @@ fn a_checksum_field_cannot_be_edited() {
     let shown = screen(&mut app);
     assert!(shown.contains("Computed automatically"), "{shown}");
 }
+
+/// Pressing x while a link is up used to do nothing, silently. It now says
+/// why, instead of leaving the operator to wonder if the key even works.
+#[test]
+fn removing_a_link_that_is_up_says_why_it_did_not_go() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('x'));
+
+    assert_eq!(app.session().connections.len(), 1, "nothing was removed");
+    let shown = screen(&mut app);
+    assert!(shown.contains("disconnect it first"), "{shown}");
+}

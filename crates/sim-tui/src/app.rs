@@ -831,8 +831,15 @@ impl App {
         let Some(id) = self.selected_connection() else {
             return;
         };
-        if self.session.status_of(&id) == Some(ConnectionStatus::Disconnected) {
-            self.session.remove_connection(&id);
+        match self.session.status_of(&id) {
+            Some(ConnectionStatus::Disconnected) => self.session.remove_connection(&id),
+            Some(_) => {
+                self.session.last_error = Some(format!(
+                    "{}: disconnect it first (Enter), then remove it.",
+                    id.0
+                ));
+            }
+            None => {}
         }
     }
 
