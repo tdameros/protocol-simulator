@@ -198,6 +198,18 @@ impl Project {
         })
     }
 
+    /// Carries over the sections this front end does not understand.
+    ///
+    /// [`Self::capture_settings`] describes what the session holds, and the
+    /// session does not hold a pane arrangement. Saving without this drops the
+    /// one a window wrote, which is a project coming back rearranged for
+    /// having been opened in a terminal once.
+    #[must_use]
+    pub fn carrying_over(mut self, read: &Self) -> Self {
+        self.ui.layout.clone_from(&read.ui.layout);
+        self
+    }
+
     /// # Errors
     ///
     /// Returns an error if the file cannot be read, is not valid TOML, or was
@@ -696,5 +708,22 @@ stop_bits = 3
         Project::read(&file).expect("what it writes, it reads");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    /// A front end that has no pane arrangement of its own must not take one
+    /// away from the front end that has.
+    #[test]
+    fn saving_from_a_front_end_that_cannot_read_the_layout_keeps_it() {
+        let text = "version = 1\n\n[ui]\ntheme = \"dark\"\n\n[ui.layout]\nwhatever = \"a window wrote this\"\n";
+        let read: Project = toml::from_str(text).expect("should parse");
+        assert!(read.ui.layout.is_some(), "the fixture carries one");
+
+        let mut session = Session::default();
+        read.apply(&mut session, None).expect("should apply");
+
+        let saved = Project::capture_settings(&session, ThemeSpec::Dark, None).carrying_over(&read);
+
+        assert_eq!(saved.ui.layout, read.ui.layout);
+        let written = toml::to_string_pretty(&saved).expect("should serialise");
+        assert!(written.contains("a window wrote this"), "{written}");
     }
 }
