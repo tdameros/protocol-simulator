@@ -7,6 +7,11 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 
+use std::time::{Duration, SystemTime};
+
+use sim_core::{ConnectionId, ConnectionStatus, TransportConfig};
+use sim_session::state::{ConnectionEntry, Direction, LogEntry};
+
 use crate::app::App;
 use crate::ui;
 
@@ -118,4 +123,77 @@ fn the_keys_are_offered_without_being_asked_for() {
 
     assert!(last.contains("quit"), "the hint line reads: {last}");
     assert!(last.contains("Tab"));
+}
+
+fn linked(app: &mut App, name: &str, status: ConnectionStatus) {
+    app.session_mut().connections.push((
+        ConnectionId::from(name),
+        ConnectionEntry {
+            config: TransportConfig::Udp {
+                bind: "127.0.0.1:9000".parse().expect("address"),
+                remote: "127.0.0.1:9001".parse().expect("address"),
+            },
+            status,
+            retry: None,
+            autoconnect: false,
+        },
+    ));
+}
+
+fn captured(app: &mut App, bytes: &[u8], at: Duration) {
+    app.session_mut().push_log(LogEntry {
+        seq: 0,
+        id: ConnectionId::from("bus"),
+        direction: Direction::Received,
+        bytes: bytes.to_vec(),
+        source: None,
+        timestamp: SystemTime::UNIX_EPOCH + at,
+    });
+}
+
+#[test]
+fn a_link_says_what_it_is_and_how_it_is_doing() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    let shown = screen(&app);
+
+    assert!(shown.contains("bus"), "{shown}");
+    assert!(shown.contains("Connected"), "{shown}");
+    assert!(shown.contains("UDP 127.0.0.1:9000"), "{shown}");
+}
+
+#[test]
+fn no_link_says_so_rather_than_showing_an_empty_box() {
+    let shown = screen(&App::default());
+    assert!(shown.contains("No link"), "{shown}");
+}
+
+#[test]
+fn a_captured_frame_shows_its_bytes_and_its_characters() {
+    let mut app = App::default();
+    captured(&mut app, b"\xAA\x55ok", Duration::from_secs(1));
+    press(&mut app, KeyCode::Char('2'));
+    let shown = screen(&app);
+
+    assert!(shown.contains("AA 55 6F 6B"), "{shown}");
+    assert!(shown.contains(".Uok"), "{shown}");
+    assert!(shown.contains("RX"), "{shown}");
+}
+
+/// A board left running fills the buffer. What matters is the end of it.
+#[test]
+fn a_full_buffer_shows_its_newest_rows() {
+    let mut app = App::default();
+    for n in 0..500u16 {
+        captured(
+            &mut app,
+            &n.to_be_bytes(),
+            Duration::from_millis(u64::from(n)),
+        );
+    }
+    press(&mut app, KeyCode::Char('2'));
+    let shown = screen(&app);
+
+    assert!(shown.contains("01 F3"), "the last row is drawn: {shown}");
+    assert!(!shown.contains("00 00"), "the first is not: {shown}");
 }

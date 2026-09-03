@@ -7,35 +7,50 @@ mod ui;
 #[cfg(test)]
 mod tui_tests;
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 
 use app::App;
 
+/// How long a pass waits for a key before looking at the engine again.
+///
+/// Frames arrive on their own, so the loop cannot sit on the keyboard. Short
+/// enough that a rate looks live, long enough that an idle bench costs a board
+/// nothing.
+const TICK: Duration = Duration::from_millis(100);
+
 fn main() -> std::io::Result<()> {
+    // One positional argument, as the window takes: a project file, or a folder
+    // of frame definitions. No file picker, since the machine this runs on is
+    // usually reached over ssh and has no desktop to put one on.
+    let opened_with = std::env::args().nth(1).map(PathBuf::from);
+
     // Raw mode, the alternate screen, and a panic hook that puts the terminal
     // back. Restoring is the whole point: a front end that leaves a broken
     // shell behind on a board reached over ssh is worse than no front end.
     let mut terminal = ratatui::init();
-    let outcome = run(&mut terminal);
+    let outcome = run(&mut terminal, opened_with);
     ratatui::restore();
     outcome
 }
 
-fn run(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
-    let mut app = App::default();
+fn run(terminal: &mut DefaultTerminal, opened_with: Option<PathBuf>) -> std::io::Result<()> {
+    let mut app = App::opening(opened_with);
 
     while app.running() {
+        app.take_engine_events();
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
-        // Blocking, which is right while nothing arrives on its own. The engine
-        // will want a poll with a timeout so that a frame landing redraws
-        // without a key being pressed.
-        if let Event::Key(key) = event::read()? {
-            // Windows reports the release as well, and acting on both would
-            // move two tabs for one press.
-            if key.kind == KeyEventKind::Press {
-                app.handle(key);
+        if event::poll(TICK)? {
+            if let Event::Key(key) = event::read()? {
+                // Windows reports the release as well, and acting on both would
+                // move two tabs for one press.
+                if key.kind == KeyEventKind::Press {
+                    app.handle(key);
+                }
             }
         }
     }
