@@ -1255,3 +1255,95 @@ fn removing_a_link_that_is_up_says_why_it_did_not_go() {
     let shown = screen(&mut app);
     assert!(shown.contains("disconnect it first"), "{shown}");
 }
+
+#[test]
+fn a_target_is_chosen_from_the_connected_links() {
+    let mut app = App::default();
+    with_frames(&mut app, "a_target_is_chosen_from_the_connected_links");
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    linked(&mut app, "spare", ConnectionStatus::Disconnected);
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('t'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("bus"), "{shown}");
+    assert!(
+        !shown.contains("spare"),
+        "only what is up is offered: {shown}"
+    );
+
+    press(&mut app, KeyCode::Enter);
+    let shown = screen(&mut app);
+    assert!(shown.contains("Target: bus (connected)"), "{shown}");
+}
+
+#[test]
+fn no_connected_link_says_so_instead_of_an_empty_list() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Disconnected);
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('t'));
+
+    assert!(app.overlay().is_none(), "nothing to choose from");
+    let shown = screen(&mut app);
+    assert!(shown.contains("No connected link"), "{shown}");
+}
+
+/// Sending is what the whole view is for; it deserves to say so.
+#[test]
+fn sending_a_frame_says_so() {
+    let mut app = App::default();
+    with_frames(&mut app, "sending_a_frame_says_so");
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('s'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Sent 5 byte(s) to bus"), "{shown}");
+}
+
+/// The confirmation is not left standing once something else has happened.
+#[test]
+fn the_send_confirmation_gives_way_to_the_next_key() {
+    let mut app = App::default();
+    with_frames(&mut app, "the_send_confirmation_gives_way_to_the_next_key");
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('s'));
+    assert!(app.status().is_some());
+
+    press(&mut app, KeyCode::Down);
+    assert!(app.status().is_none());
+}
+
+#[test]
+fn sending_without_a_target_says_to_pick_one() {
+    let mut app = App::default();
+    with_frames(&mut app, "sending_without_a_target_says_to_pick_one");
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('s'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Press t to pick one"), "{shown}");
+}
+
+#[test]
+fn sending_to_a_target_that_dropped_is_refused() {
+    let mut app = App::default();
+    with_frames(&mut app, "sending_to_a_target_that_dropped_is_refused");
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Enter);
+
+    // The link drops after being picked, without being un-picked.
+    app.session_mut().connections[0].1.status = ConnectionStatus::Disconnected;
+    press(&mut app, KeyCode::Char('s'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("is not connected"), "{shown}");
+}

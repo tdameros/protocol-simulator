@@ -14,6 +14,7 @@ use sim_core::frame::codec;
 use sim_core::frame::value::seed_values;
 use sim_core::frame::value::Value;
 use sim_core::frame::{FieldDef, FieldKind, FrameDef};
+use sim_core::ConnectionStatus;
 use sim_session::kinds;
 use sim_session::reading;
 use sim_session::scenarios;
@@ -30,24 +31,24 @@ const RECEIVED: Color = Color::Rgb(40, 160, 90);
 const ERROR: Color = Color::Rgb(200, 60, 60);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    // The trouble line only exists while there is trouble, so a working bench
-    // gives the whole screen to what it is watching.
-    let complaint = u16::from(app.trouble().is_some());
-    let [bar, body, said, hints] = Layout::vertical([
+    // The line only exists while there is something to say, so a working
+    // bench gives the whole screen to what it is watching.
+    let said = app
+        .trouble()
+        .map(|text| (text.to_owned(), ERROR))
+        .or_else(|| app.status().map(|text| (text.to_owned(), RECEIVED)));
+    let [bar, body, line, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(complaint),
+        Constraint::Length(u16::from(said.is_some())),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
     tab_bar(frame, bar, app);
     view(frame, body, app);
-    if let Some(trouble) = app.trouble() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::raw(trouble.to_owned()).fg(ERROR))),
-            said,
-        );
+    if let Some((text, tint)) = said {
+        frame.render_widget(Paragraph::new(Line::from(Span::raw(text).fg(tint))), line);
     }
     hint_line(frame, hints, app);
 
@@ -291,6 +292,7 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
         Ok(bytes) => Line::from(Span::raw(hex::spaced(&bytes))),
         Err(error) => Line::from(Span::raw(error.to_string()).fg(ERROR)),
     });
+    lines.push(target_line(app));
 
     let title = if focused {
         format!(" {} (fields) ", chosen.name)
@@ -303,6 +305,19 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
             .block(Block::bordered().title(title)),
         area,
     );
+}
+
+/// Which connection a frame would go out on, and whether it actually could.
+fn target_line(app: &App) -> Line<'static> {
+    let Some(id) = &app.session().frame_target else {
+        return Line::from(Span::raw("Target: none (t to pick one)").dim());
+    };
+    match app.session().status_of(id) {
+        Some(ConnectionStatus::Connected) => {
+            Line::from(Span::raw(format!("Target: {} (connected)", id.0)).dim())
+        }
+        _ => Line::from(Span::raw(format!("Target: {} (not connected)", id.0)).fg(ERROR)),
+    }
 }
 
 /// One row of a frame's detail, field or single bit alike.

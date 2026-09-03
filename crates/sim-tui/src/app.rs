@@ -94,6 +94,8 @@ pub enum PickPurpose {
     DecodeAs,
     /// Settles the value of one enum field, by variant name.
     EnumField { field: usize },
+    /// Settles which connection a frame is sent on.
+    FrameTarget,
 }
 
 /// One value typed as text, and what it belongs to.
@@ -311,6 +313,11 @@ pub struct App {
     looked_in: Option<PathBuf>,
     /// The connection under the cursor in the Connections view.
     connection_at: Option<usize>,
+    /// The last thing that went right, until the next key reads it.
+    ///
+    /// Apart from `session.last_error`, which is for what did not: the two
+    /// never compete for the one line reserved above the hints.
+    status: Option<String>,
     /// Which pane of the Frames view a key acts on.
     frame_focus: FramesFocus,
     /// The row under the cursor in the fields pane, and the frame it belongs
@@ -338,6 +345,7 @@ impl Default for App {
             path: None,
             looked_in: None,
             connection_at: None,
+            status: None,
             frame_focus: FramesFocus::Library,
             field_at: None,
         }
@@ -567,7 +575,12 @@ impl App {
                 ("s", "send"),
                 ("Left", "list"),
             ],
-            Tab::Frames => &[("up/down", "choose"), ("Right", "fields"), ("s", "send")],
+            Tab::Frames => &[
+                ("up/down", "choose"),
+                ("Right", "fields"),
+                ("t", "target"),
+                ("s", "send"),
+            ],
             Tab::Connections => &[
                 ("up/down", "choose"),
                 ("Enter", "toggle"),
@@ -583,12 +596,19 @@ impl App {
         self.session.last_error.as_deref()
     }
 
+    /// The last thing that went right, until the next key reads it.
+    #[must_use]
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
     pub fn handle(&mut self, key: KeyEvent) {
         // Cleared before the key is acted on, not after: an action that fails
         // again puts its message straight back, and one that succeeds leaves
         // the line to whatever comes next. Anything else would have a stale
         // complaint outlive the thing complained about.
         self.session.last_error = None;
+        self.status = None;
 
         // Ctrl+C is the one key a terminal program may not redefine, whatever
         // else is on screen.
@@ -862,9 +882,30 @@ impl App {
                 FramesFocus::Fields => self.edit_selected_field(),
             },
             KeyCode::Char('s') => self.send_selected_frame(),
+            KeyCode::Char('t') => self.pick_frame_target(),
             _ => return false,
         }
         true
+    }
+
+    /// Offers the connections currently up, to choose which one a frame goes
+    /// out on.
+    fn pick_frame_target(&mut self) {
+        let connected: Vec<String> = self
+            .session
+            .connections
+            .iter()
+            .filter(|(_, entry)| entry.status == ConnectionStatus::Connected)
+            .map(|(id, _)| id.0.clone())
+            .collect();
+        if connected.is_empty() {
+            self.session.last_error = Some("No connected link to send to.".to_owned());
+            return;
+        }
+        self.overlay = Some(Overlay::Pick(
+            Picker::new("Target connection", connected),
+            PickPurpose::FrameTarget,
+        ));
     }
 
     fn frame_move(&mut self, delta: isize) {
@@ -1042,6 +1083,9 @@ impl App {
                     sim_core::frame::value::Value::Uint(value),
                 );
             }
+            PickPurpose::FrameTarget => {
+                self.session.frame_target = Some(sim_core::ConnectionId(taken));
+            }
         }
     }
 
@@ -1136,19 +1180,21 @@ impl App {
         let Some(frame) = self.session.frames.selected_frame().cloned() else {
             return;
         };
-        let Some(id) = self
-            .session
-            .frame_target
-            .clone()
-            .or_else(|| self.session.connections.first().map(|(id, _)| id.clone()))
-        else {
-            self.session.last_error = Some("No link to send on.".to_owned());
+        let Some(id) = self.session.frame_target.clone() else {
+            self.session.last_error = Some("No target chosen. Press t to pick one.".to_owned());
             return;
         };
+        if self.session.status_of(&id) != Some(ConnectionStatus::Connected) {
+            self.session.last_error = Some(format!("{} is not connected.", id.0));
+            return;
+        }
 
         let values = self.session.frames.values_mut(&frame).clone();
         match codec::encode(&frame, &values) {
-            Ok(bytes) => self.engine.send_raw(id, bytes),
+            Ok(bytes) => {
+                self.status = Some(format!("Sent {} byte(s) to {}.", bytes.len(), id.0));
+                self.engine.send_raw(id, bytes);
+            }
             Err(error) => self.session.last_error = Some(error.to_string()),
         }
     }
