@@ -1938,3 +1938,110 @@ fn delete_removes_a_scenario_from_disk() {
 
     assert!(app.session().scenarios.entries.is_empty());
 }
+
+fn scratch_project_dir(name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("sim-tui-save-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("a scratch folder");
+    root
+}
+
+#[test]
+fn save_as_writes_a_readable_project() {
+    let root = scratch_project_dir("save_as_writes_a_readable_project");
+    let mut app = App::opening(Some(root.join("nonexistent.toml")));
+    press(&mut app, KeyCode::Char('W'));
+    press(&mut app, KeyCode::Char('s'));
+    for _ in 0..30 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    for letter in "bench.toml".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let path = root.join("bench.toml");
+    assert!(path.exists(), "{}", screen(&mut app));
+    let read = sim_session::project::Project::read(&path).expect("should read back");
+    assert_eq!(read.version, 1);
+    assert_eq!(app.opened(), Some(path.as_path()));
+}
+
+#[test]
+fn saving_confirms_and_clears_the_dirty_marker() {
+    let root = scratch_project_dir("saving_confirms_and_clears_the_dirty_marker");
+    let mut app = App::opening(Some(root.join("nonexistent.toml")));
+    press(&mut app, KeyCode::Char('W'));
+    press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Saved to"), "{shown}");
+    assert!(!shown.contains("simulator.toml *"), "{shown}");
+}
+
+#[test]
+fn w_saves_straight_back_once_a_path_is_known() {
+    let root = scratch_project_dir("w_saves_straight_back_once_a_path_is_known");
+    let mut app = App::opening(Some(root.join("nonexistent.toml")));
+    press(&mut app, KeyCode::Char('W'));
+    press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay().is_none());
+
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('w'));
+
+    assert!(!app.is_dirty());
+    let read =
+        sim_session::project::Project::read(&root.join("simulator.toml")).expect("should read");
+    assert_eq!(read.connections.len(), 1);
+}
+
+#[test]
+fn a_pane_layout_from_the_window_survives_a_save_from_here() {
+    let root = scratch_project_dir("a_pane_layout_from_the_window_survives_a_save_from_here");
+    let path = root.join("bench.toml");
+    std::fs::write(
+        &path,
+        "version = 1\n\n[ui]\ntheme = \"dark\"\n\n[ui.layout]\nwhatever = \"a window wrote this\"\n",
+    )
+    .expect("a project file");
+
+    let mut app = App::opening(Some(path.clone()));
+    press(&mut app, KeyCode::Char('w'));
+
+    let written = std::fs::read_to_string(&path).expect("should still be there");
+    assert!(written.contains("a window wrote this"), "{written}");
+    assert!(written.contains("theme = \"dark\""), "{written}");
+}
+
+#[test]
+fn nothing_to_save_leaves_no_mark() {
+    let root = scratch_project_dir("nothing_to_save_leaves_no_mark");
+    let path = root.join("bench.toml");
+    std::fs::write(&path, "version = 1\n").expect("a project file");
+    let app = App::opening(Some(path));
+
+    assert!(!app.is_dirty());
+}
+
+#[test]
+fn a_change_after_opening_shows_the_dirty_mark() {
+    let root = scratch_project_dir("a_change_after_opening_shows_the_dirty_mark");
+    let path = root.join("bench.toml");
+    std::fs::write(&path, "version = 1\n").expect("a project file");
+    let mut app = App::opening(Some(path));
+
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    assert!(app.is_dirty());
+    let shown = screen(&mut app);
+    assert!(shown.contains("bench.toml *"), "{shown}");
+}
+
+/// A session that has never been touched is not "unsaved work".
+#[test]
+fn a_fresh_app_with_nothing_opened_is_not_dirty() {
+    let app = App::default();
+    assert!(!app.is_dirty());
+}

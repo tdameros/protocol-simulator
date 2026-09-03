@@ -123,11 +123,16 @@ pub struct EditBox {
 #[derive(Clone)]
 enum EditTarget {
     Field(usize),
-    Bit { field: usize, bit: usize },
+    Bit {
+        field: usize,
+        bit: usize,
+    },
     ScenarioName,
     ScenarioDescription,
     RepeatEvery,
     RepeatTimes,
+    /// The folder to save into, chosen; the name is what is typed here.
+    SaveFileName(PathBuf),
 }
 
 pub enum Overlay {
@@ -918,6 +923,16 @@ pub struct Browser {
     picker: Picker,
     /// What went wrong reading a folder, in place of its contents.
     trouble: Option<String>,
+    mode: BrowserMode,
+}
+
+/// What choosing an entry does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BrowserMode {
+    /// A file to be opened.
+    Open,
+    /// A folder to save into, named once it is reached.
+    Save,
 }
 
 /// The entry that goes back up, shown first so it is always in the same place.
@@ -925,13 +940,27 @@ const UPWARDS: &str = "..";
 
 impl Browser {
     fn opening(at: PathBuf) -> Self {
+        Self::browsing(at, BrowserMode::Open)
+    }
+
+    fn saving(at: PathBuf) -> Self {
+        Self::browsing(at, BrowserMode::Save)
+    }
+
+    fn browsing(at: PathBuf, mode: BrowserMode) -> Self {
         let mut browser = Self {
             at,
             picker: Picker::new(String::new(), Vec::new()),
             trouble: None,
+            mode,
         };
         browser.listing();
         browser
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> BrowserMode {
+        self.mode
     }
 
     /// Where the walk currently is, which is what the popup titles itself with.
@@ -1096,6 +1125,14 @@ pub struct App {
     /// that is not there is usually a typo, and the folder around it is where
     /// the right name is.
     looked_in: Option<PathBuf>,
+    /// The project as it was last read from disk, kept so a save can carry
+    /// over the sections this front end does not understand: the pane
+    /// arrangement and the theme.
+    opened_project: Option<Project>,
+    /// What the project looked like the last time it was opened or saved,
+    /// compared against on every draw to say whether there is anything to
+    /// save.
+    saved: Option<Project>,
     /// The connection under the cursor in the Connections view.
     connection_at: Option<usize>,
     /// The last thing that went right, until the next key reads it.
@@ -1125,7 +1162,7 @@ impl Default for App {
         // A view to show traffic in, before any project says otherwise. Without
         // one there is no filter to pass, so nothing would ever be drawn.
         session.open_monitor();
-        Self {
+        let mut app = Self {
             tab: Tab::Connections,
             overlay: None,
             editing: false,
@@ -1134,13 +1171,19 @@ impl Default for App {
             engine: EngineHandle::new(),
             path: None,
             looked_in: None,
+            opened_project: None,
+            saved: None,
             connection_at: None,
             status: None,
             current_monitor: None,
             scenario_row: None,
             frame_focus: FramesFocus::Library,
             field_at: None,
-        }
+        };
+        // Compared against from the first key pressed, so an app that has not
+        // been touched yet is never mistaken for one with unsaved work.
+        app.saved = Some(app.snapshot());
+        app
     }
 }
 
@@ -1167,22 +1210,107 @@ impl App {
         if app.session.monitors.is_empty() {
             app.session.open_monitor();
         }
+        // A frames-only folder changed what `Default` captured above without
+        // going through `open`, so it needs its own comparison point too.
+        app.saved = Some(app.snapshot());
         app
     }
 
     fn open(&mut self, path: &Path) {
-        let loaded = Project::read(path).and_then(|read| read.apply(&mut self.session, Some(path)));
+        let loaded = Project::read(path);
+        let loaded = loaded.and_then(|read| {
+            read.apply(&mut self.session, Some(path))
+                .map(|restored| (read, restored))
+        });
         match loaded {
-            Ok(restored) => {
+            Ok((read, restored)) => {
                 self.looked_in = path.parent().map(Path::to_path_buf);
                 for (id, config, retry) in restored.connect {
                     self.engine.connect(id, config, retry);
                 }
                 self.session.restore_monitors(restored.monitors);
+                // A project describing none still needs somewhere to show
+                // traffic, whether this is the first project this session has
+                // opened or the fifth.
+                if self.session.monitors.is_empty() {
+                    self.session.open_monitor();
+                }
                 self.path = Some(path.to_path_buf());
+                self.opened_project = Some(read);
+                self.saved = Some(self.snapshot());
             }
             Err(error) => self.session.last_error = Some(format!("{error:#}")),
         }
+    }
+
+    /// Writes to the file the project came from, or asks for one.
+    fn save(&mut self) {
+        match self.path.clone() {
+            Some(path) => self.save_to(&path),
+            None => self.save_as(),
+        }
+    }
+
+    /// Offers the disk to pick a folder to save into, starting where the
+    /// project on show sits.
+    fn save_as(&mut self) {
+        let at = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(|| self.looked_in.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        self.overlay = Some(Overlay::Browse(Browser::saving(at)));
+    }
+
+    /// Asks for the file name to save under, in the folder just chosen.
+    fn prompt_save_name(&mut self, directory: PathBuf, seed: Option<String>) {
+        self.overlay = Some(Overlay::EditText(EditBox {
+            title: "Save as".to_owned(),
+            text: seed.unwrap_or_else(|| sim_session::project::DEFAULT_FILE_NAME.to_owned()),
+            target: EditTarget::SaveFileName(directory),
+        }));
+    }
+
+    fn save_to(&mut self, path: &Path) {
+        let mut project = Project::capture_settings(&self.session, self.theme(), Some(path));
+        if let Some(original) = &self.opened_project {
+            project = project.carrying_over(original);
+        }
+        match project.write(path) {
+            Ok(()) => {
+                self.path = Some(path.to_path_buf());
+                self.saved = Some(project);
+                self.status = Some(format!("Saved to {}.", path.display()));
+            }
+            Err(error) => self.session.last_error = Some(format!("{error:#}")),
+        }
+    }
+
+    /// The theme a saved project should keep, which is whatever the file
+    /// already asked for: this front end has no notion of light or dark of
+    /// its own to write in its place.
+    fn theme(&self) -> sim_session::project::ThemeSpec {
+        self.opened_project
+            .as_ref()
+            .map_or(sim_session::project::ThemeSpec::Dark, |project| {
+                project.ui.theme
+            })
+    }
+
+    /// Whether the project differs from what was last opened or saved.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.saved.as_ref() != Some(&self.snapshot())
+    }
+
+    /// Everything the session currently holds, described the way the file
+    /// would be, but without a pane arrangement or a theme opinion of its
+    /// own: see [`Project::carrying_over`].
+    fn snapshot(&self) -> Project {
+        Project::capture_settings(&self.session, self.theme(), self.path.as_deref())
     }
 
     /// Everything the engine has said since the last pass.
@@ -1316,8 +1444,9 @@ impl App {
     }
 
     /// What every view answers to, whichever one is on show.
-    pub const KEYS: [(&'static str, &'static str); 4] = [
+    pub const KEYS: [(&'static str, &'static str); 5] = [
         ("o", "open"),
+        ("w", "save"),
         ("1-5", "go to a view"),
         ("Tab", "next view"),
         ("Shift+Tab", "previous view"),
@@ -1366,13 +1495,22 @@ impl App {
                 ("Esc", "back"),
             ];
         }
-        if let Some(Overlay::Browse(_)) = self.overlay {
-            return &[
-                ("up/down", "choose"),
-                ("type", "narrow"),
-                ("Enter", "open"),
-                ("Esc", "back"),
-            ];
+        if let Some(Overlay::Browse(browser)) = &self.overlay {
+            return if browser.mode() == BrowserMode::Save {
+                &[
+                    ("up/down", "choose"),
+                    ("s", "save here"),
+                    ("Enter", "into folder"),
+                    ("Esc", "cancel"),
+                ]
+            } else {
+                &[
+                    ("up/down", "choose"),
+                    ("type", "narrow"),
+                    ("Enter", "open"),
+                    ("Esc", "back"),
+                ]
+            };
         }
         if let Some(Overlay::NewConnection(_)) = self.overlay {
             return &[
@@ -1505,6 +1643,8 @@ impl App {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('?') => self.overlay = Some(Overlay::Keys),
             KeyCode::Char('o') => self.browse(),
+            KeyCode::Char('w') => self.save(),
+            KeyCode::Char('W') => self.save_as(),
             KeyCode::Char('n') if self.tab == Tab::Connections => {
                 self.overlay = Some(Overlay::NewConnection(ConnectionForm::default()));
             }
@@ -1547,6 +1687,28 @@ impl App {
                 KeyCode::Char(letter) => form.type_char(letter),
                 KeyCode::Esc => self.overlay = None,
                 KeyCode::Enter => self.submit_connection(),
+                _ => {}
+            },
+            Overlay::Browse(browser) if browser.mode() == BrowserMode::Save => match code {
+                KeyCode::Down => browser.picker.step(1),
+                KeyCode::Up => browser.picker.step(-1),
+                KeyCode::Backspace => browser.picker.rubbed_out(),
+                KeyCode::Esc => self.overlay = None,
+                // A folder walks; a file offers itself to save over.
+                KeyCode::Enter => {
+                    if let Some(path) = browser.taken() {
+                        self.prompt_save_name(
+                            path.parent().map_or_else(PathBuf::new, Path::to_path_buf),
+                            path.file_name()
+                                .map(|name| name.to_string_lossy().into_owned()),
+                        );
+                    }
+                }
+                KeyCode::Char('s') => {
+                    let at = browser.at().to_path_buf();
+                    self.prompt_save_name(at, None);
+                }
+                KeyCode::Char(letter) => browser.picker.typing(letter),
                 _ => {}
             },
             Overlay::Browse(browser) => match code {
@@ -2019,7 +2181,9 @@ impl App {
                     repeat.times = text.parse().ok();
                 }
             }
-            EditTarget::Field(_) | EditTarget::Bit { .. } => return false,
+            EditTarget::Field(_) | EditTarget::Bit { .. } | EditTarget::SaveFileName(_) => {
+                return false
+            }
         }
         true
     }
@@ -2038,6 +2202,14 @@ impl App {
         };
         let text = edit.text.clone();
         let target = edit.target.clone();
+
+        if let EditTarget::SaveFileName(directory) = &target {
+            self.overlay = None;
+            if !text.trim().is_empty() {
+                self.save_to(&directory.join(text.trim()));
+            }
+            return;
+        }
 
         if self.apply_scenario_edit(&target, &text) {
             self.overlay = None;
@@ -2106,7 +2278,8 @@ impl App {
             EditTarget::ScenarioName
             | EditTarget::ScenarioDescription
             | EditTarget::RepeatEvery
-            | EditTarget::RepeatTimes => unreachable!("handled and returned above"),
+            | EditTarget::RepeatTimes
+            | EditTarget::SaveFileName(_) => unreachable!("handled and returned above"),
         }
         self.overlay = None;
     }

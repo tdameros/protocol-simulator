@@ -201,12 +201,14 @@ impl Project {
     /// Carries over the sections this front end does not understand.
     ///
     /// [`Self::capture_settings`] describes what the session holds, and the
-    /// session does not hold a pane arrangement. Saving without this drops the
-    /// one a window wrote, which is a project coming back rearranged for
-    /// having been opened in a terminal once.
+    /// session holds neither a pane arrangement nor a light-or-dark theme.
+    /// Saving without this drops what a window wrote there, which is a
+    /// project coming back rearranged and relit for having been opened in a
+    /// terminal once.
     #[must_use]
     pub fn carrying_over(mut self, read: &Self) -> Self {
         self.ui.layout.clone_from(&read.ui.layout);
+        self.ui.theme = read.ui.theme;
         self
     }
 
@@ -720,9 +722,17 @@ stop_bits = 3
         let mut session = Session::default();
         read.apply(&mut session, None).expect("should apply");
 
-        let saved = Project::capture_settings(&session, ThemeSpec::Dark, None).carrying_over(&read);
+        // Captured under a theme the file did not ask for, the way a front end
+        // with no notion of light or dark would: the original wins regardless.
+        let saved =
+            Project::capture_settings(&session, ThemeSpec::Light, None).carrying_over(&read);
 
         assert_eq!(saved.ui.layout, read.ui.layout);
+        assert_eq!(
+            saved.ui.theme,
+            ThemeSpec::Dark,
+            "the file's own theme survives too"
+        );
         let written = toml::to_string_pretty(&saved).expect("should serialise");
         assert!(written.contains("a window wrote this"), "{written}");
     }

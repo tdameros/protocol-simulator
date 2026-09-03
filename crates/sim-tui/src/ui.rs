@@ -68,10 +68,15 @@ fn tab_bar(frame: &mut Frame, area: Rect, app: &App) {
     // The project keeps the right edge, so a bench with several boards open
     // says which one this terminal is looking at.
     let named = app.opened().map(|path| {
-        path.file_name()
+        let name = path
+            .file_name()
             .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-            .into_owned()
+            .to_string_lossy();
+        if app.is_dirty() {
+            format!("{name} *")
+        } else {
+            name.into_owned()
+        }
     });
     let (area, tail) = match &named {
         Some(name) => {
