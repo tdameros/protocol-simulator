@@ -2580,3 +2580,45 @@ fn a_long_frame_structure_scrolls_to_keep_the_cursor_on_screen() {
         "and the first scrolled out to make room: {shown}"
     );
 }
+
+/// The same shape of bug as the frame views: a step overriding a frame with
+/// more fields than the terminal is tall left the ones past the fold both
+/// unreadable and unreachable, since the popup grew to fit every row instead
+/// of scrolling.
+#[test]
+fn a_step_overriding_a_wide_frame_scrolls_to_keep_the_focus_on_screen() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_many_fields(
+        &mut app,
+        "a_step_overriding_a_wide_frame_scrolls_to_keep_the_focus_on_screen",
+        40,
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left); // Wait -> Raw -> Send
+
+    press(&mut app, KeyCode::Down); // bus target
+    press(&mut app, KeyCode::Down); // Frame row
+    press(&mut app, KeyCode::Right); // choose Wide, the only frame
+    assert!(screen(&mut app).contains("f0"), "{}", screen(&mut app));
+
+    for _ in 0..39 {
+        press(&mut app, KeyCode::Down);
+    }
+
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("f39"),
+        "the last field came into focus: {shown}"
+    );
+    assert!(
+        !shown.contains("f0 "),
+        "and the first scrolled out to make room: {shown}"
+    );
+}

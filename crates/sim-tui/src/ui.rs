@@ -268,13 +268,21 @@ fn step_editor_over(frame: &mut Frame, area: Rect, edit: &crate::app::StepEdit, 
     let frames: Vec<sim_core::frame::FrameDef> = app.session().frames.frames().cloned().collect();
 
     let lines = edit.lines(step, &names, &frames);
+    scrolled_popup(frame, area, lines, " Step ");
+}
+
+/// A popup listing one field per row, windowed to the focused one: a frame
+/// with more rows to show than the terminal is tall used to grow the popup to
+/// fit every one of them, leaving Tab move the focus straight off screen.
+fn scrolled_popup(frame: &mut Frame, area: Rect, lines: Vec<(String, String, bool)>, title: &str) {
     let widest = lines
         .iter()
         .map(|(label, _, _)| label.len())
         .max()
         .unwrap_or(0);
+    let focus_at = lines.iter().position(|(_, _, focused)| *focused);
 
-    let rendered: Vec<Line> = lines
+    let all: Vec<Line> = lines
         .into_iter()
         .map(|(label, value, focused)| {
             let line = Line::from(vec![
@@ -289,12 +297,22 @@ fn step_editor_over(frame: &mut Frame, area: Rect, edit: &crate::app::StepEdit, 
         })
         .collect();
 
-    let wanted = rendered.iter().map(Line::width).max().unwrap_or(0) + 4;
+    let room = area.height.saturating_sub(4) as usize;
+    let first = match focus_at {
+        Some(at) => at
+            .saturating_sub(room / 2)
+            .min(all.len().saturating_sub(room)),
+        None => 0,
+    };
+    let last = (first + room).min(all.len());
+    let rendered = all[first..last].to_vec();
+
+    let wanted = all.iter().map(Line::width).max().unwrap_or(0) + 4;
     let popup = centred(area, wanted, rendered.len() + 4);
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(rendered).block(Block::bordered().title(" Step ")),
+        Paragraph::new(rendered).block(Block::bordered().title(title.to_owned())),
         popup,
     );
 }
@@ -433,35 +451,7 @@ fn frame_field_editor_over(
     };
 
     let lines = edit.lines(field, &draft.frame);
-    let widest = lines
-        .iter()
-        .map(|(label, _, _)| label.len())
-        .max()
-        .unwrap_or(0);
-
-    let rendered: Vec<Line> = lines
-        .into_iter()
-        .map(|(label, value, focused)| {
-            let line = Line::from(vec![
-                Span::raw(format!("{label:widest$}  ")).dim(),
-                Span::raw(value),
-            ]);
-            if focused {
-                line.style(Style::new().add_modifier(Modifier::REVERSED))
-            } else {
-                line
-            }
-        })
-        .collect();
-
-    let wanted = rendered.iter().map(Line::width).max().unwrap_or(0) + 4;
-    let popup = centred(area, wanted, rendered.len() + 4);
-
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(rendered).block(Block::bordered().title(format!(" {} ", field.name))),
-        popup,
-    );
+    scrolled_popup(frame, area, lines, &format!(" {} ", field.name));
 }
 
 /// The chosen definition, its values, and the bytes they encode to.
