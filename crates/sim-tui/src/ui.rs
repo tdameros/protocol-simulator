@@ -361,10 +361,29 @@ fn frame_editor_view(frame: &mut Frame, area: Rect, app: &App) {
     let cursor = app.frame_row();
 
     let widest = 8; // "Endian" plus room, the widest label in the header.
-    let lines: Vec<Line> = rows
+    let invalid = if draft.problem(app.session().frames.types()).is_some() {
+        " · invalid"
+    } else {
+        ""
+    };
+    let block = Block::bordered().title(format!(" {}{invalid} ", definition.name));
+
+    // The row a frame's field list can grow past a screen's height under, kept
+    // on screen the same way the traffic list keeps the row being read.
+    let room = block.inner(area).height as usize;
+    let first = match cursor {
+        Some(at) => at
+            .saturating_sub(room / 2)
+            .min(rows.len().saturating_sub(room)),
+        None => 0,
+    };
+    let last = (first + room).min(rows.len());
+
+    let lines: Vec<Line> = rows[first..last]
         .iter()
         .enumerate()
-        .map(|(at, row)| {
+        .map(|(offset, row)| {
+            let at = offset + first;
             let (label, value) = match row {
                 crate::app::FrameRow::Name => ("Name".to_owned(), definition.name.clone()),
                 crate::app::FrameRow::Endian => (
@@ -391,15 +410,10 @@ fn frame_editor_view(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let invalid = if draft.problem(app.session().frames.types()).is_some() {
-        " · invalid"
-    } else {
-        ""
-    };
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(format!(" {}{invalid} ", definition.name))),
+            .block(block),
         area,
     );
 }
@@ -479,10 +493,33 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
     let cursor = app.field_at(&chosen.name);
     let rows = crate::app::field_rows(&chosen);
 
-    let mut lines: Vec<Line> = rows
+    let title = if focused {
+        format!(" {} (fields) ", chosen.name)
+    } else {
+        format!(" {} ", chosen.name)
+    };
+    let block = Block::bordered().title(title);
+
+    // The preview, the note and the target keep their room; a long field list
+    // scrolls under them rather than pushing them off the bottom, since they
+    // are the answer the fields above are working towards.
+    let note = app.session().frame_hex_note.is_some();
+    let reserved = 3 + usize::from(note);
+    let room = (block.inner(area).height as usize).saturating_sub(reserved);
+    let at = cursor.filter(|_| focused);
+    let first = match at {
+        Some(at) => at
+            .saturating_sub(room / 2)
+            .min(rows.len().saturating_sub(room)),
+        None => 0,
+    };
+    let last = (first + room).min(rows.len());
+
+    let mut lines: Vec<Line> = rows[first..last]
         .iter()
         .enumerate()
-        .map(|(at, row)| {
+        .map(|(offset, row)| {
+            let at = offset + first;
             let line = field_row_line(&chosen, row, &values, widest, hex_values);
             if focused && cursor == Some(at) {
                 line.style(Style::new().add_modifier(Modifier::REVERSED))
@@ -504,15 +541,10 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(target_line(app));
 
-    let title = if focused {
-        format!(" {} (fields) ", chosen.name)
-    } else {
-        format!(" {} ", chosen.name)
-    };
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(title)),
+            .block(block),
         area,
     );
 }

@@ -2505,3 +2505,78 @@ fn a_little_endian_multi_byte_field_says_so_next_to_its_type() {
 
     assert!(screen(&mut app).contains("u16 le"), "{}", screen(&mut app));
 }
+
+fn with_many_fields(app: &mut App, name: &str, count: u32) {
+    use std::fmt::Write as _;
+    let dir = std::env::temp_dir().join(format!("sim-tui-many-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    let mut text = "name = \"Wide\"\nendian = \"big\"\n".to_owned();
+    for at in 0..count {
+        let _ = write!(text, "\n[[field]]\nname = \"f{at}\"\ntype = \"u8\"\n");
+    }
+    std::fs::write(dir.join("wide.toml"), text).expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+}
+
+/// A frame with more fields than the pane's height used to leave the ones
+/// past the fold unreachable: the list never scrolled to follow the cursor.
+#[test]
+fn a_long_field_list_scrolls_to_keep_the_cursor_on_screen() {
+    let mut app = App::default();
+    with_many_fields(
+        &mut app,
+        "a_long_field_list_scrolls_to_keep_the_cursor_on_screen",
+        20,
+    );
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Right);
+    assert!(screen(&mut app).contains("f0"), "{}", screen(&mut app));
+
+    for _ in 0..19 {
+        press(&mut app, KeyCode::Down);
+    }
+
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("f19"),
+        "the last field came into view: {shown}"
+    );
+    assert!(
+        !shown.contains("f0 "),
+        "and the first scrolled out to make room: {shown}"
+    );
+    assert!(
+        shown.contains("Target:"),
+        "the summary below the list is not pushed off screen: {shown}"
+    );
+}
+
+/// The frame structure editor's own field list has the same shape, and the
+/// same bug to not have.
+#[test]
+fn a_long_frame_structure_scrolls_to_keep_the_cursor_on_screen() {
+    let mut app = App::default();
+    with_many_fields(
+        &mut app,
+        "a_long_frame_structure_scrolls_to_keep_the_cursor_on_screen",
+        40,
+    );
+    press(&mut app, KeyCode::Char('4'));
+    press(&mut app, KeyCode::Char('e'));
+    assert!(screen(&mut app).contains("f0"), "{}", screen(&mut app));
+
+    for _ in 0..39 {
+        press(&mut app, KeyCode::Down);
+    }
+
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("f39"),
+        "the last field came into view: {shown}"
+    );
+    assert!(
+        !shown.contains("f0 "),
+        "and the first scrolled out to make room: {shown}"
+    );
+}
