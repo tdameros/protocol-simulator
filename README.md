@@ -20,6 +20,22 @@ cargo run -p sim-gui -- my-project.toml    # open a project
 One positional argument is accepted. A directory is taken as a frames folder, a
 file as a project.
 
+A terminal front end covers the same engine for a board with no display:
+
+```sh
+cargo run -p sim-tui                       # empty
+cargo run -p sim-tui -- examples/frames    # open a frames folder
+```
+
+`make tui-embedded` cross-compiles it for an aarch64 Linux board from macOS or
+Linux, needing `brew install zig && cargo install cargo-zigbuild` once. The
+result is a static musl binary, so nothing on the board has to match it:
+
+```sh
+make tui-embedded
+scp target/aarch64-unknown-linux-musl/release/protocol-simulator-tui root@board:/tmp/
+```
+
 ## Concepts
 
 | Term | Is |
