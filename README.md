@@ -28,8 +28,9 @@ cargo run -p sim-tui -- examples/frames    # open a frames folder
 ```
 
 `make tui-embedded` cross-compiles it for an aarch64 Linux board from macOS or
-Linux, needing `brew install zig && cargo install cargo-zigbuild` once. The
-result is a static musl binary, so nothing on the board has to match it:
+Linux, needing `cargo install cargo-zigbuild` and `zig` on the `PATH` once
+(`brew install zig`, `apt install zig`, or `pip install ziglang`). The result
+is a static musl binary, so nothing on the board has to match it:
 
 ```sh
 make tui-embedded

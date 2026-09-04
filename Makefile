@@ -87,10 +87,11 @@ bundle-macos: ## Build the universal macOS .app locally (needs ~3 GB of disk)
 
 # zig over a Docker cross image: the terminal front end links nothing beyond
 # libc (see docs/testing.md for why `sim-core` never grew a native dependency),
-# so a full cross toolchain would only buy a slower build.
-tui-embedded: ## Cross-compile the terminal front end for an aarch64 Linux board (needs: brew install zig && cargo install cargo-zigbuild)
+# so a full cross toolchain would only buy a slower build. Not checked with
+# `command -v zig`: a `pip install ziglang` puts it behind `python3 -m
+# ziglang` instead, which cargo-zigbuild finds on its own either way.
+tui-embedded: ## Cross-compile the terminal front end for an aarch64 Linux board (needs: cargo install cargo-zigbuild, and zig on the PATH: brew install zig, apt install zig, or pip install ziglang)
 	@command -v cargo-zigbuild >/dev/null || { echo "cargo-zigbuild not found, run: cargo install cargo-zigbuild"; exit 1; }
-	@command -v zig >/dev/null || { echo "zig not found, run: brew install zig"; exit 1; }
 	rustup target add $(EMBEDDED_TARGET)
 	cargo zigbuild --release --locked -p $(TUI_PKG) --target $(EMBEDDED_TARGET)
 	@echo "Binary at target/$(EMBEDDED_TARGET)/release/protocol-simulator-tui"
