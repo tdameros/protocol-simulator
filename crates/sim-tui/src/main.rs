@@ -41,6 +41,12 @@ fn main() -> std::io::Result<()> {
 fn run(terminal: &mut DefaultTerminal, opened_with: Option<PathBuf>) -> std::io::Result<()> {
     let mut app = App::opening(opened_with);
 
+    // Entering the alternate screen is not enough on every serial console: some
+    // pass the escape code through without acting on it, leaving whatever was
+    // scrolled by underneath showing through the parts this never repaints. An
+    // explicit clear forces every cell to be drawn once, over that history.
+    terminal.clear()?;
+
     while app.running() {
         app.take_engine_events();
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
