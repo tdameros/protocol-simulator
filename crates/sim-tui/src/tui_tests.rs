@@ -2329,6 +2329,29 @@ fn a_bit_can_be_added_edited_and_removed() {
     assert!(!screen(&mut app).contains("Bit 1"), "{}", screen(&mut app));
 }
 
+/// A repr used to cycle through every scalar, including signed and floating
+/// point ones a bitfield or an enum can never actually hold.
+#[test]
+fn a_bitfields_repr_only_ever_cycles_through_unsigned_widths() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "bits");
+    press(&mut app, KeyCode::Down); // Repr row
+
+    for _ in 0..8 {
+        press(&mut app, KeyCode::Right);
+        let shown = screen(&mut app);
+        assert!(
+            ["u8", "u16", "u32", "u64"]
+                .iter()
+                .any(|repr| shown.contains(repr)),
+            "{shown}"
+        );
+    }
+}
+
 #[test]
 fn the_last_bit_cannot_be_removed() {
     let mut app = App::default();

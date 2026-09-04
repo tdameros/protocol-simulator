@@ -535,8 +535,8 @@ fn details(ui: &mut Ui, layout: &mut FrameDef, row: &Row<'_>, stated: bool) {
                 ui.label(RichText::new("bytes").weak());
             });
         }
-        FieldKind::Enum { repr, variants } => enum_details(ui, index, *repr, variants, hex),
-        FieldKind::Bits { repr, bits } => bits_details(ui, index, *repr, bits),
+        FieldKind::Enum { repr, variants } => enum_details(ui, index, repr, variants, hex),
+        FieldKind::Bits { repr, bits } => bits_details(ui, index, repr, bits),
         FieldKind::Checksum { covers, .. } => {
             let span = *covers;
             coverage_picker(ui, layout, row.frame, index, span);
@@ -620,14 +620,36 @@ fn scalar_details(ui: &mut Ui, field: &mut FieldDef, scalar: ScalarType, hex: bo
     });
 }
 
+/// What an enum or a bitfield may be represented by, changed on the spot: the
+/// wire width a repr picks is exactly what stands between one byte of flags
+/// and four.
+fn repr_picker(ui: &mut Ui, salt: (&str, usize), repr: &mut ScalarType) {
+    ComboBox::from_id_salt(salt)
+        .selected_text(repr.name())
+        .show_ui(ui, |ui| {
+            for candidate in ScalarType::UNSIGNED {
+                if ui
+                    .selectable_label(*repr == candidate, candidate.name())
+                    .clicked()
+                {
+                    *repr = candidate;
+                }
+            }
+        });
+}
+
 fn enum_details(
     ui: &mut Ui,
     index: usize,
-    repr: ScalarType,
+    repr: &mut ScalarType,
     variants: &mut Vec<EnumVariant>,
     hex: bool,
 ) {
-    ui.label(RichText::new(format!("{} on the wire", repr.name())).weak());
+    ui.horizontal(|ui| {
+        repr_picker(ui, ("enum_repr", index), repr);
+        ui.label(RichText::new("on the wire").weak());
+    });
+    let repr = *repr;
     let digits = repr.size() * 2;
     let mut remove = None;
     let mut renamed: Option<(usize, String)> = None;
@@ -696,7 +718,8 @@ fn enum_details(
     }
 }
 
-fn bits_details(ui: &mut Ui, index: usize, repr: ScalarType, bits: &mut Vec<BitDef>) {
+fn bits_details(ui: &mut Ui, index: usize, repr: &mut ScalarType, bits: &mut Vec<BitDef>) {
+    repr_picker(ui, ("bits_repr", index), repr);
     // A scalar is eight bytes at most, so the width always fits.
     let room = u32::try_from(repr.size() * 8).unwrap_or(64);
     let used: u32 = bits.iter().map(|bit| bit.width).sum();

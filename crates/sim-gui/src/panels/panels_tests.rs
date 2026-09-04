@@ -496,3 +496,58 @@ fn a_double_click_stays_on_the_row_it_started_on() {
         "the second click reached the same row and put the fields away"
     );
 }
+
+fn frame_edit_panel(
+    frame: sim_core::frame::FrameDef,
+) -> Harness<'static, sim_core::frame::FrameDef> {
+    Harness::new_ui_state(
+        |ui, frame: &mut sim_core::frame::FrameDef| {
+            let types = sim_core::frame::schema::TypeLibrary::default();
+            let _ = super::frame_edit::layout(ui, frame, false, &[], &types, true);
+        },
+        frame,
+    )
+}
+
+fn a_bits_field(name: &str) -> sim_core::frame::FrameDef {
+    sim_core::frame::FrameDef::flat(
+        "Flags",
+        vec![sim_core::frame::FieldDef {
+            name: name.to_owned(),
+            description: None,
+            kind: sim_core::frame::FieldKind::Bits {
+                repr: sim_core::frame::ScalarType::U8,
+                bits: vec![sim_core::frame::BitDef {
+                    name: "ready".to_owned(),
+                    width: 1,
+                }],
+            },
+            endian: sim_core::frame::Endianness::Big,
+            default: None,
+            range: None,
+        }],
+    )
+}
+
+/// A bitfield used to be stuck at whatever repr `New` gave it: nothing in the
+/// editor let a technician widen one byte of flags into two.
+#[test]
+fn a_bitfields_repr_can_be_widened_past_one_byte() {
+    let frame = a_bits_field("flags");
+    let mut harness = frame_edit_panel(frame);
+    harness.run();
+
+    // The row starts folded, and the repr picker is drawn in its body.
+    harness.get_by_role(accesskit::Role::Unknown).click();
+    harness.run();
+
+    harness.get_by_value("u8").click();
+    harness.run();
+    harness.get_by_label("u16").click();
+    harness.run();
+
+    let sim_core::frame::FieldKind::Bits { repr, .. } = harness.state().fields[0].kind else {
+        panic!("still a bitfield");
+    };
+    assert_eq!(repr, sim_core::frame::ScalarType::U16);
+}

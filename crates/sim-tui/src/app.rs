@@ -2486,7 +2486,8 @@ impl App {
             FieldKind::Enum { repr, .. } | FieldKind::Bits { repr, .. } => *repr,
             _ => return,
         };
-        let next = crate::connection_form::cycle(&sim_core::frame::ScalarType::ALL, repr, delta);
+        let next =
+            crate::connection_form::cycle(&sim_core::frame::ScalarType::UNSIGNED, repr, delta);
         let Some(draft) = self.session.frames.draft.as_mut() else {
             return;
         };

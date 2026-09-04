@@ -32,3 +32,6 @@ shots = ["egui_kittest/snapshot", "egui_kittest/wgpu", "egui_kittest/eframe"]
 [dev-dependencies]
 # Drives the panels without a window, so what a click does is testable.
 egui_kittest = "0.35"
+# Only for the role a test queries by: a collapsing header's own toggle has no
+# label to click on.
+accesskit = "0.24"

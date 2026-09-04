@@ -3927,6 +3927,7 @@ dependencies = [
 name = "sim-gui"
 version = "0.4.1"
 dependencies = [
+ "accesskit",
  "anyhow",
  "eframe",
  "egui",
