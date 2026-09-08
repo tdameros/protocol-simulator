@@ -1,13 +1,17 @@
 GUI_PKG := sim-gui
+TUI_PKG := sim-tui
 CORE_PKG := sim-core
+# musl over gnu: the board's own glibc version is not something this repo
+# controls, and a statically linked binary has no version to match.
+EMBEDDED_TARGET := aarch64-unknown-linux-musl
 # Same source of truth as the release workflow. Recursive, not `:=`, so only the
 # bundle target pays for it.
 VERSION = $(shell cargo metadata --format-version 1 --no-deps | \
 	jq -r '.packages[] | select(.name == "$(GUI_PKG)") | .version')
 
 .DEFAULT_GOAL := help
-.PHONY: help build build-release run run-release check check-release test test-core \
-        clippy clippy-fix fmt fmt-check doc clean ci toolchain watch bundle-macos
+.PHONY: help build build-release run run-tui run-release check check-release test test-core \
+        clippy clippy-fix fmt fmt-check doc clean ci toolchain watch bundle-macos tui-embedded
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "\033[36m%-16s\033[0m %s\n", $$1, $$2}'
@@ -20,6 +24,9 @@ build-release: ## Build the workspace (release profile)
 
 run: ## Run the GUI (dev profile)
 	cargo run -p $(GUI_PKG)
+
+run-tui: ## Run the terminal front end (dev profile)
+	cargo run -p $(TUI_PKG)
 
 run-release: ## Run the GUI (release profile)
 	cargo run -p $(GUI_PKG) --release
@@ -77,6 +84,17 @@ bundle-macos: ## Build the universal macOS .app locally (needs ~3 GB of disk)
 	cargo build --release -p $(GUI_PKG) --target aarch64-apple-darwin
 	cargo build --release -p $(GUI_PKG) --target x86_64-apple-darwin
 	packaging/macos/bundle.sh $(VERSION)
+
+# zig over a Docker cross image: the terminal front end links nothing beyond
+# libc (see docs/testing.md for why `sim-core` never grew a native dependency),
+# so a full cross toolchain would only buy a slower build. Not checked with
+# `command -v zig`: a `pip install ziglang` puts it behind `python3 -m
+# ziglang` instead, which cargo-zigbuild finds on its own either way.
+tui-embedded: ## Cross-compile the terminal front end for an aarch64 Linux board (needs: cargo install cargo-zigbuild, and zig on the PATH: brew install zig, apt install zig, or pip install ziglang)
+	@command -v cargo-zigbuild >/dev/null || { echo "cargo-zigbuild not found, run: cargo install cargo-zigbuild"; exit 1; }
+	rustup target add $(EMBEDDED_TARGET)
+	cargo zigbuild --release --locked -p $(TUI_PKG) --target $(EMBEDDED_TARGET)
+	@echo "Binary at target/$(EMBEDDED_TARGET)/release/protocol-simulator-tui"
 
 toolchain: ## Update the stable Rust toolchain via rustup
 	rustup update stable

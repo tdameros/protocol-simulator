@@ -3,10 +3,11 @@ use sim_core::{ConnectionId, ConnectionStatus};
 use egui::{Color32, ComboBox, RichText, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
-use crate::state::AppState;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::hex;
+use sim_session::state::Session;
 
-pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
+pub fn show(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
     ui.heading("Raw hex injection");
 
     // Only a connection removed from the list clears the selection. A target that
@@ -66,16 +67,16 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
             .hint_text("DE AD BE EF"),
     );
 
-    let parsed = parse_hex(&state.hex_input);
+    let parsed = hex::parse(&state.hex_input);
     match &parsed {
         Ok(bytes) => {
             ui.label(format!("{} byte(s) ready to send.", bytes.len()));
         }
-        Err(message) if state.hex_input.is_empty() => {
-            ui.weak(message);
+        Err(problem) if state.hex_input.is_empty() => {
+            ui.weak(problem.to_string());
         }
-        Err(message) => {
-            ui.colored_label(Color32::from_rgb(200, 60, 60), message);
+        Err(problem) => {
+            ui.colored_label(Color32::from_rgb(200, 60, 60), problem.to_string());
         }
     }
 
@@ -91,23 +92,4 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
             engine.send_raw(id, bytes);
         }
     }
-}
-
-/// Shared with the scenario editor, which needs the same reading of the same
-/// notation.
-pub fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
-    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() {
-        return Err("Enter hexadecimal bytes (e.g. DEADBEEF).".to_owned());
-    }
-    if !cleaned.len().is_multiple_of(2) {
-        return Err("Odd number of hexadecimal digits.".to_owned());
-    }
-    if !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Non-hexadecimal character detected.".to_owned());
-    }
-    (0..cleaned.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).map_err(|_| "Invalid byte.".to_owned()))
-        .collect()
 }

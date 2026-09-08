@@ -6,14 +6,16 @@ use sim_core::ConnectionStatus;
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextStyle, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
-use crate::panels::{bit_positions, number, spaced_hex};
-use crate::state::AppState;
+use crate::panels::number;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::kinds::bit_positions;
+use sim_session::state::Session;
+use sim_session::{frames, hex, tree};
 
 const ERROR: Color32 = Color32::from_rgb(200, 60, 60);
 const WARNING: Color32 = Color32::from_rgb(200, 120, 40);
 
-pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
+pub fn show(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
     // Taken unconditionally: bytes sent here with no frame to decode them into
     // are dropped now rather than surfacing later against an unrelated frame.
     let handed_over = state.pending_frame_hex.take();
@@ -53,15 +55,15 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     };
 
     if let Some(bytes) = handed_over {
-        let typed = spaced_hex(&bytes);
-        state.frame_hex_note = apply_hex(state, &frame, &typed);
+        let typed = hex::spaced(&bytes);
+        state.frame_hex_note = frames::apply_hex(state, &frame, &typed);
         state.frame_hex = typed;
     }
 
     // Read before the values are borrowed, the whole editor sharing one answer
     // rather than each field having its own.
     let hex = state.hex_values;
-    let tree = build_tree(&frame.fields);
+    let tree = tree::build_tree(&frame.fields);
     ScrollArea::vertical()
         .id_salt("frame_fields")
         .max_height(ui.available_height() * 0.55)
@@ -74,7 +76,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle) {
     preview_and_send(ui, state, engine, &frame);
 }
 
-fn library_bar(ui: &mut Ui, state: &mut AppState) {
+fn library_bar(ui: &mut Ui, state: &mut Session) {
     ui.horizontal(|ui| {
         // Both throw the draft away, so neither is offered while one is open:
         // losing unsaved work to a stray click is not a trade worth making.
@@ -114,7 +116,7 @@ fn library_bar(ui: &mut Ui, state: &mut AppState) {
 
 /// New, Edit and Delete, beside the frame they act on rather than beside the
 /// folder, so that the row reads like the one for shared types below it.
-fn definition_buttons(ui: &mut Ui, state: &mut AppState) {
+fn definition_buttons(ui: &mut Ui, state: &mut Session) {
     let idle = state.frames.draft.is_none() && state.frames.type_draft.is_none();
     if ui
         .add_enabled(
@@ -125,7 +127,7 @@ fn definition_buttons(ui: &mut Ui, state: &mut AppState) {
         .clicked()
     {
         let name = state.frames.unused_frame_name("New frame");
-        state.frames.begin_new(blank(&name));
+        state.frames.begin_new(frames::blank_frame(&name));
     }
     let editable = state.frames.selected_entry().is_some() && idle;
     if ui
@@ -149,22 +151,7 @@ fn definition_buttons(ui: &mut Ui, state: &mut AppState) {
     }
 }
 
-/// What New starts from: one byte, the smallest thing that is still a frame.
-fn blank(name: &str) -> FrameDef {
-    FrameDef::flat(
-        name,
-        vec![FieldDef {
-            name: "id".to_owned(),
-            description: None,
-            kind: FieldKind::Scalar(ScalarType::U8),
-            endian: sim_core::frame::Endianness::default(),
-            default: None,
-            range: None,
-        }],
-    )
-}
-
-fn draft_editor(ui: &mut Ui, state: &mut AppState) {
+fn draft_editor(ui: &mut Ui, state: &mut Session) {
     let dirty = state.frames.draft_is_dirty();
     let problem = state.frames.draft_problem();
     let Some(draft) = &mut state.frames.draft else {
@@ -179,7 +166,7 @@ fn draft_editor(ui: &mut Ui, state: &mut AppState) {
     super::frame_edit::byte_order(ui, &mut endian, None);
     // Through the layout rather than by assignment: the fields that were
     // following the frame have to keep following it.
-    crate::layout::set_endian(&mut draft.frame, endian);
+    sim_session::layout::set_endian(&mut draft.frame, endian);
     let mut description = draft.frame.description.clone().unwrap_or_default();
     ui.horizontal(|ui| {
         ui.label("Description:");
@@ -203,7 +190,7 @@ fn draft_editor(ui: &mut Ui, state: &mut AppState) {
             )
             .clicked()
         {
-            save_draft(state);
+            frames::save_draft(state);
         }
         if ui.button("Cancel").clicked() {
             state.frames.cancel_edit();
@@ -216,26 +203,7 @@ fn draft_editor(ui: &mut Ui, state: &mut AppState) {
     });
 }
 
-/// Writes the draft out, choosing a file for one that has never had a home.
-fn save_draft(state: &mut AppState) {
-    let Some(directory) = state.frames.directory.clone() else {
-        state.last_error = Some("No frames folder to save into.".to_owned());
-        return;
-    };
-    let name = state
-        .frames
-        .draft
-        .as_ref()
-        .map(|draft| draft.frame.name.clone())
-        .unwrap_or_default();
-
-    let into = crate::frames::suggested_file(&directory, &name);
-    if let Err(error) = state.frames.save_draft(&into) {
-        state.last_error = Some(format!("{error:#}"));
-    }
-}
-
-fn frame_picker(ui: &mut Ui, state: &mut AppState) {
+fn frame_picker(ui: &mut Ui, state: &mut Session) {
     if state.frames.directory.is_none() {
         return;
     }
@@ -299,80 +267,15 @@ fn frame_picker(ui: &mut Ui, state: &mut AppState) {
     }
 }
 
-fn show_failures(ui: &mut Ui, state: &AppState) {
+fn show_failures(ui: &mut Ui, state: &Session) {
     for (file, reason) in &state.frames.failures {
         ui.colored_label(ERROR, format!("{file}: {reason}"));
     }
 }
 
-/// One level of the field tree rebuilt from the dotted names an instantiated
-/// type produces, so `zone.left` folds away with everything under it.
-enum Entry<'a> {
-    Field(&'a FieldDef),
-    Group(Group<'a>),
-}
-
-struct Group<'a> {
-    /// The last path segment, which is what the header shows.
-    label: &'a str,
-    /// The whole path, used to decide what belongs to this group.
-    path: &'a str,
-    /// Name of the first field inside, which unlike the path is always unique
-    /// even when hand-written names interleave two blocks.
-    salt: &'a str,
-    entries: Vec<Entry<'a>>,
-}
-
-impl Entry<'_> {
-    fn size(&self) -> usize {
-        match self {
-            Self::Field(field) => field.kind.size(),
-            Self::Group(group) => group.entries.iter().map(Self::size).sum(),
-        }
-    }
-}
-
-fn build_tree(fields: &[FieldDef]) -> Vec<Entry<'_>> {
-    let mut root = Vec::new();
-    for field in fields {
-        insert(&mut root, field, 0);
-    }
-    root
-}
-
-/// Files declare fields in wire order, so a group only ever extends the entry
-/// that precedes it: display order can never drift from the byte order.
-fn insert<'a>(entries: &mut Vec<Entry<'a>>, field: &'a FieldDef, at: usize) {
-    let Some(dot) = field.name[at..].find('.') else {
-        entries.push(Entry::Field(field));
-        return;
-    };
-    let path = &field.name[..at + dot];
-    let next = at + dot + 1;
-
-    if let Some(Entry::Group(group)) = entries.last_mut() {
-        if group.path == path {
-            insert(&mut group.entries, field, next);
-            return;
-        }
-    }
-    let mut group = Group {
-        label: &field.name[at..at + dot],
-        path,
-        salt: &field.name,
-        entries: Vec::new(),
-    };
-    insert(&mut group.entries, field, next);
-    entries.push(Entry::Group(group));
-}
-
-fn leaf_name(name: &str) -> &str {
-    name.rfind('.').map_or(name, |at| &name[at + 1..])
-}
-
 fn show_entries(
     ui: &mut Ui,
-    entries: &[Entry<'_>],
+    entries: &[tree::Entry<'_>],
     values: &mut sim_core::frame::value::FieldValues,
     hex: bool,
 ) {
@@ -381,8 +284,8 @@ fn show_entries(
     let mut run: Vec<&FieldDef> = Vec::new();
     for entry in entries {
         match entry {
-            Entry::Field(field) => run.push(field),
-            Entry::Group(group) => {
+            tree::Entry::Field(field) => run.push(field),
+            tree::Entry::Group(group) => {
                 field_grid(ui, &mut run, values, hex);
                 let header = format!("{}  ·  {} B", group.label, entry.size());
                 egui::CollapsingHeader::new(RichText::new(header).strong())
@@ -422,7 +325,7 @@ fn field_row(
     values: &mut sim_core::frame::value::FieldValues,
     hex: bool,
 ) {
-    let mut label = ui.label(RichText::new(leaf_name(&field.name)).strong());
+    let mut label = ui.label(RichText::new(tree::leaf_name(&field.name)).strong());
     if let Some(description) = &field.description {
         label = label.on_hover_text(description);
     }
@@ -431,46 +334,13 @@ fn field_row(
     }
     let _ = label;
 
-    ui.label(RichText::new(type_label(field)).weak());
+    ui.label(RichText::new(frames::type_label(field)).weak());
 
     match &field.kind {
         FieldKind::Checksum { .. } => {
             ui.label(RichText::new("computed on send").weak());
         }
         kind => value_widget(ui, field, kind, values, hex),
-    }
-}
-
-/// The declared type, shown next to every field so the layout is readable
-/// without opening the TOML.
-fn type_label(field: &FieldDef) -> String {
-    let endian = match field.endian {
-        sim_core::frame::Endianness::Big => "be",
-        sim_core::frame::Endianness::Little => "le",
-    };
-    let constraint = field
-        .range
-        .as_ref()
-        .map(|range| format!(" {}", range.describe()))
-        .unwrap_or_default();
-    match &field.kind {
-        FieldKind::Scalar(scalar) if scalar.size() > 1 => {
-            format!("{} {endian}{constraint}", scalar.name())
-        }
-        FieldKind::Scalar(scalar) => format!("{}{constraint}", scalar.name()),
-        FieldKind::Bytes { len } => format!("bytes[{len}]"),
-        FieldKind::Text { len } => format!("text[{len}]"),
-        FieldKind::Enum { repr, .. } => format!("enum {}", repr.name()),
-        FieldKind::Bits { repr, .. } => format!("bits {}", repr.name()),
-        FieldKind::Checksum { spec, .. } => match spec {
-            sim_core::frame::checksum::ChecksumSpec::Crc(crc) => crc
-                .preset_name()
-                .map_or_else(|| format!("crc{}", crc.width_bits), ToOwned::to_owned),
-            sim_core::frame::checksum::ChecksumSpec::Xor8 => "xor8".to_owned(),
-            sim_core::frame::checksum::ChecksumSpec::Sum { width_bytes } => {
-                format!("sum{}", width_bytes * 8)
-            }
-        },
     }
 }
 
@@ -503,7 +373,7 @@ pub fn value_widget(
             let mut current = entry.as_uint().unwrap_or(0);
             let (min, max) = match field.range {
                 Some(ValueRange::Uint { min, max }) => (min, max),
-                _ => (0, max_unsigned(*scalar)),
+                _ => (0, frames::max_unsigned(*scalar)),
             };
             // Padded to the width of what holds it, so a u16 reads 0x00FF
             // rather than 0xFF and lines up with the byte preview below.
@@ -532,7 +402,7 @@ pub fn value_widget(
         }
         FieldKind::Bytes { len } => {
             let current = entry.as_bytes().unwrap_or(&[]).to_vec();
-            let mut text = to_hex(&current);
+            let mut text = hex::packed(&current);
             if ui
                 .add(
                     egui::TextEdit::singleline(&mut text)
@@ -541,7 +411,7 @@ pub fn value_widget(
                 )
                 .changed()
             {
-                if let Some(mut bytes) = parse_hex(&text) {
+                if let Ok(mut bytes) = hex::parse(&text) {
                     bytes.resize(*len, 0);
                     *entry = Value::Bytes(bytes);
                 }
@@ -641,7 +511,7 @@ fn bits_widget(
     }
 }
 
-fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, frame: &FrameDef) {
+fn preview_and_send(ui: &mut Ui, state: &mut Session, engine: &EngineHandle, frame: &FrameDef) {
     let encoded = {
         let values = state.frames.values_mut(frame);
         codec::encode(frame, values)
@@ -716,11 +586,11 @@ fn preview_and_send(ui: &mut Ui, state: &mut AppState, engine: &EngineHandle, fr
 ///
 /// The box only mirrors the encoder while it is not focused. Once it is, the
 /// text is whatever was typed, and the fields follow it instead.
-fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: Option<&[u8]>) {
+fn hex_preview(ui: &mut Ui, state: &mut Session, frame: &FrameDef, bytes: Option<&[u8]>) {
     let id = egui::Id::new(("frame_hex", &frame.name));
     // With nothing to mirror, the typed text stays put rather than being wiped.
     if let (false, Some(bytes)) = (ui.memory(|memory| memory.has_focus(id)), bytes) {
-        state.frame_hex = spaced_hex(bytes);
+        state.frame_hex = hex::spaced(bytes);
     }
 
     let response = ui.add(
@@ -732,307 +602,6 @@ fn hex_preview(ui: &mut Ui, state: &mut AppState, frame: &FrameDef, bytes: Optio
 
     if response.changed() {
         let typed = state.frame_hex.clone();
-        state.frame_hex_note = apply_hex(state, frame, &typed);
-    }
-}
-
-/// Decodes typed hex back into the field values.
-///
-/// Returns what the operator should know about: why nothing was applied, or
-/// what the frame will not keep.
-fn apply_hex(state: &mut AppState, frame: &FrameDef, typed: &str) -> Option<String> {
-    let cleaned: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
-    if !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Some("Not hexadecimal.".to_owned());
-    }
-    // Half a byte typed is someone mid-keystroke, not a mistake to point at.
-    let bytes = parse_hex(&cleaned)?;
-    if bytes.len() != frame.size() {
-        return Some(format!(
-            "{} bytes typed, the frame is {}.",
-            bytes.len(),
-            frame.size()
-        ));
-    }
-
-    let decoded = match codec::decode(frame, &bytes) {
-        Ok(decoded) => decoded,
-        Err(error) => return Some(error.to_string()),
-    };
-
-    let values = state.frames.values_mut(frame);
-    for field in &frame.fields {
-        // Checksums are recomputed on encode, so writing one back would be
-        // overwritten anyway; the mismatch below is the honest report.
-        if matches!(field.kind, FieldKind::Checksum { .. }) {
-            continue;
-        }
-        if let Some(value) = decoded.values.get(&field.name) {
-            values.insert(field.name.clone(), value.clone());
-        }
-    }
-
-    let mut notes = Vec::new();
-    // Worth saying out loud: paste a capture with a bad checksum and the
-    // preview will quietly show the corrected one a moment later.
-    if !decoded.checksum_mismatches.is_empty() {
-        let fields: Vec<&str> = decoded
-            .checksum_mismatches
-            .iter()
-            .map(|mismatch| mismatch.field.as_str())
-            .collect();
-        notes.push(format!(
-            "{} did not match; the preview will show the recomputed value.",
-            fields.join(", ")
-        ));
-    }
-    for violation in &decoded.range_violations {
-        notes.push(format!(
-            "{} is {}, outside {}.",
-            violation.field, violation.found, violation.range
-        ));
-    }
-    (!notes.is_empty()).then(|| notes.join(" "))
-}
-
-fn max_unsigned(scalar: ScalarType) -> u64 {
-    let bits = scalar.size() * 8;
-    if bits >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        let _ = write!(out, "{byte:02X}");
-        out
-    })
-}
-
-fn parse_hex(text: &str) -> Option<Vec<u8>> {
-    let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if !cleaned.len().is_multiple_of(2) || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    (0..cleaned.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&cleaned[i..i + 2], 16).ok())
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sim_core::frame::Endianness;
-
-    /// Two bytes each, so a group's reported size is unambiguous.
-    fn field(name: &str) -> FieldDef {
-        FieldDef {
-            name: name.to_owned(),
-            description: None,
-            kind: FieldKind::Scalar(ScalarType::U16),
-            endian: Endianness::Big,
-            default: None,
-            range: None,
-        }
-    }
-
-    fn shape(entries: &[Entry<'_>]) -> String {
-        entries
-            .iter()
-            .map(|entry| match entry {
-                Entry::Field(field) => field.name.clone(),
-                Entry::Group(group) => format!("{}({})", group.path, shape(&group.entries)),
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    #[test]
-    fn nested_instances_nest_in_the_editor_too() {
-        let fields = [
-            field("header"),
-            field("zone.left.led[0].mode"),
-            field("zone.left.led[1].mode"),
-            field("zone.left.accent.red"),
-            field("zone.right.led[0].mode"),
-            field("crc"),
-        ];
-        let tree = build_tree(&fields);
-
-        assert_eq!(
-            shape(&tree),
-            "header \
-             zone(\
-             zone.left(\
-             zone.left.led[0](zone.left.led[0].mode) \
-             zone.left.led[1](zone.left.led[1].mode) \
-             zone.left.accent(zone.left.accent.red)\
-             ) \
-             zone.right(zone.right.led[0](zone.right.led[0].mode))\
-             ) \
-             crc"
-        );
-
-        // Folding `zone` hides four fields, whatever the depth they sit at.
-        assert_eq!(tree[1].size(), 8);
-    }
-
-    /// Four bytes, the last one a checksum, so the round trip is easy to read.
-    const GUARDED: &str = r#"
-name = "Guarded"
-endian = "big"
-
-[[field]]
-name = "sync"
-type = "u16"
-default = 0xAA55
-
-[[field]]
-name = "mode"
-type = "enum"
-repr = "u8"
-variants = { IDLE = 0, RUN = 1, FAULT = 2 }
-
-[[field]]
-name = "check"
-type = "xor8"
-covers = { from = "sync", to = "mode" }
-"#;
-
-    fn guarded() -> FrameDef {
-        sim_core::frame::schema::from_toml(GUARDED).expect("fixture should parse")
-    }
-
-    #[test]
-    fn typing_hex_drives_the_fields() {
-        let frame = guarded();
-        let mut state = AppState::default();
-
-        // 0xAA ^ 0x55 ^ 0x02 = 0xFD
-        assert_eq!(apply_hex(&mut state, &frame, "AA 55 02 FD"), None);
-
-        let values = state.frames.values_mut(&frame);
-        assert_eq!(values["sync"], Value::Uint(0xAA55));
-        assert_eq!(values["mode"], Value::Uint(2));
-        // Recomputed on encode, so it is never written back as a value.
-        assert!(!values.contains_key("check"));
-    }
-
-    #[test]
-    fn an_incomplete_byte_is_not_worth_complaining_about() {
-        let frame = guarded();
-        let mut state = AppState::default();
-
-        state
-            .frames
-            .values_mut(&frame)
-            .insert("mode".to_owned(), Value::Uint(2));
-
-        // Mid-keystroke: silent, and what is already there is left alone.
-        assert_eq!(apply_hex(&mut state, &frame, "AA 5"), None);
-        assert_eq!(state.frames.values_mut(&frame)["mode"], Value::Uint(2));
-
-        assert_eq!(
-            apply_hex(&mut state, &frame, "AA ZZ"),
-            Some("Not hexadecimal.".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_short_frame_says_how_short() {
-        let frame = guarded();
-        let mut state = AppState::default();
-        let note = apply_hex(&mut state, &frame, "AA 55").expect("should be reported");
-        assert!(note.contains('2') && note.contains('4'), "got {note}");
-    }
-
-    #[test]
-    fn a_wrong_checksum_is_applied_but_flagged() {
-        let frame = guarded();
-        let mut state = AppState::default();
-
-        // Right bytes, deliberately wrong check byte.
-        let note = apply_hex(&mut state, &frame, "AA 55 02 00").expect("should be reported");
-        assert!(note.contains("check"), "got {note}");
-
-        // The fields still took the pasted values: a capture with a bad
-        // checksum is exactly what you want to look at.
-        assert_eq!(state.frames.values_mut(&frame)["mode"], Value::Uint(2));
-    }
-
-    #[test]
-    fn a_bitfield_says_where_each_of_its_parts_sits() {
-        let frame = sim_core::frame::schema::from_toml(
-            r#"
-name = "Status"
-[[field]]
-name = "flags"
-type = "bits"
-repr = "u8"
-bits = [
-  { name = "armed",       width = 1 },
-  { name = "heater_on",   width = 1 },
-  { name = "link_up",     width = 1 },
-  { name = "power_level", width = 2 },
-  { name = "spare",       width = 3 },
-]
-"#,
-        )
-        .expect("should parse");
-        let FieldKind::Bits { repr, bits } = &frame.fields[0].kind else {
-            panic!("expected a bitfield");
-        };
-
-        // Listed from the top of the word, which is the order the codec packs
-        // them in and the order the file declares them in.
-        assert_eq!(
-            bit_positions(*repr, bits),
-            [
-                Some("7".to_owned()),
-                Some("6".to_owned()),
-                Some("5".to_owned()),
-                Some("4:3".to_owned()),
-                Some("2:0".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_bitfield_wider_than_its_word_says_so_rather_than_lying() {
-        // The schema refuses this at load, so it is a guard rather than a case
-        // anyone should meet, but a wrong number would be worse than a question
-        // mark.
-        let bits = [
-            BitDef {
-                name: "big".to_owned(),
-                width: 6,
-            },
-            BitDef {
-                name: "too_big".to_owned(),
-                width: 6,
-            },
-        ];
-        assert_eq!(
-            bit_positions(ScalarType::U8, &bits),
-            [Some("7:2".to_owned()), None]
-        );
-    }
-
-    #[test]
-    fn a_repeated_builtin_stays_a_plain_row() {
-        let fields = [field("sample[0]"), field("sample[1]")];
-        assert_eq!(shape(&build_tree(&fields)), "sample[0] sample[1]");
-    }
-
-    #[test]
-    fn display_order_never_drifts_from_wire_order() {
-        // Hand-written names can interleave. Reuniting the two `a` blocks would
-        // move `b.y` in the listing while it stays put in the bytes.
-        let fields = [field("a.x"), field("b.y"), field("a.z")];
-        assert_eq!(shape(&build_tree(&fields)), "a(a.x) b(b.y) a(a.z)");
+        state.frame_hex_note = frames::apply_hex(state, frame, &typed);
     }
 }

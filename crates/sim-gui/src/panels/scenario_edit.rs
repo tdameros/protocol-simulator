@@ -6,7 +6,7 @@
 //! because it was ticked, so most of what the loader knows how to refuse cannot
 //! be built in the first place.
 //!
-//! The drawing lives here and the meaning lives in [`crate::scenarios`], which
+//! The drawing lives here and the meaning lives in [`sim_session::scenarios`], which
 //! is what makes the meaning testable without a window.
 
 use std::time::Duration;
@@ -19,10 +19,10 @@ use sim_core::scenario::{Action, Expect, Step};
 use sim_core::{Anchor, ConnectionId, HexPattern};
 
 use crate::panels::frame_editor::value_widget;
-use crate::panels::hex_inject::parse_hex;
 use crate::panels::{column, field_label, widest};
-use crate::scenarios::{self, ActionKind};
-use crate::state::AppState;
+use sim_session::hex;
+use sim_session::scenarios::{self, ActionKind};
+use sim_session::state::Session;
 
 /// A change to the list of steps, which cannot happen while it is being drawn.
 enum Edit {
@@ -32,7 +32,7 @@ enum Edit {
     Kind { index: usize, kind: ActionKind },
 }
 
-pub fn steps(ui: &mut Ui, state: &mut AppState) {
+pub fn steps(ui: &mut Ui, state: &mut Session) {
     let links: Vec<ConnectionId> = state.connections.iter().map(|(id, _)| id.clone()).collect();
     let frames: Vec<FrameDef> = state.frames.frames().cloned().collect();
     // The same answer as the frame editor gives: a value written into a step is
@@ -470,23 +470,15 @@ fn kept_text(ui: &mut Ui, salt: &str, mirror: &str, hint: &str) -> Option<String
 
 /// Bytes, taken from the box only once they parse.
 fn hex_field(ui: &mut Ui, salt: &str, bytes: &mut Vec<u8>) {
-    if let Some(text) = kept_text(ui, salt, &spaced(bytes), "DE AD BE EF") {
-        if let Ok(parsed) = parse_hex(&text) {
+    if let Some(text) = kept_text(ui, salt, &hex::spaced(bytes), "DE AD BE EF") {
+        if let Ok(parsed) = hex::parse(&text) {
             *bytes = parsed;
         }
     }
 }
 
-fn spaced(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The settings a scenario has beyond its steps.
-pub fn header(ui: &mut Ui, state: &mut AppState) {
+pub fn header(ui: &mut Ui, state: &mut Session) {
     let labels = widest(ui, &TextStyle::Body, &["Name:", "Description:", "Repeat:"]);
     let dirty = state.scenarios.draft_is_dirty();
 

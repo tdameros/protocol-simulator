@@ -6,11 +6,14 @@
 //! developer wrote where they were.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 
+use crate::engine_handle::EngineHandle;
+use crate::state::Session;
 use sim_core::frame::value::seed_values;
 use sim_core::frame::{schema, FrameDef};
 use sim_core::scenario::{self, Action, Counter, Expect, Scenario, Step};
@@ -586,6 +589,163 @@ fn file_label(path: &Path) -> String {
         || path.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+/// Writes the draft out, choosing a file for one that has never had a home.
+pub fn save(state: &mut Session) {
+    let Some(directory) = state.scenarios.directory.clone() else {
+        state.last_error = Some("No scenarios folder to save into.".to_owned());
+        return;
+    };
+    let name = state
+        .scenarios
+        .draft
+        .as_ref()
+        .map(|draft| draft.scenario.name.clone())
+        .unwrap_or_default();
+
+    let into = suggested_file(&directory, &name);
+    if let Err(error) = state.scenarios.save_draft(&into) {
+        state.last_error = Some(format!("{error:#}"));
+    }
+}
+
+/// What New starts from: one delay, which is the only step that needs nothing
+/// else to exist yet, since there may be no connection configured at all.
+#[must_use]
+pub fn blank() -> Scenario {
+    Scenario {
+        name: "New scenario".to_owned(),
+        description: None,
+        steps: vec![Step {
+            targets: Vec::new(),
+            action: Action::Wait {
+                delay: Duration::from_millis(100),
+            },
+        }],
+        repeat: None,
+    }
+}
+
+/// Hands the scenario to the engine along with the definitions it will encode
+/// against, so the run is unaffected by anything edited afterwards.
+pub fn start(state: &mut Session, engine: &EngineHandle, scenario: &Scenario) {
+    let wanted = scenario.frames_used();
+    let frames: Vec<_> = state
+        .frames
+        .frames()
+        .filter(|frame| wanted.contains(&frame.name.as_str()))
+        .cloned()
+        .collect();
+
+    // Said here rather than left to fail on the step that needs it, since the
+    // cause is a frames folder, not the scenario.
+    let missing: Vec<&str> = wanted
+        .into_iter()
+        .filter(|name| !frames.iter().any(|frame| frame.name == *name))
+        .collect();
+    if !missing.is_empty() {
+        state.last_error = Some(format!(
+            "[{}] no frame loaded named {}",
+            scenario.name,
+            missing.join(", ")
+        ));
+        return;
+    }
+
+    // Connections get the same treatment. A scenario file is loaded on its own,
+    // knowing nothing of the project's links, so a misspelt `on` used to sail
+    // through and only show up as an error per send, once a second or once
+    // every 10 ms, without stopping anything.
+    let unknown = unknown_connections(state, scenario);
+    if !unknown.is_empty() {
+        state.last_error = Some(format!(
+            "[{}] no connection named {}",
+            scenario.name,
+            unknown.join(", ")
+        ));
+        return;
+    }
+
+    engine.start_scenario(scenario.clone(), frames);
+}
+
+/// Names the scenario aims at that the project does not define, in the order
+/// they first appear so the message points at the first line to fix.
+#[must_use]
+pub fn unknown_connections(state: &Session, scenario: &Scenario) -> Vec<String> {
+    let mut unknown: Vec<String> = Vec::new();
+    for target in scenario.steps.iter().flat_map(|step| &step.targets) {
+        let known = state.connections.iter().any(|(id, _)| id == target);
+        if !known && !unknown.contains(&target.0) {
+            unknown.push(target.0.clone());
+        }
+    }
+    unknown
+}
+
+/// What the scenario does, in one line, so the list is readable without opening
+/// anything.
+#[must_use]
+pub fn shape(scenario: &Scenario) -> String {
+    let steps = scenario.steps.len();
+    let plural = if steps == 1 { "step" } else { "steps" };
+    match scenario.repeat {
+        None => format!("{steps} {plural}, once"),
+        Some(repeat) => {
+            let period = repeat.every.as_millis();
+            match repeat.times {
+                Some(times) => format!("{steps} {plural}, {times} times every {period} ms"),
+                None => format!("{steps} {plural}, every {period} ms"),
+            }
+        }
+    }
+}
+
+#[must_use]
+pub fn describe(step: &Step) -> String {
+    match &step.action {
+        Action::Send {
+            frame,
+            with,
+            counters,
+        } => {
+            let mut text = format!("send {frame}");
+            if !with.is_empty() {
+                let fields: Vec<&str> = with.keys().map(String::as_str).collect();
+                let _ = write!(text, " with {}", fields.join(", "));
+            }
+            if !counters.is_empty() {
+                let fields: Vec<&str> = counters.keys().map(String::as_str).collect();
+                let _ = write!(text, " counting {}", fields.join(", "));
+            }
+            text
+        }
+        Action::Raw { bytes } => {
+            let hex: Vec<String> = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+            format!("send raw {}", hex.join(" "))
+        }
+        Action::Wait { delay } => format!("wait {} ms", delay.as_millis()),
+        Action::WaitFor { expect, timeout } => {
+            let mut text = match expect {
+                Expect::Frame { frame, values } => {
+                    let named: Vec<&str> = values.keys().map(String::as_str).collect();
+                    format!("wait for {frame} matching {}", named.join(", "))
+                }
+                Expect::Pattern { pattern, anchor } => {
+                    let mut text = format!("wait for {}", pattern.to_hex());
+                    if let Some(offset) = anchor.offset() {
+                        let _ = write!(text, " at offset {offset}");
+                    }
+                    text
+                }
+            };
+            if let Some(limit) = timeout {
+                let _ = write!(text, ", giving up after {} ms", limit.as_millis());
+            }
+            text
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1230,5 +1390,143 @@ raw = "BB"
         assert_eq!(library.selected, Some(0));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    use super::{describe, shape, unknown_connections};
+    use crate::state::{ConnectionEntry, Session};
+    use sim_core::scenario::Scenario;
+
+    fn parse(text: &str) -> Scenario {
+        sim_core::scenario::from_toml(text)
+            .expect("should parse")
+            .remove(0)
+    }
+
+    #[test]
+    fn a_misspelt_connection_is_caught_before_anything_is_sent() {
+        let mut state = Session::default();
+        state.connections = vec![(
+            sim_core::ConnectionId::from("bus"),
+            ConnectionEntry {
+                config: sim_core::TransportConfig::Udp {
+                    bind: "127.0.0.1:9000".parse().expect("address"),
+                    remote: "127.0.0.1:9001".parse().expect("address"),
+                },
+                status: sim_core::ConnectionStatus::Connected,
+                retry: None,
+                autoconnect: false,
+            },
+        )];
+
+        let good = parse(
+            r#"
+[[scenario]]
+name = "Fine"
+on = "bus"
+[[scenario.step]]
+raw = "00"
+"#,
+        );
+        assert!(unknown_connections(&state, &good).is_empty());
+
+        let typo = parse(
+            r#"
+[[scenario]]
+name = "Typo"
+on = ["bus", "buss"]
+[[scenario.step]]
+raw = "00"
+[[scenario.step]]
+raw = "01"
+on = "uart"
+"#,
+        );
+        // Reported once each, in the order they appear, so the message points
+        // at the first line to go and fix.
+        assert_eq!(unknown_connections(&state, &typo), ["buss", "uart"]);
+
+        // A delay names no link, so it can never be the reason for a refusal.
+        let waiting = parse(
+            r#"
+[[scenario]]
+name = "Waiting"
+[[scenario.step]]
+wait_ms = 10
+"#,
+        );
+        assert!(unknown_connections(&state, &waiting).is_empty());
+    }
+
+    #[test]
+    fn the_one_line_shape_says_how_often_it_runs() {
+        let once = parse(
+            r#"
+[[scenario]]
+name = "Boot"
+on = "bus"
+[[scenario.step]]
+wait_ms = 5
+"#,
+        );
+        assert_eq!(shape(&once), "1 step, once");
+
+        let forever = parse(
+            r#"
+[[scenario]]
+name = "Beat"
+on = "bus"
+repeat = { every_ms = 100 }
+[[scenario.step]]
+raw = "00"
+[[scenario.step]]
+wait_ms = 5
+"#,
+        );
+        assert_eq!(shape(&forever), "2 steps, every 100 ms");
+
+        let counted = parse(
+            r#"
+[[scenario]]
+name = "Burst"
+on = "bus"
+repeat = { every_ms = 250, times = 10 }
+[[scenario.step]]
+raw = "00"
+"#,
+        );
+        assert_eq!(shape(&counted), "1 step, 10 times every 250 ms");
+    }
+
+    #[test]
+    fn every_kind_of_step_says_what_it_does() {
+        let scenario = parse(
+            r#"
+[[scenario]]
+name = "All of them"
+on = "bus"
+[[scenario.step]]
+send = "Telemetry"
+with = { mode = 1 }
+counters = { seq = { wrap = 255 } }
+[[scenario.step]]
+raw = "AA 55"
+[[scenario.step]]
+wait_ms = 40
+[[scenario.step]]
+wait_for = { hex = "C0 FE", at = 2, timeout_ms = 500 }
+[[scenario.step]]
+wait_for = { frame = "Telemetry", match = { sync = 1, mode = 2 } }
+"#,
+        );
+
+        let lines: Vec<String> = scenario.steps.iter().map(describe).collect();
+        assert_eq!(lines[0], "send Telemetry with mode counting seq");
+        assert_eq!(lines[1], "send raw AA 55");
+        assert_eq!(lines[2], "wait 40 ms");
+        assert_eq!(
+            lines[3],
+            "wait for C0 FE at offset 2, giving up after 500 ms"
+        );
+        assert_eq!(lines[4], "wait for Telemetry matching mode, sync");
     }
 }

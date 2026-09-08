@@ -20,6 +20,24 @@ cargo run -p sim-gui -- my-project.toml    # open a project
 One positional argument is accepted. A directory is taken as a frames folder, a
 file as a project.
 
+A terminal front end covers the same engine for a board with no display:
+
+```sh
+cargo run -p sim-tui                       # empty
+cargo run -p sim-tui -- examples/frames    # open a frames folder
+```
+
+A prebuilt aarch64 Linux binary is also on the [releases page][releases]. To
+build it yourself, `make tui-embedded` cross-compiles it from macOS or Linux,
+needing `cargo install cargo-zigbuild` and `zig` on the `PATH` once (`brew
+install zig`, `apt install zig`, or `pip install ziglang`). The result is a
+static musl binary, so nothing on the board has to match it:
+
+```sh
+make tui-embedded
+scp target/aarch64-unknown-linux-musl/release/protocol-simulator-tui root@board:/tmp/
+```
+
 ## Concepts
 
 | Term | Is |
@@ -44,12 +62,16 @@ file as a project.
 
 ## Architecture
 
-Two crates.
+Three crates.
 
 `sim-core` holds the engine, the frame model, the codec and the file formats,
 with no GUI dependency. The engine runs on a dedicated thread with a Tokio
 runtime and one task per connection, and speaks to the front end over two `mpsc`
 channels carrying `Command` and `Event`.
+
+`sim-session` holds what a front end needs that is not drawing: the loaded
+libraries, the traffic buffer and its filters, the unsaved drafts, and the one
+door to the engine.
 
 `sim-gui` draws the panels with `egui` and `egui_dock`. It owns no protocol
 logic.

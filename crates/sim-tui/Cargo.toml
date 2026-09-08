@@ -1,0 +1,17 @@
+[package]
+name = "sim-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "protocol-simulator-tui"
+path = "src/main.rs"
+
+[dependencies]
+# Default pulls every widget, calendar included, which drags in `time` for a
+# board that will never show one.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
+sim-core = { path = "../sim-core" }
+sim-session = { path = "../sim-session" }
+tokio-serial = "5.5.0"

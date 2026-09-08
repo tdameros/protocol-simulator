@@ -174,6 +174,7 @@ fn reorder(layout: &mut FrameDef, first: usize, second: usize, above: &str, belo
 }
 
 /// A name no field is using yet, `sample` becoming `sample2` if it is.
+#[must_use]
 pub fn unused_name(layout: &FrameDef, wanted: &str) -> String {
     if layout.field_index(wanted).is_none() && !layout.declared.iter().any(|name| name == wanted) {
         return wanted.to_owned();

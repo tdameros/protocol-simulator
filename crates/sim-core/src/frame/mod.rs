@@ -43,6 +43,10 @@ impl ScalarType {
         Self::F64,
     ];
 
+    /// What a bitfield or enum may be represented by, which is what
+    /// [`Self::is_unsigned_integer`] answers one at a time.
+    pub const UNSIGNED: [Self; 4] = [Self::U8, Self::U16, Self::U32, Self::U64];
+
     #[must_use]
     pub fn size(self) -> usize {
         match self {

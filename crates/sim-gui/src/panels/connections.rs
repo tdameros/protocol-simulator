@@ -1,13 +1,14 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 
 use sim_core::{ConnectionStatus, RetryPolicy};
 
 use egui::{Color32, ComboBox, Grid, RichText, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
 use crate::panels::{field_label, widest};
-use crate::state::{ConnectionEntry, NewConnectionForm, TransportKindChoice};
+use sim_session::engine_handle::EngineHandle;
+use sim_session::links;
+use sim_session::state::{ConnectionEntry, NewConnectionForm, TransportKindChoice};
 
 /// Every label the form can show, whichever transport is picked.
 ///
@@ -31,7 +32,7 @@ const FORM_LABELS: &[&str] = &[
     "Flow control:",
 ];
 
-pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHandle) {
+pub fn show(ui: &mut Ui, state: &mut sim_session::state::Session, engine: &EngineHandle) {
     ui.heading("New connection");
     new_connection_form(ui, &mut state.new_connection);
 
@@ -83,9 +84,9 @@ pub fn show(ui: &mut Ui, state: &mut crate::state::AppState, engine: &EngineHand
         .show(ui, |ui| {
             for (id, entry) in &mut state.connections {
                 ui.label(status_dot(entry.status))
-                    .on_hover_text(status_label(entry.status));
+                    .on_hover_text(links::status(entry.status));
                 ui.label(RichText::new(&id.0).strong());
-                ui.label(kind_summary(entry));
+                ui.label(links::summary(entry));
 
                 // Always a cell, even when there is nothing to show: a skipped
                 // one would pull the whole row left.
@@ -240,27 +241,11 @@ fn interface_picker(ui: &mut Ui, selected: &mut Ipv4Addr, labels: f32) {
             .selected_text(selected_text)
             .show_ui(ui, |ui| {
                 ui.selectable_value(selected, Ipv4Addr::UNSPECIFIED, "auto (0.0.0.0)");
-                for (name, addr) in local_ipv4_interfaces() {
+                for (name, addr) in links::interfaces() {
                     ui.selectable_value(selected, addr, format!("{name} ({addr})"));
                 }
             });
     });
-}
-
-fn local_ipv4_interfaces() -> Vec<(String, Ipv4Addr)> {
-    let Ok(interfaces) = if_addrs::get_if_addrs() else {
-        return Vec::new();
-    };
-    let mut found: Vec<_> = interfaces
-        .into_iter()
-        .filter_map(|iface| match iface.addr.ip() {
-            IpAddr::V4(addr) => Some((iface.name, addr)),
-            IpAddr::V6(_) => None,
-        })
-        .collect();
-    found.sort();
-    found.dedup();
-    found
 }
 
 fn serial_fields(ui: &mut Ui, form: &mut NewConnectionForm, labels: f32) {
@@ -366,40 +351,4 @@ fn status_dot(status: ConnectionStatus) -> RichText {
         ConnectionStatus::Disconnected => (icons::CIRCLE, Color32::from_rgb(150, 150, 150)),
     };
     RichText::new(glyph).color(color)
-}
-
-fn status_label(status: ConnectionStatus) -> &'static str {
-    match status {
-        ConnectionStatus::Connecting => "Connecting",
-        ConnectionStatus::Listening => "Port open, waiting for a peer",
-        ConnectionStatus::Connected => "Connected",
-        ConnectionStatus::Disconnected => "Disconnected",
-    }
-}
-
-fn kind_summary(entry: &ConnectionEntry) -> String {
-    use sim_core::{TcpMode, TransportConfig};
-
-    match &entry.config {
-        TransportConfig::Udp { bind, remote } => format!("UDP {bind} -> {remote}"),
-        TransportConfig::UdpMulticast { group, interface } => {
-            let via = if interface.is_unspecified() {
-                "auto".to_owned()
-            } else {
-                interface.to_string()
-            };
-            format!("UDP multicast {group} via {via}")
-        }
-        TransportConfig::Tcp {
-            mode: TcpMode::Client { addr },
-        } => format!("TCP client -> {addr}"),
-        TransportConfig::Tcp {
-            mode: TcpMode::Server { listen },
-        } => format!("TCP server on {listen}"),
-        TransportConfig::Serial {
-            port_name,
-            baud_rate,
-            ..
-        } => format!("Serial {port_name} @ {baud_rate}"),
-    }
 }

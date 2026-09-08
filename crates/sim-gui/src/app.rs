@@ -1,18 +1,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use sim_core::Event;
-
 use egui::{Color32, Context, CornerRadius, Modal, Theme, ViewportCommand};
 use egui_dock::{DockArea, DockState, Style};
 use egui_phosphor::regular as icons;
 
-use crate::engine_handle::EngineHandle;
 use crate::panels::{AppTabViewer, Tab};
 use crate::prefs::Preferences;
-use crate::project::{self, Project, DEFAULT_FILE_NAME};
-use crate::state::{AppState, Direction, LogEntry};
+use crate::project;
 use crate::theme;
+use sim_session::engine_handle::EngineHandle;
+use sim_session::project::{Project, DEFAULT_FILE_NAME};
+use sim_session::state::Session;
 
 const APP_NAME: &str = "Protocol Simulator";
 
@@ -29,7 +28,7 @@ enum Pending {
 pub struct SimApp {
     /// Reachable from the crate so the documentation's screenshots can put a
     /// bench in front of the window before drawing it.
-    pub(crate) state: AppState,
+    pub(crate) state: Session,
     engine: EngineHandle,
     dock_state: DockState<Tab>,
     /// Where the current project lives, once it has anywhere to live.
@@ -55,7 +54,7 @@ impl SimApp {
         let theme = cc.egui_ctx.theme();
         theme::apply(&cc.egui_ctx, theme);
 
-        let mut state = AppState::default();
+        let mut state = Session::default();
         let mut monitors = BTreeMap::new();
         let dock_state = project::default_layout(&mut monitors);
         state.restore_monitors(monitors);
@@ -88,7 +87,11 @@ impl SimApp {
     }
 
     fn snapshot(&self, theme: Theme) -> Project {
-        Project::capture_settings(&self.state, theme, self.path.as_deref())
+        Project::capture_settings(
+            &self.state,
+            project::theme_spec(theme),
+            self.path.as_deref(),
+        )
     }
 
     fn is_dirty(&self, theme: Theme) -> bool {
@@ -97,7 +100,7 @@ impl SimApp {
 
     /// Silences the engine before the window is given something else to show.
     ///
-    /// A scenario lives in the engine, not in `AppState`, so replacing the
+    /// A scenario lives in the engine, not in `Session`, so replacing the
     /// state would leave it running against links that are about to close,
     /// reporting an error per send, with nothing on screen offering to stop it.
     fn stop_everything(&mut self) {
@@ -111,22 +114,25 @@ impl SimApp {
 
     fn open(&mut self, ctx: &Context, path: &Path) {
         self.stop_everything();
-        let loaded = Project::read(path).and_then(|project| {
-            let restored = project.apply(&mut self.state, Some(path))?;
-            Ok(restored)
+        let loaded = Project::read(path).and_then(|read| {
+            let restored = read.apply(&mut self.state, Some(path))?;
+            Ok((read, restored))
         });
 
         match loaded {
-            Ok(restored) => {
+            Ok((read, restored)) => {
                 for (id, config, retry) in restored.connect {
                     self.engine.connect(id, config, retry);
                 }
-                self.dock_state = restored.layout;
-                ctx.set_theme(restored.theme);
+                let mut monitors = restored.monitors;
+                let (dock, layout_warning) = project::layout_of(&read, &mut monitors);
+                self.dock_state = dock;
+                self.state.restore_monitors(monitors);
+                ctx.set_theme(project::theme_of(restored.theme));
                 self.path = Some(path.to_path_buf());
-                self.saved = self.snapshot(restored.theme);
+                self.saved = self.snapshot(project::theme_of(restored.theme));
                 self.prefs.remember(path);
-                self.state.last_error = None;
+                self.state.last_error = layout_warning;
             }
             Err(error) => {
                 // A project that will not open is one that should stop being
@@ -140,7 +146,7 @@ impl SimApp {
 
     fn start_new(&mut self, ctx: &Context) {
         self.stop_everything();
-        self.state = AppState::default();
+        self.state = Session::default();
         let mut monitors = BTreeMap::new();
         self.dock_state = project::default_layout(&mut monitors);
         self.state.restore_monitors(monitors);
@@ -171,9 +177,10 @@ impl SimApp {
         // Set first: what the file holds depends on where it sits, paths inside
         // it being relative to it.
         self.path = Some(path.to_path_buf());
-        let project = Project::capture(&self.state, &self.dock_state, ctx.theme(), Some(path));
+        let described = project::capture(&self.state, &self.dock_state, ctx.theme(), Some(path));
+        let written = described.and_then(|project| project.write(path));
 
-        match project.write(path) {
+        match written {
             Ok(()) => {
                 self.saved = self.snapshot(ctx.theme());
                 self.prefs.remember(path);
@@ -214,73 +221,6 @@ impl SimApp {
             self.pending = Some(action);
         } else {
             self.go_ahead(ctx, action);
-        }
-    }
-
-    fn apply_events(&mut self) {
-        // Said once per pass rather than at each of the ten places a command is
-        // given: a refused Send is a frame that never went out, and silence
-        // there reads as a test that passed.
-        let dropped = self.engine.take_dropped();
-        if dropped > 0 {
-            self.state.last_error = Some(format!(
-                "the engine is too busy: {dropped} command(s) were not carried out"
-            ));
-        }
-
-        for event in self.engine.drain_events() {
-            match event {
-                Event::ConnectionStatus { id, status } => {
-                    if let Some(entry) = self.state.connection_mut(&id) {
-                        entry.status = status;
-                    }
-                }
-                Event::FrameSent {
-                    id,
-                    bytes,
-                    timestamp,
-                } => {
-                    self.state.push_log(LogEntry {
-                        seq: 0,
-                        id,
-                        direction: Direction::Sent,
-                        bytes,
-                        source: None,
-                        timestamp,
-                    });
-                }
-                Event::FrameReceived {
-                    id,
-                    bytes,
-                    source,
-                    timestamp,
-                } => {
-                    self.state.push_log(LogEntry {
-                        seq: 0,
-                        id,
-                        direction: Direction::Received,
-                        bytes,
-                        source,
-                        timestamp,
-                    });
-                }
-                Event::Error { id, error } => {
-                    self.state.record_error(id, &error);
-                }
-                Event::ScenarioStep { name, step, pass } => {
-                    self.state
-                        .running
-                        .insert(name, crate::state::ScenarioRun { step, pass });
-                }
-                Event::ScenarioFinished { name, outcome } => {
-                    self.state.running.remove(&name);
-                    // A scenario that gave up says why, where a scenario that
-                    // simply ran out has nothing to report.
-                    if let sim_core::Outcome::Failed(reason) = outcome {
-                        self.state.last_error = Some(format!("[{name}] {reason}"));
-                    }
-                }
-            }
         }
     }
 
@@ -512,7 +452,7 @@ impl eframe::App for SimApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::sync_row_height(ui);
-        self.apply_events();
+        self.engine.drain_into(&mut self.state);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
         let dirty = self.is_dirty(ctx.theme());
