@@ -333,6 +333,7 @@ impl ActionKind {
                 frame: frame.unwrap_or_default().to_owned(),
                 with: BTreeMap::new(),
                 counters: BTreeMap::new(),
+                from_capture: BTreeMap::new(),
             },
             // One byte rather than none: an empty `raw` is not a step the
             // loader accepts, and a half-made step must never be unsavable.
@@ -344,6 +345,7 @@ impl ActionKind {
                 expect: Expect::Frame {
                     frame: frame.unwrap_or_default().to_owned(),
                     values: BTreeMap::new(),
+                    capture: BTreeMap::new(),
                 },
                 timeout: Some(Duration::from_millis(500)),
             },
@@ -460,6 +462,7 @@ pub fn set_frame(step: &mut Step, name: &str) {
         frame,
         with,
         counters,
+        from_capture,
     } = &mut step.action
     else {
         return;
@@ -470,6 +473,7 @@ pub fn set_frame(step: &mut Step, name: &str) {
     name.clone_into(frame);
     with.clear();
     counters.clear();
+    from_capture.clear();
 }
 
 /// Starts or stops overriding one field of a `send` step.
@@ -478,7 +482,10 @@ pub fn set_frame(step: &mut Step, name: &str) {
 /// that would go out anyway and the technician changes it from there rather
 /// than from zero.
 pub fn set_override(step: &mut Step, frame: &FrameDef, field: &str, on: bool) {
-    let Action::Send { with, .. } = &mut step.action else {
+    let Action::Send {
+        with, from_capture, ..
+    } = &mut step.action
+    else {
         return;
     };
     if on {
@@ -486,6 +493,8 @@ pub fn set_override(step: &mut Step, frame: &FrameDef, field: &str, on: bool) {
         if let Some(value) = seeded.get(field) {
             with.insert(field.to_owned(), value.clone());
         }
+        // A field cannot be held at a value and filled from a capture too.
+        from_capture.remove(field);
     } else {
         with.remove(field);
     }
@@ -493,7 +502,13 @@ pub fn set_override(step: &mut Step, frame: &FrameDef, field: &str, on: bool) {
 
 /// Starts or stops counting one field of a `send` step up on every pass.
 pub fn set_counter(step: &mut Step, field: &str, on: bool) {
-    let Action::Send { counters, with, .. } = &mut step.action else {
+    let Action::Send {
+        counters,
+        with,
+        from_capture,
+        ..
+    } = &mut step.action
+    else {
         return;
     };
     if on {
@@ -505,10 +520,38 @@ pub fn set_counter(step: &mut Step, field: &str, on: bool) {
                 wrap: None,
             },
         );
-        // A field cannot be both held at a value and counted up from it.
+        // A field cannot be both held at a value and counted up from it, or
+        // filled from a capture and counted up from it.
         with.remove(field);
+        from_capture.remove(field);
     } else {
         counters.remove(field);
+    }
+}
+
+/// Starts or stops filling one field of a `send` step from a variable an
+/// earlier step captured.
+pub fn set_from_capture(step: &mut Step, field: &str, variable: Option<&str>) {
+    let Action::Send {
+        with,
+        counters,
+        from_capture,
+        ..
+    } = &mut step.action
+    else {
+        return;
+    };
+    match variable {
+        Some(variable) => {
+            from_capture.insert(field.to_owned(), variable.to_owned());
+            // A field cannot be filled from a capture and also held at a
+            // value or counted up from it.
+            with.remove(field);
+            counters.remove(field);
+        }
+        None => {
+            from_capture.remove(field);
+        }
     }
 }
 
@@ -532,6 +575,64 @@ pub fn set_match(step: &mut Step, frame: &FrameDef, field: &str, on: bool) {
     }
 }
 
+/// Starts or stops remembering one field of a matched frame as a variable,
+/// named after the field to start with and free to be renamed from there.
+pub fn set_capture(step: &mut Step, field: &str, on: bool) {
+    let Action::WaitFor {
+        expect: Expect::Frame { capture, .. },
+        ..
+    } = &mut step.action
+    else {
+        return;
+    };
+    if on {
+        capture.insert(field.to_owned(), field.to_owned());
+    } else {
+        capture.remove(field);
+    }
+}
+
+/// Renames the variable a captured field is stored as.
+pub fn rename_capture(step: &mut Step, field: &str, name: &str) {
+    let Action::WaitFor {
+        expect: Expect::Frame { capture, .. },
+        ..
+    } = &mut step.action
+    else {
+        return;
+    };
+    if let Some(held) = capture.get_mut(field) {
+        name.clone_into(held);
+    }
+}
+
+/// Every variable a step at `index` could read from, which is every one an
+/// earlier step's `wait_for` captures.
+///
+/// Forward only, in file order: a run reaches step `index` having executed
+/// every step before it and none after, so a name introduced later is not
+/// there yet, whatever the file's own order of `[[scenario.step]]` sections
+/// might suggest otherwise.
+#[must_use]
+pub fn captured_before(scenario: &Scenario, index: usize) -> Vec<String> {
+    let mut names: Vec<String> = scenario
+        .steps
+        .iter()
+        .take(index)
+        .filter_map(|step| match &step.action {
+            Action::WaitFor {
+                expect: Expect::Frame { capture, .. },
+                ..
+            } => Some(capture.values().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// Swaps a wait between naming a frame and spelling out bytes, keeping nothing
 /// from the other form since the two have nothing in common.
 pub fn set_wait_by_frame(step: &mut Step, by_frame: bool, frame: Option<&str>) {
@@ -542,6 +643,7 @@ pub fn set_wait_by_frame(step: &mut Step, by_frame: bool, frame: Option<&str>) {
         Expect::Frame {
             frame: frame.unwrap_or_default().to_owned(),
             values: BTreeMap::new(),
+            capture: BTreeMap::new(),
         }
     } else {
         Expect::Pattern {
@@ -709,11 +811,16 @@ pub fn describe(step: &Step) -> String {
             frame,
             with,
             counters,
+            from_capture,
         } => {
             let mut text = format!("send {frame}");
             if !with.is_empty() {
                 let fields: Vec<&str> = with.keys().map(String::as_str).collect();
                 let _ = write!(text, " with {}", fields.join(", "));
+            }
+            if !from_capture.is_empty() {
+                let fields: Vec<&str> = from_capture.keys().map(String::as_str).collect();
+                let _ = write!(text, " filling {} from capture", fields.join(", "));
             }
             if !counters.is_empty() {
                 let fields: Vec<&str> = counters.keys().map(String::as_str).collect();
@@ -728,9 +835,21 @@ pub fn describe(step: &Step) -> String {
         Action::Wait { delay } => format!("wait {} ms", delay.as_millis()),
         Action::WaitFor { expect, timeout } => {
             let mut text = match expect {
-                Expect::Frame { frame, values } => {
-                    let named: Vec<&str> = values.keys().map(String::as_str).collect();
-                    format!("wait for {frame} matching {}", named.join(", "))
+                Expect::Frame {
+                    frame,
+                    values,
+                    capture,
+                } => {
+                    let mut text = format!("wait for {frame}");
+                    if !values.is_empty() {
+                        let named: Vec<&str> = values.keys().map(String::as_str).collect();
+                        let _ = write!(text, " matching {}", named.join(", "));
+                    }
+                    if !capture.is_empty() {
+                        let named: Vec<&str> = capture.keys().map(String::as_str).collect();
+                        let _ = write!(text, " capturing {}", named.join(", "));
+                    }
+                    text
                 }
                 Expect::Pattern { pattern, anchor } => {
                     let mut text = format!("wait for {}", pattern.to_hex());
@@ -992,6 +1111,7 @@ raw = "01"
                         expect: Expect::Frame {
                             frame: "Telemetry".to_owned(),
                             values: BTreeMap::new(),
+                            capture: BTreeMap::new(),
                         },
                         timeout: None,
                     };
@@ -1255,6 +1375,7 @@ counters = { seq = { wrap = 255 } }
             frame,
             with,
             counters,
+            ..
         } = &step.action
         else {
             panic!("expected a send");
@@ -1325,7 +1446,7 @@ type = "u8"
         ));
         set_wait_by_frame(step, true, Some("Status"));
         let Action::WaitFor {
-            expect: Expect::Frame { frame, values },
+            expect: Expect::Frame { frame, values, .. },
             ..
         } = &step.action
         else {

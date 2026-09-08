@@ -94,6 +94,15 @@ pub enum StepError {
 
     #[error("{hex} is not an even run of hex digits")]
     BadBytes { hex: String },
+
+    #[error("captures a field, but has {targets} targets; only one answer would be kept")]
+    CaptureNeedsOneTarget { targets: usize },
+
+    #[error("captures a field, but a hex pattern has none to capture by name")]
+    CaptureNeedsAFrame,
+
+    #[error("{field} is filled from {variable}, which no earlier step captures")]
+    UnknownVariable { field: String, variable: String },
 }
 
 /// A scenario as the engine runs it.
@@ -164,6 +173,8 @@ pub enum Action {
         with: BTreeMap<String, Value>,
         /// Fields that count up on every pass, by name.
         counters: BTreeMap<String, Counter>,
+        /// Fields filled from a variable an earlier step captured, by name.
+        from_capture: BTreeMap<String, String>,
     },
     /// Send bytes as they are, for the malformed frame a definition cannot
     /// express.
@@ -208,6 +219,15 @@ pub enum Expect {
     Frame {
         frame: String,
         values: BTreeMap<String, Value>,
+        /// Fields to remember once this matches, as a variable name a later
+        /// step's `from_capture` can read back.
+        ///
+        /// Only sayable here, where the reply names a frame: a wait aimed at
+        /// several targets could answer with several different values for the
+        /// same field, and a raw byte pattern has no field names to remember
+        /// by. Both are refused at load, rather than picking one answer to
+        /// keep in silence.
+        capture: BTreeMap<String, String>,
     },
 }
 
@@ -313,6 +333,8 @@ struct RawStep {
     with: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     counters: BTreeMap<String, RawCounter>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    from_capture: BTreeMap<String, String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     raw: Option<String>,
@@ -342,6 +364,8 @@ struct RawWaitFor {
     frame: Option<String>,
     #[serde(default, rename = "match", skip_serializing_if = "BTreeMap::is_empty")]
     match_values: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    capture: BTreeMap<String, String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
@@ -647,6 +671,7 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
             frame,
             with,
             counters,
+            from_capture,
         } => {
             raw.send = Some(frame.clone());
             raw.with = with.clone();
@@ -663,6 +688,7 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
                     )
                 })
                 .collect();
+            raw.from_capture.clone_from(from_capture);
         }
         Action::Raw { bytes } => {
             raw.raw = Some(
@@ -684,9 +710,14 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
                     wait.hex = Some(pattern.to_hex());
                     wait.at = anchor.offset();
                 }
-                Expect::Frame { frame, values } => {
+                Expect::Frame {
+                    frame,
+                    values,
+                    capture,
+                } => {
                     wait.frame = Some(frame.clone());
                     wait.match_values.clone_from(values);
+                    wait.capture.clone_from(capture);
                 }
             }
             raw.wait_for = Some(wait);
@@ -714,20 +745,40 @@ fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
         .as_ref()
         .map(RawTargets::names)
         .unwrap_or_default();
-    let steps = raw
-        .steps
-        .into_iter()
-        .enumerate()
-        .map(|(index, step)| {
-            build_step(step, &default).map_err(|reason| ScenarioError::Step {
-                name: name.clone(),
-                // Counted from one: the file is read by people, and the first
-                // step is the first one.
-                step: index + 1,
-                reason,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+
+    // Known only forward, the same order a run reaches them in: a later step
+    // reading a variable an earlier one never captures is refused here rather
+    // than failing mid run.
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut steps = Vec::with_capacity(raw.steps.len());
+    for (index, raw_step) in raw.steps.into_iter().enumerate() {
+        let wrap = |reason| ScenarioError::Step {
+            name: name.clone(),
+            // Counted from one: the file is read by people, and the first
+            // step is the first one.
+            step: index + 1,
+            reason,
+        };
+        let step = build_step(raw_step, &default).map_err(wrap)?;
+        if let Action::Send { from_capture, .. } = &step.action {
+            for (field, variable) in from_capture {
+                if !known.contains(variable) {
+                    return Err(wrap(StepError::UnknownVariable {
+                        field: field.clone(),
+                        variable: variable.clone(),
+                    }));
+                }
+            }
+        }
+        if let Action::WaitFor {
+            expect: Expect::Frame { capture, .. },
+            ..
+        } = &step.action
+        {
+            known.extend(capture.values().cloned());
+        }
+        steps.push(step);
+    }
 
     let repeat = match raw.repeat {
         // A zero period is not a fast scenario, it is a scenario with no clock:
@@ -746,6 +797,43 @@ fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
         description: raw.description,
         steps,
         repeat,
+    })
+}
+
+fn build_wait_for(wait: RawWaitFor) -> Result<Action, StepError> {
+    let expect = match (wait.hex, wait.frame) {
+        (Some(_), Some(_)) => return Err(StepError::AmbiguousWait),
+        (None, None) => return Err(StepError::EmptyWait),
+        (Some(hex), None) => {
+            if !wait.match_values.is_empty() {
+                return Err(StepError::AmbiguousWait);
+            }
+            if !wait.capture.is_empty() {
+                return Err(StepError::CaptureNeedsAFrame);
+            }
+            let spec = PatternSpec { hex, at: wait.at };
+            let (pattern, anchor) = spec.compile().ok_or_else(|| StepError::BadPattern {
+                hex: spec.hex.clone(),
+            })?;
+            Expect::Pattern { pattern, anchor }
+        }
+        (None, Some(frame)) => {
+            if wait.at.is_some() {
+                return Err(StepError::PointlessOffset);
+            }
+            if wait.match_values.is_empty() && wait.capture.is_empty() {
+                return Err(StepError::NoFieldsToMatch);
+            }
+            Expect::Frame {
+                frame,
+                values: wait.match_values,
+                capture: wait.capture,
+            }
+        }
+    };
+    Ok(Action::WaitFor {
+        expect,
+        timeout: wait.timeout_ms.map(Duration::from_millis),
     })
 }
 
@@ -778,6 +866,7 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
                     )
                 })
                 .collect(),
+            from_capture: raw.from_capture,
         }
     } else if let Some(hex) = raw.raw {
         Action::Raw {
@@ -788,36 +877,7 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
             delay: Duration::from_millis(delay),
         }
     } else if let Some(wait) = raw.wait_for {
-        let expect = match (wait.hex, wait.frame) {
-            (Some(_), Some(_)) => return Err(StepError::AmbiguousWait),
-            (None, None) => return Err(StepError::EmptyWait),
-            (Some(hex), None) => {
-                if !wait.match_values.is_empty() {
-                    return Err(StepError::AmbiguousWait);
-                }
-                let spec = PatternSpec { hex, at: wait.at };
-                let (pattern, anchor) = spec.compile().ok_or_else(|| StepError::BadPattern {
-                    hex: spec.hex.clone(),
-                })?;
-                Expect::Pattern { pattern, anchor }
-            }
-            (None, Some(frame)) => {
-                if wait.at.is_some() {
-                    return Err(StepError::PointlessOffset);
-                }
-                if wait.match_values.is_empty() {
-                    return Err(StepError::NoFieldsToMatch);
-                }
-                Expect::Frame {
-                    frame,
-                    values: wait.match_values,
-                }
-            }
-        };
-        Action::WaitFor {
-            expect,
-            timeout: wait.timeout_ms.map(Duration::from_millis),
-        }
+        build_wait_for(wait)?
     } else {
         return Err(StepError::Empty);
     };
@@ -847,6 +907,19 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
     }
     if targets.is_empty() {
         return Err(StepError::NoConnection);
+    }
+    // One answer to keep, not one merged from several: a second target
+    // could legitimately disagree on the very field being remembered.
+    if let Action::WaitFor {
+        expect: Expect::Frame { capture, .. },
+        ..
+    } = &action
+    {
+        if !capture.is_empty() && targets.len() != 1 {
+            return Err(StepError::CaptureNeedsOneTarget {
+                targets: targets.len(),
+            });
+        }
     }
 
     Ok(Step { targets, action })
@@ -1477,7 +1550,7 @@ on = "bus"
 wait_for = { frame = "Telemetry", match = { sync = 43605, mode = 3 }, timeout_ms = 500 }
 "#);
         let Action::WaitFor {
-            expect: Expect::Frame { frame, values },
+            expect: Expect::Frame { frame, values, .. },
             timeout: Some(_),
         } = &scenario.steps[0].action
         else {
@@ -1501,6 +1574,122 @@ wait_for = { frame = "Telemetry", match = { sync = 43605 }, timeout_ms = 500 }
 wait_for = { hex = "C0 ?? FE", at = 1 }
 "#,
         );
+    }
+
+    #[test]
+    fn a_field_a_wait_captures_can_fill_a_later_send() {
+        let scenario = one(r#"
+[[scenario]]
+name = "Relay"
+
+[[scenario.step]]
+send = "Request"
+on = "server1"
+
+[[scenario.step]]
+wait_for = { frame = "Response", capture = { code = "server1_code" }, timeout_ms = 4000 }
+on = "server1"
+
+[[scenario.step]]
+send = "Forward"
+on = "server2"
+from_capture = { payload = "server1_code" }
+"#);
+        let Action::WaitFor {
+            expect: Expect::Frame { capture, .. },
+            ..
+        } = &scenario.steps[1].action
+        else {
+            panic!("expected a frame wait");
+        };
+        assert_eq!(capture["code"], "server1_code");
+
+        let Action::Send { from_capture, .. } = &scenario.steps[2].action else {
+            panic!("expected a send");
+        };
+        assert_eq!(from_capture["payload"], "server1_code");
+
+        round_trips(
+            r#"
+[[scenario]]
+name = "Relay"
+
+[[scenario.step]]
+send = "Request"
+on = "server1"
+
+[[scenario.step]]
+wait_for = { frame = "Response", capture = { code = "server1_code" }, timeout_ms = 4000 }
+on = "server1"
+
+[[scenario.step]]
+send = "Forward"
+on = "server2"
+from_capture = { payload = "server1_code" }
+"#,
+        );
+    }
+
+    /// A capture needs a frame to decode by, needs one target to have a single
+    /// answer to keep, and a `from_capture` needs the variable it names to have
+    /// been captured by an earlier step, not a later one and not never.
+    #[test]
+    fn capturing_is_refused_where_it_would_not_make_sense() {
+        for (label, text, expected) in [
+            (
+                "capture with a hex pattern",
+                r#"
+[[scenario]]
+name = "W"
+on = "bus"
+[[scenario.step]]
+wait_for = { hex = "AA55", capture = { code = "x" } }
+"#,
+                "none to capture by name",
+            ),
+            (
+                "capture with two targets",
+                r#"
+[[scenario]]
+name = "W"
+on = ["a", "b"]
+[[scenario.step]]
+wait_for = { frame = "Telemetry", capture = { sync = "x" } }
+"#,
+                "2 targets",
+            ),
+            (
+                "from_capture naming a variable nothing captures",
+                r#"
+[[scenario]]
+name = "W"
+on = "bus"
+[[scenario.step]]
+send = "Telemetry"
+from_capture = { mode = "never_captured" }
+"#,
+                "never_captured",
+            ),
+            (
+                "from_capture naming a variable a later step captures",
+                r#"
+[[scenario]]
+name = "W"
+on = "bus"
+[[scenario.step]]
+send = "Telemetry"
+from_capture = { mode = "later" }
+[[scenario.step]]
+wait_for = { frame = "Telemetry", capture = { sync = "later" } }
+"#,
+                "later",
+            ),
+        ] {
+            let error = from_toml(text)
+                .expect_err(&format!("{label} should be refused"))
+                .to_string();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
     }
 
     #[test]

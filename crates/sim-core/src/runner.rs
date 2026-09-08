@@ -78,6 +78,10 @@ pub(crate) async fn run(mut context: Context) -> Outcome {
             ticker.tick().await;
         }
 
+        // Fresh every pass: a value a repeat's earlier pass captured has
+        // nothing to do with the reply this one is about to wait for.
+        let mut variables: BTreeMap<String, Value> = BTreeMap::new();
+
         for (index, step) in scenario.steps.iter().enumerate() {
             let _ = context
                 .events
@@ -95,6 +99,7 @@ pub(crate) async fn run(mut context: Context) -> Outcome {
                 &context.frames,
                 &context.commands,
                 &mut context.received,
+                &mut variables,
             )
             .await
             {
@@ -125,6 +130,7 @@ async fn execute(
     frames: &[FrameDef],
     commands: &mpsc::WeakSender<Command>,
     received: &mut broadcast::Receiver<Heard>,
+    variables: &mut BTreeMap<String, Value>,
 ) -> StepResult {
     match &step.action {
         Action::Wait { delay } => {
@@ -136,7 +142,8 @@ async fn execute(
             frame,
             with,
             counters,
-        } => match encode(frame, with, counters, pass, frames) {
+            from_capture,
+        } => match encode(frame, with, counters, from_capture, variables, pass, frames) {
             // The same bytes to every target, so two links carrying the same
             // simulated device see the same counter on the same pass.
             Ok(bytes) => send_to_all(commands, &step.targets, &bytes).await,
@@ -151,6 +158,17 @@ async fn execute(
                 Err(reason) => return StepResult::Failed(reason),
             };
             let (pattern, anchor) = (&pattern, &anchor);
+
+            // Non-empty only on a single target, enforced at load: there is
+            // exactly one answer here to decode and remember.
+            let capturing = match expect {
+                Expect::Frame { frame, capture, .. } if !capture.is_empty() => frames
+                    .iter()
+                    .find(|held| &held.name == frame)
+                    .map(|held| (held, capture)),
+                _ => None,
+            };
+
             // Started from where the stream is now, not from where the scenario
             // subscribed. Held across steps, the buffer would let a frame from
             // an earlier pass, or from before this wait was ever reached,
@@ -172,6 +190,9 @@ async fn execute(
                         Ok((id, bytes)) => {
                             if pattern.found_in(&bytes, *anchor) {
                                 pending.remove(&id);
+                                if let Some((frame, capture)) = capturing {
+                                    store_capture(frame, capture, &bytes, variables);
+                                }
                             }
                         }
                         // Frames arrived faster than this step could look at
@@ -255,7 +276,7 @@ async fn send(
 fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor), String> {
     match expect {
         Expect::Pattern { pattern, anchor } => Ok((pattern.clone(), *anchor)),
-        Expect::Frame { frame, values } => {
+        Expect::Frame { frame, values, .. } => {
             let definition = frames
                 .iter()
                 .find(|known| &known.name == frame)
@@ -286,12 +307,16 @@ fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor),
     }
 }
 
-/// The frame's own defaults, overlaid with what the step overrides and what its
-/// counters have reached.
+/// The frame's own defaults, overlaid with what the step overrides, what an
+/// earlier step captured, and what its counters have reached, in that order:
+/// a counter is the one source that changes every pass, so it wins if a field
+/// is somehow named in more than one.
 fn encode(
     name: &str,
     with: &BTreeMap<String, Value>,
     counters: &BTreeMap<String, Counter>,
+    from_capture: &BTreeMap<String, String>,
+    variables: &BTreeMap<String, Value>,
     pass: u32,
     frames: &[FrameDef],
 ) -> Result<Vec<u8>, String> {
@@ -301,6 +326,17 @@ fn encode(
         .ok_or_else(|| format!("no frame named {name}"))?;
 
     let mut values = overlaid(frame, with)?;
+    for (field, variable) in from_capture {
+        let kind = field_kind(frame, field)?;
+        let held = variables
+            .get(variable)
+            .ok_or_else(|| format!("{name}.{field} is filled from {variable}, which is not set"))?;
+        let coerced = held
+            .clone()
+            .coerced_to(kind)
+            .ok_or_else(|| format!("{name}.{field} cannot hold {}", held.type_name()))?;
+        values.insert(field.clone(), coerced);
+    }
     for (field, counter) in counters {
         let kind = field_kind(frame, field)?;
         let value = Value::Uint(counter.at(u64::from(pass)))
@@ -310,6 +346,29 @@ fn encode(
     }
 
     codec::encode(frame, &values).map_err(|error| error.to_string())
+}
+
+/// Remembers the fields a matched frame asked to keep, decoded against the
+/// frame the wait already knows how to read.
+///
+/// A frame that will not decode, or a field with no counterpart in the frame,
+/// leaves the variable unset rather than the run: `encode` reports the gap by
+/// name when a later step actually reaches for it, which is a clearer failure
+/// than one raised here about a reply nothing yet needs.
+fn store_capture(
+    frame: &FrameDef,
+    capture: &BTreeMap<String, String>,
+    bytes: &[u8],
+    variables: &mut BTreeMap<String, Value>,
+) {
+    let Ok(decoded) = codec::decode(frame, bytes) else {
+        return;
+    };
+    for (field, variable) in capture {
+        if let Some(value) = decoded.values.get(field) {
+            variables.insert(variable.clone(), value.clone());
+        }
+    }
 }
 
 /// The frame's own defaults with `given` laid over them.
