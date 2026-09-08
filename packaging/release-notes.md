@@ -15,6 +15,11 @@ Open**, or `xattr -dr com.apple.quarantine /Applications/ProtocolSimulator.app`.
 
 The app takes one optional argument, a frames folder or a project file.
 
+**Terminal front end, aarch64 Linux.** `tar xzf
+protocol-simulator-tui-linux-aarch64.tar.gz`, copy `protocol-simulator-tui` to
+the board, then run it there. Statically linked, so it asks nothing of the
+board's own libc.
+
 ## Documentation
 
 [README](https://github.com/tdameros/protocol-simulator#readme) for the

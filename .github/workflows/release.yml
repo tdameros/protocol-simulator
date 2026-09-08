@@ -67,7 +67,9 @@ jobs:
           fi
 
   build:
-    name: ${{ matrix.os }}
+    # Two jobs share an `os`, an aarch64 Linux board having none of its own to
+    # run on, so the display name is its own field rather than the runner's.
+    name: ${{ matrix.name }}
     needs: version
     runs-on: ${{ matrix.os }}
     strategy:
@@ -84,9 +86,11 @@ jobs:
           # 12 and Fedora 36 as well. Not RHEL 9, which ships 2.34: going that
           # low would mean an older image again, or building in a container.
           - os: ubuntu-22.04
+            name: linux-x86_64
             artifact: protocol-simulator-linux-x86_64.tar.gz
             rustflags: ""
           - os: windows-2025
+            name: windows-x86_64
             artifact: protocol-simulator-windows-x86_64.exe
             # Statically linked CRT, so the exe needs no Visual C++
             # redistributable. Set for the whole job rather than the build step:
@@ -95,8 +99,18 @@ jobs:
           # arm64, like macos-latest. Both slices of the universal binary are
           # cross-compiled from here anyway.
           - os: macos-26
+            name: macos-universal
             artifact: protocol-simulator-macos-universal.zip
             rustflags: ""
+          # The terminal front end only, cross-compiled the same way
+          # `make tui-embedded` does it locally: no board of its own runs
+          # this, and a static musl binary asks nothing of whatever board
+          # it lands on.
+          - os: ubuntu-24.04
+            name: linux-aarch64-tui
+            artifact: protocol-simulator-tui-linux-aarch64.tar.gz
+            rustflags: ""
+            embedded: true
 
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -110,6 +124,9 @@ jobs:
           rustup update stable --no-self-update
           rustup default stable
 
+      # Needed even here: the test step below builds the whole workspace
+      # natively, sim-gui included, regardless of which artifact this job
+      # packages.
       - name: Install desktop libraries
         if: runner.os == 'Linux'
         run: |
@@ -120,18 +137,31 @@ jobs:
 
       # ci.yml only guards main, and a release can be cut from any commit. This
       # is the gate that makes the artifact itself trustworthy, so it runs
-      # before anything is packaged and in the profile that ships.
+      # before anything is packaged and in the profile that ships. Native, on
+      # every runner including this one: the workspace's own tests never touch
+      # the aarch64 target this job cross-compiles for.
       - name: Test
         run: cargo test --workspace --release --locked
 
       - name: Build and package (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.embedded
         run: |
           cargo build --release --locked -p sim-gui
           cp THIRD-PARTY.md target/release/
           # tar rather than a bare file, because it carries the executable bit
           # that a browser download would otherwise strip.
           tar -C target/release -czf "${{ matrix.artifact }}" "$BIN" THIRD-PARTY.md
+
+      - name: Build and package (TUI aarch64)
+        if: matrix.embedded
+        run: |
+          pip3 install --user ziglang
+          cargo install cargo-zigbuild --locked
+          rustup target add aarch64-unknown-linux-musl
+          cargo zigbuild --release --locked -p sim-tui --target aarch64-unknown-linux-musl
+          cp THIRD-PARTY.md target/aarch64-unknown-linux-musl/release/
+          tar -C target/aarch64-unknown-linux-musl/release -czf "${{ matrix.artifact }}" \
+            protocol-simulator-tui THIRD-PARTY.md
 
       - name: Build and package (Windows)
         if: runner.os == 'Windows'
