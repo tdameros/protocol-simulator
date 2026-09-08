@@ -50,4 +50,6 @@ Documentation is reference material. No semicolons, no dashes as punctuation,
 no filler. A table beats a paragraph.
 
 Commits are small and their subject follows the conventional prefixes `feat:`,
-`fix:`, `chore:`, `test:`, `docs:` and `refactor:`. Subject only.
+`fix:`, `chore:`, `test:`, `docs:` and `refactor:`. Subject line only, one
+line, no body. Whatever explains the change goes in the subject itself or gets
+left out, never in a paragraph underneath.
