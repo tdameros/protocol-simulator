@@ -16,10 +16,10 @@ not start.
 
 | Step | Key | Carries |
 | --- | --- | --- |
-| send a frame | `send` | `with`, values overriding the defaults, and `counters` |
+| send a frame | `send` | `with`, values overriding the defaults, `counters`, and `from_capture` |
 | send raw bytes | `raw` | a hex string |
 | wait | `wait_ms` | a delay in milliseconds |
-| wait for | `wait_for` | a frame and its expected values, or a hex pattern, plus `timeout_ms` |
+| wait for | `wait_for` | a frame, its expected values and what to capture, or a hex pattern, plus `timeout_ms` |
 
 `wait_for` takes one of two shapes:
 
@@ -33,6 +33,38 @@ editing the frame afterwards leaves the wait meaning the same thing. Fields left
 out of `match` are unconstrained. `??` in a hex pattern matches any byte, and
 `at` pins it to a byte offset. The two shapes are exclusive, and a wait needs
 one of them.
+
+## Captures
+
+A field a `wait_for` reads back can be remembered under a name of its own, for
+a later step to send on, on any connection.
+
+```toml
+[[scenario.step]]
+send = "Request"
+on = "server1"
+
+[[scenario.step]]
+wait_for = { frame = "Response", capture = { code = "server1_code" } }
+on = "server1"
+
+[[scenario.step]]
+send = "Forward"
+on = "server2"
+from_capture = { payload = "server1_code" }
+```
+
+`capture` names, on the left, a field of the frame being waited for. On the
+right is the variable it becomes. `from_capture` on a later `send` step names,
+on the left, one of that frame's own fields, filled with whatever the variable
+on the right last held.
+
+A capture needs a frame to decode by, so it is refused on a hex pattern wait.
+It also needs one target, an answer from a second one having nothing to do
+with the first. `from_capture` is refused where it names a variable no earlier
+step captures, caught when the scenario loads rather than partway through a
+run. A variable is remembered for one pass and is gone before the next repeat
+starts, so a step reading it always reads what this pass captured.
 
 ## Targets
 
