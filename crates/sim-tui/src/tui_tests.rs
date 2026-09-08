@@ -2622,3 +2622,179 @@ fn a_step_overriding_a_wide_frame_scrolls_to_keep_the_focus_on_screen() {
         "and the first scrolled out to make room: {shown}"
     );
 }
+
+const RESPONSE: &str = r#"
+name = "Response"
+[[field]]
+name = "code"
+type = "u8"
+"#;
+
+const FORWARD: &str = r#"
+name = "Forward"
+[[field]]
+name = "payload"
+type = "u8"
+"#;
+
+fn with_relay_frames(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-relay-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("response.toml"), RESPONSE).expect("a frame file");
+    std::fs::write(dir.join("forward.toml"), FORWARD).expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+}
+
+/// Nothing offered to fill from until something has captured a variable, and
+/// once something has, the picker starts on the one variable in scope.
+#[test]
+fn capturing_a_replys_field_lets_a_later_send_fill_from_it() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_relay_frames(
+        &mut app,
+        "capturing_a_replys_field_lets_a_later_send_fill_from_it",
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a'));
+    // cursor already sits on the new (second) step
+
+    // Step 2: a Send of Forward. Nothing captures yet, so "c" does nothing.
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Left); // Raw -> Send
+    press(&mut app, KeyCode::Down); // bus target
+    press(&mut app, KeyCode::Down); // Frame row
+    press(&mut app, KeyCode::Right); // Response
+    press(&mut app, KeyCode::Right); // Forward
+    press(&mut app, KeyCode::Down); // payload row
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        screen(&mut app).contains("frame default"),
+        "nothing to capture from yet: {}",
+        screen(&mut app)
+    );
+    press(&mut app, KeyCode::Esc);
+
+    // Step 1: a WaitFor of Response, capturing "code".
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait -> WaitFor
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, wait-by-frame, Frame
+    }
+    press(&mut app, KeyCode::Right); // Response
+    press(&mut app, KeyCode::Down); // code row
+    press(&mut app, KeyCode::Right); // capture it
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("capture as code"),
+        "captured under its own name to start with: {shown}"
+    );
+
+    for _ in 0.."code".len() {
+        press(&mut app, KeyCode::Backspace);
+    }
+    for letter in "server1_code".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    assert!(
+        screen(&mut app).contains("capture as server1_code"),
+        "{}",
+        screen(&mut app)
+    );
+    press(&mut app, KeyCode::Esc);
+
+    // Step 2 again: "c" on payload now has a variable to offer.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, Frame, payload
+    }
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        screen(&mut app).contains("from capture: server1_code"),
+        "the one variable in scope is picked automatically: {}",
+        screen(&mut app)
+    );
+}
+
+/// With more than one variable in scope, left and right cycle between them
+/// rather than only ever offering the first.
+#[test]
+fn cycling_a_captured_field_picks_a_different_variable() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_relay_frames(
+        &mut app,
+        "cycling_a_captured_field_picks_a_different_variable",
+    );
+    app.session_mut()
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    {
+        let draft = app.session_mut().scenarios.draft.as_mut().unwrap();
+        let target = sim_core::ConnectionId::from("bus");
+        draft.scenario.steps = vec![
+            sim_core::scenario::Step {
+                targets: vec![target.clone()],
+                action: sim_core::scenario::Action::WaitFor {
+                    expect: sim_core::scenario::Expect::Frame {
+                        frame: "Response".to_owned(),
+                        values: std::collections::BTreeMap::default(),
+                        capture: std::collections::BTreeMap::from([(
+                            "code".to_owned(),
+                            "first".to_owned(),
+                        )]),
+                    },
+                    timeout: None,
+                },
+            },
+            sim_core::scenario::Step {
+                targets: vec![target.clone()],
+                action: sim_core::scenario::Action::WaitFor {
+                    expect: sim_core::scenario::Expect::Frame {
+                        frame: "Response".to_owned(),
+                        values: std::collections::BTreeMap::default(),
+                        capture: std::collections::BTreeMap::from([(
+                            "code".to_owned(),
+                            "second".to_owned(),
+                        )]),
+                    },
+                    timeout: None,
+                },
+            },
+            sim_core::scenario::Step {
+                targets: vec![target],
+                action: sim_core::scenario::Action::Send {
+                    frame: "Forward".to_owned(),
+                    with: std::collections::BTreeMap::default(),
+                    counters: std::collections::BTreeMap::default(),
+                    from_capture: std::collections::BTreeMap::default(),
+                },
+            },
+        ];
+    }
+    press(&mut app, KeyCode::Char('5'));
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Down); // Name, Description, Repeat, step1, step2, step3
+    }
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, Frame, payload
+    }
+    press(&mut app, KeyCode::Char('c'));
+    let first = screen(&mut app);
+    assert!(
+        first.contains("from capture: first"),
+        "the first variable in scope: {first}"
+    );
+
+    press(&mut app, KeyCode::Right);
+    let second = screen(&mut app);
+    assert!(
+        second.contains("from capture: second"),
+        "cycled to the other one: {second}"
+    );
+}

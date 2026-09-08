@@ -837,7 +837,7 @@ impl StepEdit {
                     frame,
                     with,
                     counters,
-                    ..
+                    from_capture,
                 } = &step.action
                 else {
                     return (String::new(), String::new());
@@ -850,6 +850,8 @@ impl StepEdit {
                 let counted = counters.contains_key(&field_def.name);
                 let value = if let Some(value) = overridden {
                     reading::describe(field_def, value, false)
+                } else if let Some(variable) = from_capture.get(&field_def.name) {
+                    format!("from capture: {variable}")
                 } else if counted {
                     "counted".to_owned()
                 } else {
@@ -948,7 +950,12 @@ impl StepEdit {
             }
             StepField::WaitField(i) => {
                 let Action::WaitFor {
-                    expect: Expect::Frame { frame, values },
+                    expect:
+                        Expect::Frame {
+                            frame,
+                            values,
+                            capture,
+                        },
                     ..
                 } = &step.action
                 else {
@@ -959,13 +966,16 @@ impl StepEdit {
                     return (String::new(), String::new());
                 };
                 let matched = values.contains_key(&field_def.name);
-                let value = if matched {
+                let mut value = if matched {
                     values
                         .get(&field_def.name)
                         .map_or_else(String::new, |v| reading::describe(field_def, v, false))
                 } else {
                     "any value".to_owned()
                 };
+                if let Some(variable) = capture.get(&field_def.name) {
+                    value = format!("{value} · capture as {variable}");
+                }
                 (format!("  {}", field_def.name), value)
             }
             StepField::Limited => {
@@ -1051,32 +1061,46 @@ impl StepEdit {
                     String::new()
                 }
             }
-            StepField::SendField(i) => {
-                if let Action::Send { frame, with, .. } = &step.action {
-                    let field_def = frames
-                        .iter()
-                        .find(|f| &f.name == frame)
-                        .and_then(|d| d.fields.get(*i));
-                    if let Some(field_def) = field_def {
-                        with.get(&field_def.name)
-                            .map_or_else(String::new, |value| match &field_def.kind {
-                                FieldKind::Bytes { .. } => {
-                                    value.as_bytes().map_or_else(String::new, hex::packed)
-                                }
-                                FieldKind::Text { .. } => {
-                                    value.as_text().unwrap_or_default().to_owned()
-                                }
-                                _ => reading::describe(field_def, value, false),
-                            })
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                }
-            }
+            StepField::SendField(i) => Self::reseed_send_field(*i, step, frames),
+            StepField::WaitField(i) => Self::reseed_wait_field(*i, step, frames),
             _ => String::new(),
         };
+    }
+
+    fn reseed_send_field(i: usize, step: &Step, frames: &[FrameDef]) -> String {
+        let Action::Send { frame, with, .. } = &step.action else {
+            return String::new();
+        };
+        let Some(field_def) = frames
+            .iter()
+            .find(|f| &f.name == frame)
+            .and_then(|d| d.fields.get(i))
+        else {
+            return String::new();
+        };
+        with.get(&field_def.name)
+            .map_or_else(String::new, |value| match &field_def.kind {
+                FieldKind::Bytes { .. } => value.as_bytes().map_or_else(String::new, hex::packed),
+                FieldKind::Text { .. } => value.as_text().unwrap_or_default().to_owned(),
+                _ => reading::describe(field_def, value, false),
+            })
+    }
+
+    fn reseed_wait_field(i: usize, step: &Step, frames: &[FrameDef]) -> String {
+        let Action::WaitFor {
+            expect: Expect::Frame { frame, capture, .. },
+            ..
+        } = &step.action
+        else {
+            return String::new();
+        };
+        frames
+            .iter()
+            .find(|f| &f.name == frame)
+            .and_then(|d| d.fields.get(i))
+            .and_then(|field_def| capture.get(&field_def.name))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -1702,6 +1726,7 @@ impl App {
                 ("Tab", "next field"),
                 ("left/right", "change"),
                 ("space", "toggle"),
+                ("c", "capture"),
                 ("type", "edit"),
                 ("Esc", "done"),
             ]);
@@ -3414,6 +3439,8 @@ impl App {
                             | StepField::WaitPattern
                             | StepField::WaitOffset
                             | StepField::TimeoutMs
+                            | StepField::SendField(_)
+                            | StepField::WaitField(_)
                     )
                 );
                 if reseed_kinds
@@ -3555,6 +3582,39 @@ impl App {
                 definition,
                 &field_def.name,
                 on,
+            );
+            return;
+        }
+        if matches!(code, KeyCode::Char('c')) {
+            let available = scenarios::captured_before(&draft.scenario, index);
+            if available.is_empty() {
+                return;
+            }
+            let Action::Send { from_capture, .. } = &step.action else {
+                return;
+            };
+            let on = !from_capture.contains_key(&field_def.name);
+            scenarios::set_from_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                on.then(|| available[0].as_str()),
+            );
+            return;
+        }
+        let Action::Send { from_capture, .. } = &step.action else {
+            return;
+        };
+        if let Some(variable) = from_capture.get(&field_def.name) {
+            let Some(delta) = arrow_delta(code) else {
+                return;
+            };
+            let available = scenarios::captured_before(&draft.scenario, index);
+            let choices: Vec<&String> = available.iter().collect();
+            let next = crate::connection_form::cycle(&choices, variable, delta).clone();
+            scenarios::set_from_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                Some(&next),
             );
             return;
         }
@@ -3770,7 +3830,12 @@ impl App {
                         if let Some(Step {
                             action:
                                 Action::WaitFor {
-                                    expect: Expect::Frame { frame, values },
+                                    expect:
+                                        Expect::Frame {
+                                            frame,
+                                            values,
+                                            capture,
+                                        },
                                     ..
                                 },
                             ..
@@ -3784,37 +3849,12 @@ impl App {
                             let at = at.rem_euclid(i32::try_from(names.len()).unwrap_or(1));
                             frame.clone_from(&names[usize::try_from(at).unwrap_or(0)]);
                             values.clear();
+                            capture.clear();
                         }
                     }
                 }
             }
-            StepField::WaitField(i) => {
-                let Some(step) = draft.scenario.steps.get(index).cloned() else {
-                    return;
-                };
-                let Action::WaitFor {
-                    expect: Expect::Frame { frame, values },
-                    ..
-                } = &step.action
-                else {
-                    return;
-                };
-                let Some(definition) = frames.iter().find(|f| f.name == *frame) else {
-                    return;
-                };
-                let Some(field_def) = definition.fields.get(*i) else {
-                    return;
-                };
-                if matches!(code, KeyCode::Char(' ')) {
-                    let on = !values.contains_key(&field_def.name);
-                    scenarios::set_match(
-                        draft.scenario.steps.get_mut(index).expect("just read"),
-                        definition,
-                        &field_def.name,
-                        on,
-                    );
-                }
-            }
+            StepField::WaitField(i) => self.act_on_wait_field(index, *i, code, frames, text),
             StepField::Limited => {
                 if matches!(code, KeyCode::Char(' ')) {
                     if let Some(Step {
@@ -3842,6 +3882,71 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn act_on_wait_field(
+        &mut self,
+        index: usize,
+        i: usize,
+        code: KeyCode,
+        frames: &[FrameDef],
+        text: &mut String,
+    ) {
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return;
+        };
+        let Some(step) = draft.scenario.steps.get(index).cloned() else {
+            return;
+        };
+        let Action::WaitFor {
+            expect:
+                Expect::Frame {
+                    frame,
+                    values,
+                    capture,
+                },
+            ..
+        } = &step.action
+        else {
+            return;
+        };
+        let Some(definition) = frames.iter().find(|f| f.name == *frame) else {
+            return;
+        };
+        let Some(field_def) = definition.fields.get(i) else {
+            return;
+        };
+        if matches!(code, KeyCode::Char(' ')) {
+            let on = !values.contains_key(&field_def.name);
+            scenarios::set_match(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                definition,
+                &field_def.name,
+                on,
+            );
+            return;
+        }
+        // Left/right rather than a letter key: a variable name is free text,
+        // and no letter is safe to reserve as its own toggle once the name
+        // being typed might contain that very letter.
+        if arrow_delta(code).is_some() {
+            let on = !capture.contains_key(&field_def.name);
+            scenarios::set_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                on,
+            );
+            return;
+        }
+        if !capture.contains_key(&field_def.name) {
+            return;
+        }
+        edit_text(code, text);
+        scenarios::rename_capture(
+            draft.scenario.steps.get_mut(index).expect("just read"),
+            &field_def.name,
+            text,
+        );
     }
 
     fn pick_scenario(&mut self, delta: isize) {
