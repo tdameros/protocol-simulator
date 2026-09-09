@@ -2798,3 +2798,87 @@ fn cycling_a_captured_field_picks_a_different_variable() {
         "cycled to the other one: {second}"
     );
 }
+
+/// A step moved or removed can leave a `from_capture` pointing at a variable
+/// nothing captures any more. "c" still has to turn that off, even though
+/// there is nothing left to turn it on to.
+#[test]
+fn a_dangling_capture_can_still_be_turned_off_with_c() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_relay_frames(
+        &mut app,
+        "a_dangling_capture_can_still_be_turned_off_with_c",
+    );
+    app.session_mut()
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    {
+        let draft = app.session_mut().scenarios.draft.as_mut().unwrap();
+        draft.scenario.steps = vec![sim_core::scenario::Step {
+            targets: vec![sim_core::ConnectionId::from("bus")],
+            action: sim_core::scenario::Action::Send {
+                frame: "Forward".to_owned(),
+                with: std::collections::BTreeMap::new(),
+                counters: std::collections::BTreeMap::new(),
+                from_capture: std::collections::BTreeMap::from([(
+                    "payload".to_owned(),
+                    "gone".to_owned(),
+                )]),
+            },
+        }];
+    }
+    press(&mut app, KeyCode::Char('5'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // Name, Description, Repeat, step1
+    }
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, Frame, payload
+    }
+    let before = screen(&mut app);
+    assert!(
+        before.contains("from capture: gone"),
+        "the dangling reference is still shown: {before}"
+    );
+
+    press(&mut app, KeyCode::Char('c'));
+    let after = screen(&mut app);
+    assert!(
+        after.contains("frame default"),
+        "c still turns it off with nothing left to turn it on to: {after}"
+    );
+}
+
+/// Turning a capture on seeds its variable name from the field, and typing
+/// straight away has to continue from that name rather than from nothing:
+/// the screen already says "capture as code" before the first keystroke.
+#[test]
+fn typing_right_after_turning_a_capture_on_continues_its_seeded_name() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_relay_frames(
+        &mut app,
+        "typing_right_after_turning_a_capture_on_continues_its_seeded_name",
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // Name, Description, Repeat, step1
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait -> WaitFor
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, wait-by-frame, Frame
+    }
+    press(&mut app, KeyCode::Right); // Response
+    press(&mut app, KeyCode::Down); // code row
+    press(&mut app, KeyCode::Right); // capture it, seeded "code"
+
+    press(&mut app, KeyCode::Char('!'));
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("capture as code!"),
+        "the seeded name, not an empty buffer, is what the key extends: {shown}"
+    );
+}

@@ -9,7 +9,7 @@
 //! not from tracks inside one file, which keeps periodic emission from being a
 //! second concept: a sender at 10 Hz is a one-step scenario that repeats.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -749,7 +749,7 @@ fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
     // Known only forward, the same order a run reaches them in: a later step
     // reading a variable an earlier one never captures is refused here rather
     // than failing mid run.
-    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut known: HashSet<String> = HashSet::new();
     let mut steps = Vec::with_capacity(raw.steps.len());
     for (index, raw_step) in raw.steps.into_iter().enumerate() {
         let wrap = |reason| ScenarioError::Step {

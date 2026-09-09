@@ -655,3 +655,58 @@ fn a_captured_field_can_be_sent_from_the_panel() {
         "the one variable in scope is picked automatically"
     );
 }
+
+/// A step moved or removed can leave a `from_capture` pointing at a variable
+/// nothing captures any more. The row it lives on has to keep offering a way
+/// to clear it, not hide the control the moment nothing is left to pick from.
+#[test]
+fn a_dangling_capture_can_still_be_cleared_from_its_own_row() {
+    let (dir, mut world) = folder(
+        "dangling",
+        &[("response.toml", RESPONSE), ("forward.toml", FORWARD)],
+    );
+    world.state.scenarios.load_from(dir);
+    world
+        .state
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    {
+        let draft = world.state.scenarios.draft.as_mut().unwrap();
+        draft.scenario.steps = vec![sim_core::scenario::Step {
+            targets: vec![sim_core::ConnectionId::from("server2")],
+            action: sim_core::scenario::Action::Send {
+                frame: "Forward".to_owned(),
+                with: std::collections::BTreeMap::new(),
+                counters: std::collections::BTreeMap::new(),
+                from_capture: std::collections::BTreeMap::from([(
+                    "payload".to_owned(),
+                    "gone".to_owned(),
+                )]),
+            },
+        }];
+    }
+
+    let mut harness = scenarios_panel(world);
+    harness.run();
+
+    harness.get_by_label_contains("from capture").click();
+    harness.run();
+
+    let sim_core::scenario::Action::Send { from_capture, .. } = &harness
+        .state()
+        .state
+        .scenarios
+        .draft
+        .as_ref()
+        .unwrap()
+        .scenario
+        .steps[0]
+        .action
+    else {
+        panic!("expected a send");
+    };
+    assert!(
+        from_capture.is_empty(),
+        "unticking it clears the stale reference: {from_capture:?}"
+    );
+}

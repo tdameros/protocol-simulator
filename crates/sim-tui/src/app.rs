@@ -3586,14 +3586,18 @@ impl App {
             return;
         }
         if matches!(code, KeyCode::Char('c')) {
-            let available = scenarios::captured_before(&draft.scenario, index);
-            if available.is_empty() {
-                return;
-            }
             let Action::Send { from_capture, .. } = &step.action else {
                 return;
             };
             let on = !from_capture.contains_key(&field_def.name);
+            // Turning it off is always allowed, a step moved or removed out
+            // from under a capture being the one way this field's own
+            // variable can already be gone from `available`. Turning it on
+            // needs something to turn it on to.
+            let available = scenarios::captured_before(&draft.scenario, index);
+            if on && available.is_empty() {
+                return;
+            }
             scenarios::set_from_capture(
                 draft.scenario.steps.get_mut(index).expect("just read"),
                 &field_def.name,
@@ -3936,6 +3940,12 @@ impl App {
                 &field_def.name,
                 on,
             );
+            // Turning it on seeds the variable's name from the field's own,
+            // and the scratch buffer has to agree before the next key is
+            // read as extending it rather than starting over from nothing.
+            if on {
+                field_def.name.clone_into(text);
+            }
             return;
         }
         if !capture.contains_key(&field_def.name) {

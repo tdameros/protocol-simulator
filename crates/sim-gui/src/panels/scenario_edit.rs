@@ -298,7 +298,11 @@ fn override_row(
         toggled_counting = ui
             .add_enabled(!captured, egui::Checkbox::new(&mut counting, "count"))
             .changed();
-        if !available.is_empty() {
+        // Shown disabled, never hidden, once it is already on: a step moved
+        // or removed out from under it can leave `captured` true with
+        // `available` empty, and that is exactly the row unticking it from
+        // has to stay reachable on.
+        if captured || !available.is_empty() {
             toggled_capturing = ui
                 .add_enabled(
                     !counted,
@@ -311,7 +315,8 @@ fn override_row(
         scenarios::set_counter(step, &field.name, counting);
     }
     if toggled_capturing {
-        scenarios::set_from_capture(step, &field.name, capturing.then(|| available[0].as_str()));
+        let variable = capturing.then(|| available.first()).flatten();
+        scenarios::set_from_capture(step, &field.name, variable.map(String::as_str));
     }
 
     let Action::Send { counters, .. } = &mut step.action else {

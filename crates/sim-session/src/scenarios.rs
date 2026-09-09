@@ -5,7 +5,7 @@
 //! back through [`sim_core::scenario::update_in`], which leaves the comments a
 //! developer wrote where they were.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -394,6 +394,7 @@ impl Draft {
     pub fn remove_step(&mut self, index: usize) {
         if index < self.scenario.steps.len() {
             self.scenario.steps.remove(index);
+            prune_dangling_captures(&mut self.scenario);
         }
     }
 
@@ -409,6 +410,7 @@ impl Draft {
         };
         if index < steps.len() && other < steps.len() {
             steps.swap(index, other);
+            prune_dangling_captures(&mut self.scenario);
         }
     }
 
@@ -631,6 +633,28 @@ pub fn captured_before(scenario: &Scenario, index: usize) -> Vec<String> {
     names.sort_unstable();
     names.dedup();
     names
+}
+
+/// Drops a `from_capture` entry left pointing at a variable no step before it
+/// captures any more, a step having been moved or removed out from under it.
+///
+/// Silent rather than reported: the field falls back to the frame's own
+/// default, exactly as unticking its override by hand would leave it, so
+/// there is nothing here for a save to refuse.
+fn prune_dangling_captures(scenario: &mut Scenario) {
+    let mut known: HashSet<String> = HashSet::new();
+    for step in &mut scenario.steps {
+        if let Action::Send { from_capture, .. } = &mut step.action {
+            from_capture.retain(|_, variable| known.contains(variable));
+        }
+        if let Action::WaitFor {
+            expect: Expect::Frame { capture, .. },
+            ..
+        } = &step.action
+        {
+            known.extend(capture.values().cloned());
+        }
+    }
 }
 
 /// Swaps a wait between naming a frame and spelling out bytes, keeping nothing
@@ -1244,6 +1268,53 @@ raw = "03"
         assert_eq!(order(&draft), ["02", "03", "01"]);
         draft.move_step(99, true);
         assert_eq!(order(&draft), ["02", "03", "01"]);
+    }
+
+    const RELAY: &str = r#"
+[[scenario]]
+name = "Relay"
+[[scenario.step]]
+wait_for = { frame = "Response", capture = { code = "server1_code" } }
+on = "server1"
+[[scenario.step]]
+send = "Forward"
+on = "server2"
+from_capture = { payload = "server1_code" }
+"#;
+
+    fn from_capture_of(draft: &Draft, step: usize) -> BTreeMap<String, String> {
+        let Action::Send { from_capture, .. } = &draft.scenario.steps[step].action else {
+            panic!("expected a send");
+        };
+        from_capture.clone()
+    }
+
+    #[test]
+    fn removing_a_capturing_step_drops_what_read_from_it() {
+        let mut draft = draft_of(RELAY);
+        assert_eq!(
+            from_capture_of(&draft, 1).get("payload"),
+            Some(&"server1_code".to_owned())
+        );
+
+        draft.remove_step(0);
+
+        assert!(
+            from_capture_of(&draft, 0).is_empty(),
+            "the variable it named is gone with the step that captured it"
+        );
+    }
+
+    #[test]
+    fn moving_a_capturing_step_past_what_reads_it_drops_the_reference_too() {
+        let mut draft = draft_of(RELAY);
+
+        draft.move_step(0, true);
+
+        assert!(
+            from_capture_of(&draft, 0).is_empty(),
+            "the capture now comes after the step that wanted to read it"
+        );
     }
 
     #[test]
