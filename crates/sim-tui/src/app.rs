@@ -1088,19 +1088,37 @@ impl StepEdit {
 
     fn reseed_wait_field(i: usize, step: &Step, frames: &[FrameDef]) -> String {
         let Action::WaitFor {
-            expect: Expect::Frame { frame, capture, .. },
+            expect:
+                Expect::Frame {
+                    frame,
+                    values,
+                    capture,
+                },
             ..
         } = &step.action
         else {
             return String::new();
         };
-        frames
+        let Some(field_def) = frames
             .iter()
             .find(|f| &f.name == frame)
             .and_then(|d| d.fields.get(i))
-            .and_then(|field_def| capture.get(&field_def.name))
-            .cloned()
-            .unwrap_or_default()
+        else {
+            return String::new();
+        };
+        // A captured name is what free text edits while both could apply, the
+        // two never actually meeting: a field worth remembering by name is
+        // rarely also one pinned to an exact value.
+        if let Some(variable) = capture.get(&field_def.name) {
+            return variable.clone();
+        }
+        values
+            .get(&field_def.name)
+            .map_or_else(String::new, |value| match &field_def.kind {
+                FieldKind::Bytes { .. } => value.as_bytes().map_or_else(String::new, hex::packed),
+                FieldKind::Text { .. } => value.as_text().unwrap_or_default().to_owned(),
+                _ => reading::describe(field_def, value, false),
+            })
     }
 }
 
@@ -3947,15 +3965,35 @@ impl App {
             }
             return;
         }
-        if !capture.contains_key(&field_def.name) {
+        if capture.contains_key(&field_def.name) {
+            edit_text(code, text);
+            scenarios::rename_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                text,
+            );
+            return;
+        }
+        // Editing only reaches a value already ticked in: an untouched field
+        // still means any value at all is accepted.
+        if !values.contains_key(&field_def.name) {
             return;
         }
         edit_text(code, text);
-        scenarios::rename_capture(
-            draft.scenario.steps.get_mut(index).expect("just read"),
-            &field_def.name,
-            text,
-        );
+        let Some(value) = typed_override_value(&field_def.kind, text) else {
+            return;
+        };
+        if let Some(Step {
+            action:
+                Action::WaitFor {
+                    expect: Expect::Frame { values, .. },
+                    ..
+                },
+            ..
+        }) = draft.scenario.steps.get_mut(index)
+        {
+            values.insert(field_def.name.clone(), value);
+        }
     }
 
     fn pick_scenario(&mut self, delta: isize) {

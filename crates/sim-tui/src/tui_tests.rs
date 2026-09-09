@@ -2905,3 +2905,40 @@ fn the_step_hint_does_not_promise_a_key_the_wait_side_does_not_answer_to() {
     assert!(!hints.contains("c capture"), "{hints}");
     assert!(hints.contains("left/right"), "{hints}");
 }
+
+/// Ticking a matched field seeds the frame's own default, but a wait for an
+/// exact number needs more than that default: typing has to reach it too,
+/// the same way it already reaches a send step's overridden value.
+#[test]
+fn a_matched_field_can_be_given_an_exact_value_to_wait_for() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_scenario_frames(
+        &mut app,
+        "a_matched_field_can_be_given_an_exact_value_to_wait_for",
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait -> WaitFor, starts by frame
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, wait-by-frame, Frame
+    }
+    press(&mut app, KeyCode::Right); // choose Status
+    press(&mut app, KeyCode::Down); // sync
+    press(&mut app, KeyCode::Char(' ')); // match it, seeded from the default
+
+    for letter in "56".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+
+    let shown = screen(&mut app);
+    let sync_line = shown.lines().rfind(|l| l.contains("sync")).unwrap_or("");
+    assert!(
+        sync_line.contains("56"),
+        "the typed value, not the seeded default: {shown}"
+    );
+}
