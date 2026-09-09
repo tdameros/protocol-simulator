@@ -2882,3 +2882,26 @@ fn typing_right_after_turning_a_capture_on_continues_its_seeded_name() {
         "the seeded name, not an empty buffer, is what the key extends: {shown}"
     );
 }
+
+/// The hint line used to advertise "c" for capturing a field, but the wait
+/// side of a step popup does that with left/right instead, "c" doing nothing
+/// there and something different on the send side.
+#[test]
+fn the_step_hint_does_not_promise_a_key_the_wait_side_does_not_answer_to() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let hints = screen(&mut app)
+        .lines()
+        .last()
+        .expect("a hint line")
+        .to_owned();
+    assert!(!hints.contains("c capture"), "{hints}");
+    assert!(hints.contains("left/right"), "{hints}");
+}

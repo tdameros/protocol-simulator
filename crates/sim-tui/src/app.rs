@@ -1724,9 +1724,8 @@ impl App {
         if let Some(Overlay::Step(_)) = self.overlay {
             return Some(&[
                 ("Tab", "next field"),
-                ("left/right", "change"),
+                ("left/right", "change, capture"),
                 ("space", "toggle"),
-                ("c", "capture"),
                 ("type", "edit"),
                 ("Esc", "done"),
             ]);
