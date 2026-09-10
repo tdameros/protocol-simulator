@@ -2942,3 +2942,59 @@ fn a_matched_field_can_be_given_an_exact_value_to_wait_for() {
         "the typed value, not the seeded default: {shown}"
     );
 }
+
+/// A frame with more fields than the pane's own share of the screen used to
+/// leave the rest simply cut off, with no way to reach them.
+#[test]
+fn a_long_decoded_reading_scrolls_with_page_up_and_down() {
+    let mut app = App::default();
+    with_many_fields(
+        &mut app,
+        "a_long_decoded_reading_scrolls_with_page_up_and_down",
+        20,
+    );
+    captured(&mut app, &[0; 20], Duration::from_secs(1));
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // the one candidate, Wide
+    press(&mut app, KeyCode::Enter); // confirm it
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("f0"), "the top is visible at first: {shown}");
+    assert!(
+        !shown.contains("f19"),
+        "the bottom is not, or there was nothing to fix: {shown}"
+    );
+
+    for _ in 0..5 {
+        press(&mut app, KeyCode::PageDown);
+    }
+    let scrolled = screen(&mut app);
+    assert!(
+        scrolled.contains("f19"),
+        "page down reaches the bottom: {scrolled}"
+    );
+    assert!(
+        !scrolled.contains("f0"),
+        "and the top scrolled out to make room: {scrolled}"
+    );
+
+    for _ in 0..5 {
+        press(&mut app, KeyCode::PageUp);
+    }
+    let back = screen(&mut app);
+    assert!(back.contains("f0"), "page up returns to the top: {back}");
+}
+
+/// Clearing the traffic view already worked from "c", but nothing ever said
+/// so, the key map included, which is as good as it not existing.
+#[test]
+fn clearing_the_traffic_view_is_documented_in_the_key_map() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('?'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("clear"), "{shown}");
+}

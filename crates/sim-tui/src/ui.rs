@@ -855,8 +855,20 @@ fn watch(frame: &mut Frame, area: Rect, app: &mut App) {
     rows_view(frame, list, app);
 
     if let (Some(pane), Some(lines)) = (pane, fields) {
+        // A frame with more fields than the pane's own share of the screen
+        // used to have the rest simply cut off, with no way to reach them.
+        let room = pane.height.saturating_sub(2) as usize;
+        let start = app
+            .traffic_field_scroll()
+            .min(lines.len().saturating_sub(room));
+        let end = (start + room).min(lines.len());
+        let title = if lines.len() > room {
+            " Fields (PageUp/PageDown to scroll) "
+        } else {
+            " Fields "
+        };
         frame.render_widget(
-            Paragraph::new(lines).block(Block::bordered().title(" Fields ")),
+            Paragraph::new(lines[start..end].to_vec()).block(Block::bordered().title(title)),
             pane,
         );
     }

@@ -1369,6 +1369,9 @@ pub struct App {
     /// differently shaped frame resets the cursor rather than landing on
     /// whatever row happened to share its number.
     field_at: Option<(String, usize)>,
+    /// How far the Traffic tab's decoded fields pane has scrolled, reset
+    /// whenever the row it describes changes.
+    traffic_field_scroll: usize,
 }
 
 impl Default for App {
@@ -1395,6 +1398,7 @@ impl Default for App {
             frame_row: None,
             frame_focus: FramesFocus::Library,
             field_at: None,
+            traffic_field_scroll: 0,
         };
         // Compared against from the first key pressed, so an app that has not
         // been touched yet is never mistaken for one with unsaved work.
@@ -1565,6 +1569,12 @@ impl App {
         self.frame_focus == FramesFocus::Fields
     }
 
+    /// How far the Traffic tab's decoded fields pane has scrolled.
+    #[must_use]
+    pub fn traffic_field_scroll(&self) -> usize {
+        self.traffic_field_scroll
+    }
+
     /// The row under the cursor in the fields pane, for the frame currently
     /// on show.
     #[must_use]
@@ -1624,7 +1634,16 @@ impl App {
     pub fn selected_reading(&mut self) -> Option<(&LogEntry, Reading<'_>)> {
         let id = self.monitor_id()?;
         let seq = self.session.monitors.get(&id)?.selected?;
-        let entry = self.session.log.iter().find(|entry| entry.seq == seq)?;
+        // Binary rather than linear: this runs on every redraw, whether or not
+        // a key was pressed, and the log only ever grows at one end, seq
+        // ascending, which is exactly what a search needs to stay fast at ten
+        // thousand entries and ten redraws a second.
+        let at = self
+            .session
+            .log
+            .binary_search_by_key(&seq, |entry| entry.seq)
+            .ok()?;
+        let entry = self.session.log.get(at)?;
         let decode_as = &mut self.session.monitors.get_mut(&id)?.decode_as;
         let reading = reading::read(&self.session.frames, entry, decode_as);
         Some((entry, reading))
@@ -1788,6 +1807,7 @@ impl App {
                 ("Enter", "read as"),
                 ("p", "pause"),
                 ("f", "follow"),
+                ("c", "clear"),
                 ("/", "filter"),
             ],
             Tab::Scenarios if self.session.scenarios.draft.is_some() => &[
@@ -2827,6 +2847,7 @@ impl App {
                         monitor.decode_as = Some(taken);
                     }
                 }
+                self.traffic_field_scroll = 0;
             }
             PickPurpose::EnumField { field } => {
                 let Some(frame) = self.session.frames.selected_frame().cloned() else {
@@ -4050,6 +4071,12 @@ impl App {
             KeyCode::Char(']') => self.switch_monitor(1),
             KeyCode::Char('h') => self.send_row_to_hex(),
             KeyCode::Char('F') => self.open_row_in_frames(),
+            KeyCode::PageDown => {
+                self.traffic_field_scroll = self.traffic_field_scroll.saturating_add(5);
+            }
+            KeyCode::PageUp => {
+                self.traffic_field_scroll = self.traffic_field_scroll.saturating_sub(5);
+            }
             _ => return false,
         }
         true
@@ -4183,5 +4210,6 @@ impl App {
         };
         monitor.selected = Some(seqs[at]);
         monitor.follow = false;
+        self.traffic_field_scroll = 0;
     }
 }
