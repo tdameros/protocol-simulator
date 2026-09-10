@@ -24,17 +24,22 @@ use sim_session::{hex, links, traffic};
 use crate::app::{App, Browser, Overlay, Picker, Tab};
 use crate::connection_form::ConnectionForm;
 
+// Named ANSI colours throughout, not RGB: this front end is also read over a
+// serial console through something like `screen`, which does not render a
+// 24-bit colour escape at all, unlike the 16 colours every terminal answers
+// to.
+
 /// The two directions, told apart at a glance rather than read.
-const SENT: Color = Color::Rgb(90, 140, 220);
-const RECEIVED: Color = Color::Rgb(40, 160, 90);
+const SENT: Color = Color::LightBlue;
+const RECEIVED: Color = Color::LightGreen;
 /// What a frame that will not decode is written in.
-const ERROR: Color = Color::Rgb(200, 60, 60);
+const ERROR: Color = Color::LightRed;
 /// What a note about a decode that partly worked is written in.
-const WARNING: Color = Color::Rgb(200, 120, 40);
+const WARNING: Color = Color::Yellow;
 /// Secondary text: a label, a hint, a timestamp. An explicit colour rather
 /// than the `DIM` modifier, whose actual contrast against a black background
 /// is left to the terminal and on several of them is close to unreadable.
-const MUTED: Color = Color::Rgb(145, 145, 160);
+const MUTED: Color = Color::DarkGray;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // The line only exists while there is something to say, so a working
