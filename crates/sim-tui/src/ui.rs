@@ -31,6 +31,10 @@ const RECEIVED: Color = Color::Rgb(40, 160, 90);
 const ERROR: Color = Color::Rgb(200, 60, 60);
 /// What a note about a decode that partly worked is written in.
 const WARNING: Color = Color::Rgb(200, 120, 40);
+/// Secondary text: a label, a hint, a timestamp. An explicit colour rather
+/// than the `DIM` modifier, whose actual contrast against a black background
+/// is left to the terminal and on several of them is close to unreadable.
+const MUTED: Color = Color::Rgb(145, 145, 160);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // The line only exists while there is something to say, so a working
@@ -91,7 +95,7 @@ fn tab_bar(frame: &mut Frame, area: Rect, app: &App) {
         None => (area, None),
     };
     if let Some((tail, name)) = tail {
-        frame.render_widget(Paragraph::new(name.as_str().dim()), tail);
+        frame.render_widget(Paragraph::new(name.as_str().fg(MUTED)), tail);
     }
 
     let titles = Tab::ALL
@@ -122,9 +126,10 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(format!(" Connections ({}) ", links.len()));
 
     if links.is_empty() {
-        let empty = Paragraph::new("No link. Press o to open a project, or n to add one.".dim())
-            .wrap(Wrap { trim: true })
-            .block(block);
+        let empty =
+            Paragraph::new("No link. Press o to open a project, or n to add one.".fg(MUTED))
+                .wrap(Wrap { trim: true })
+                .block(block);
         frame.render_widget(empty, area);
         return;
     }
@@ -146,7 +151,7 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
             let auto = if entry.autoconnect { "*" } else { " " };
             let retry = if entry.retry.is_some() { "~" } else { " " };
             let line = Line::from(vec![
-                Span::raw(format!("{auto} {retry} ")).dim(),
+                Span::raw(format!("{auto} {retry} ")).fg(MUTED),
                 Span::styled(
                     format!("{:named$}", id.0),
                     Style::new().add_modifier(Modifier::BOLD),
@@ -154,7 +159,7 @@ fn connections(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw("  "),
                 Span::raw(format!("{:stated$}", links::status(entry.status))),
                 Span::raw("  "),
-                Span::raw(links::summary(entry)).dim(),
+                Span::raw(links::summary(entry)).fg(MUTED),
             ]);
             if app.connection_at() == Some(at) {
                 line.style(Style::new().add_modifier(Modifier::REVERSED))
@@ -180,7 +185,7 @@ fn connection_form_over(frame: &mut Frame, area: Rect, form: &ConnectionForm) {
         .into_iter()
         .map(|(label, value, focused)| {
             let line = Line::from(vec![
-                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(format!("{label:widest$}  ")).fg(MUTED),
                 Span::raw(value),
             ]);
             if focused {
@@ -229,7 +234,7 @@ fn filter_editor_over(frame: &mut Frame, area: Rect, edit: &crate::app::FilterEd
         .into_iter()
         .map(|(label, value, focused)| {
             let line = Line::from(vec![
-                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(format!("{label:widest$}  ")).fg(MUTED),
                 Span::raw(value),
             ]);
             if focused {
@@ -286,7 +291,7 @@ fn scrolled_popup(frame: &mut Frame, area: Rect, lines: Vec<(String, String, boo
         .into_iter()
         .map(|(label, value, focused)| {
             let line = Line::from(vec![
-                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(format!("{label:widest$}  ")).fg(MUTED),
                 Span::raw(value),
             ]);
             if focused {
@@ -326,9 +331,10 @@ fn frames_view(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(format!(" Frames ({}) ", library.entries.len()));
 
     if library.entries.is_empty() {
-        let empty = Paragraph::new("No frame definition. Open a project, or pass a folder.".dim())
-            .wrap(Wrap { trim: true })
-            .block(block);
+        let empty =
+            Paragraph::new("No frame definition. Open a project, or pass a folder.".fg(MUTED))
+                .wrap(Wrap { trim: true })
+                .block(block);
         frame.render_widget(empty, area);
         return;
     }
@@ -354,7 +360,7 @@ fn frames_view(frame: &mut Frame, area: Rect, app: &App) {
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::raw(format!("{} bytes", entry.frame.size())).dim(),
+                Span::raw(format!("{} bytes", entry.frame.size())).fg(MUTED),
             ]);
             if library.selected == Some(at) {
                 line.style(Style::new().add_modifier(Modifier::REVERSED))
@@ -417,7 +423,7 @@ fn frame_editor_view(frame: &mut Frame, area: Rect, app: &App) {
                 }
             };
             let line = Line::from(vec![
-                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(format!("{label:widest$}  ")).fg(MUTED),
                 Span::raw(value),
             ]);
             if cursor == Some(at) {
@@ -457,7 +463,7 @@ fn frame_field_editor_over(
 /// The chosen definition, its values, and the bytes they encode to.
 fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
     let Some(chosen) = app.session().frames.selected_frame().cloned() else {
-        let hint = Paragraph::new("Choose a frame to see its fields.".dim())
+        let hint = Paragraph::new("Choose a frame to see its fields.".fg(MUTED))
             .block(Block::bordered().title(" Fields "));
         frame.render_widget(hint, area);
         return;
@@ -542,11 +548,11 @@ fn frame_detail(frame: &mut Frame, area: Rect, app: &App) {
 /// Which connection a frame would go out on, and whether it actually could.
 fn target_line(app: &App) -> Line<'static> {
     let Some(id) = &app.session().frame_target else {
-        return Line::from(Span::raw("Target: none (t to pick one)").dim());
+        return Line::from(Span::raw("Target: none (t to pick one)").fg(MUTED));
     };
     match app.session().status_of(id) {
         Some(ConnectionStatus::Connected) => {
-            Line::from(Span::raw(format!("Target: {} (connected)", id.0)).dim())
+            Line::from(Span::raw(format!("Target: {} (connected)", id.0)).fg(MUTED))
         }
         _ => Line::from(Span::raw(format!("Target: {} (not connected)", id.0)).fg(ERROR)),
     }
@@ -571,7 +577,7 @@ fn field_row_line(
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::raw(sim_session::frames::type_label(field)).dim(),
+                Span::raw(sim_session::frames::type_label(field)).fg(MUTED),
                 Span::raw("  "),
                 Span::raw(said),
             ])
@@ -594,14 +600,14 @@ fn field_row_line(
                 .unwrap_or(0);
             let said = reading::unsigned(held, bit_def.width.div_ceil(4) as usize, hex);
             let tint = if held == 0 {
-                Style::new().add_modifier(Modifier::DIM)
+                Style::new().fg(MUTED)
             } else {
                 Style::new().add_modifier(Modifier::BOLD)
             };
             Line::from(vec![
-                Span::raw(format!("  {}", bit_def.name)).dim(),
+                Span::raw(format!("  {}", bit_def.name)).fg(MUTED),
                 Span::raw("  "),
-                Span::raw(position).dim(),
+                Span::raw(position).fg(MUTED),
                 Span::raw("  "),
                 Span::styled(said, tint),
             ])
@@ -620,7 +626,7 @@ fn inject_view(frame: &mut Frame, area: Rect, app: &App) {
     let said = match hex::parse(typed) {
         Ok(bytes) => Span::raw(format!("{} byte(s) ready to send.", bytes.len())),
         // Nothing typed is not a mistake to point at, only a box not filled in.
-        Err(hex::Problem::Empty) => Span::raw("Type hexadecimal bytes.").dim(),
+        Err(hex::Problem::Empty) => Span::raw("Type hexadecimal bytes.").fg(MUTED),
         Err(problem) => Span::raw(problem.to_string()).fg(ERROR),
     };
 
@@ -658,10 +664,11 @@ fn scenarios_view(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(format!(" Scenarios ({}) ", library.entries.len()));
 
     if library.entries.is_empty() {
-        let empty =
-            Paragraph::new("No scenario. Open a project, or pass a folder that holds some.".dim())
-                .wrap(Wrap { trim: true })
-                .block(block);
+        let empty = Paragraph::new(
+            "No scenario. Open a project, or pass a folder that holds some.".fg(MUTED),
+        )
+        .wrap(Wrap { trim: true })
+        .block(block);
         frame.render_widget(empty, area);
         return;
     }
@@ -692,7 +699,7 @@ fn scenarios_view(frame: &mut Frame, area: Rect, app: &App) {
             let tint = if run.is_some() {
                 Style::new().fg(RECEIVED)
             } else {
-                Style::new().add_modifier(Modifier::DIM)
+                Style::new().fg(MUTED)
             };
 
             let line = Line::from(vec![
@@ -774,7 +781,7 @@ fn scenario_editor_view(frame: &mut Frame, area: Rect, app: &App) {
                 }
             };
             let line = Line::from(vec![
-                Span::raw(format!("{label:widest$}  ")).dim(),
+                Span::raw(format!("{label:widest$}  ")).fg(MUTED),
                 Span::raw(value),
             ]);
             if cursor == Some(at) {
@@ -800,7 +807,7 @@ fn scenario_editor_view(frame: &mut Frame, area: Rect, app: &App) {
 
 fn steps_view(frame: &mut Frame, area: Rect, app: &App) {
     let Some(scenario) = app.session().scenarios.selected_scenario() else {
-        let hint = Paragraph::new("Choose a scenario to see its steps.".dim())
+        let hint = Paragraph::new("Choose a scenario to see its steps.".fg(MUTED))
             .block(Block::bordered().title(" Steps "));
         frame.render_widget(hint, area);
         return;
@@ -818,10 +825,10 @@ fn steps_view(frame: &mut Frame, area: Rect, app: &App) {
                 .collect::<Vec<_>>()
                 .join(", ");
             Line::from(vec![
-                Span::raw(format!("{:>3}  ", at + 1)).dim(),
+                Span::raw(format!("{:>3}  ", at + 1)).fg(MUTED),
                 Span::raw(scenarios::describe(step)),
                 Span::raw("  "),
-                Span::raw(links).dim(),
+                Span::raw(links).fg(MUTED),
             ])
         })
         .collect();
@@ -896,14 +903,14 @@ fn bit_rows(field: &FieldDef, value: Option<&Value>, hex: bool) -> Vec<Line<'sta
             let held = set.get(&bit.name).copied().unwrap_or_default();
             let said = reading::unsigned(held, (bit.width.div_ceil(4)) as usize, hex);
             let tint = if held == 0 {
-                Style::new().add_modifier(Modifier::DIM)
+                Style::new().fg(MUTED)
             } else {
                 Style::new().add_modifier(Modifier::BOLD)
             };
             Line::from(vec![
-                Span::raw(format!("  {:widest$}", bit.name)).dim(),
+                Span::raw(format!("  {:widest$}", bit.name)).fg(MUTED),
                 Span::raw("  "),
-                Span::raw(position.unwrap_or_default()).dim(),
+                Span::raw(position.unwrap_or_default()).fg(MUTED),
                 Span::raw("  "),
                 Span::styled(said, tint),
             ])
@@ -919,7 +926,7 @@ fn field_lines(app: &mut App) -> Option<Vec<Line<'static>>> {
 
     let Some(frame) = reading.chosen() else {
         let said = reading.nothing().unwrap_or("Nothing to read.").to_owned();
-        return Some(vec![Line::from(said.dim())]);
+        return Some(vec![Line::from(said.fg(MUTED))]);
     };
 
     let decoded = match codec::decode(frame, &entry.bytes) {
@@ -949,7 +956,7 @@ fn field_lines(app: &mut App) -> Option<Vec<Line<'static>>> {
                 Style::new().add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::raw(format!("{offset}..{end}")).dim(),
+            Span::raw(format!("{offset}..{end}")).fg(MUTED),
             Span::raw("  "),
             Span::raw(hex::spaced(&entry.bytes[offset..end])),
             Span::raw("  "),
@@ -982,7 +989,7 @@ fn rows_view(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(title);
 
     if rows.is_empty() {
-        let empty = Paragraph::new("Nothing captured yet.".dim()).block(block);
+        let empty = Paragraph::new("Nothing captured yet.".fg(MUTED)).block(block);
         frame.render_widget(empty, area);
         return;
     }
@@ -1030,9 +1037,9 @@ fn row(entry: &LogEntry, previous: Option<&LogEntry>) -> Line<'static> {
     };
 
     Line::from(vec![
-        Span::raw(traffic::timestamp(entry.timestamp)).dim(),
+        Span::raw(traffic::timestamp(entry.timestamp)).fg(MUTED),
         Span::raw(" "),
-        Span::raw(traffic::delta(gap)).dim(),
+        Span::raw(traffic::delta(gap)).fg(MUTED),
         Span::raw(" "),
         Span::styled(arrow, tint),
         Span::raw(" "),
@@ -1040,7 +1047,7 @@ fn row(entry: &LogEntry, previous: Option<&LogEntry>) -> Line<'static> {
         Span::raw("  "),
         Span::raw(hex::spaced(&entry.bytes)),
         Span::raw("  "),
-        Span::raw(hex::printable(&entry.bytes)).dim(),
+        Span::raw(hex::printable(&entry.bytes)).fg(MUTED),
     ])
 }
 
@@ -1088,7 +1095,7 @@ fn hints(keys: &[(&str, &str)], room: usize) -> Line<'static> {
             Style::new().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
-        spans.push(Span::raw((*does).to_owned()).dim());
+        spans.push(Span::raw((*does).to_owned()).fg(MUTED));
     }
     Line::from(spans)
 }
