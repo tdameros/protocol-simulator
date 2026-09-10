@@ -579,10 +579,14 @@ async fn run_connection<T: Transport>(
         tokio::select! {
             outgoing = outgoing_rx.recv() => {
                 let Some(bytes) = outgoing else { return Ended::Locally };
+                // Taken before the write, not after: a stream that blocks on a
+                // full send window would otherwise have that wait silently
+                // deducted from every round trip timed against this send.
+                let timestamp = SystemTime::now();
                 match transport.send(&bytes).await {
                     Ok(()) => {
                         let _ = events
-                            .send(Event::FrameSent { id: id.clone(), bytes, timestamp: SystemTime::now() })
+                            .send(Event::FrameSent { id: id.clone(), bytes, timestamp })
                             .await;
                     }
                     Err(source) => {
