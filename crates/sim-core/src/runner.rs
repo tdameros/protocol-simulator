@@ -52,7 +52,7 @@ pub(crate) struct Context {
     pub received: broadcast::Receiver<Heard>,
 }
 
-pub(crate) async fn run(mut context: Context) -> Outcome {
+pub(crate) async fn run(context: Context) -> Outcome {
     let scenario = context.scenario.clone();
 
     // The first tick completes at once, so pass zero starts without waiting a
@@ -82,6 +82,15 @@ pub(crate) async fn run(mut context: Context) -> Outcome {
         // nothing to do with the reply this one is about to wait for.
         let mut variables: BTreeMap<String, Value> = BTreeMap::new();
 
+        // Subscribed here, before this pass's first send, rather than inside
+        // each wait: a reply can be broadcast the instant the engine writes
+        // it to the socket, which can beat a scenario task back to a
+        // subscribe call made only once the wait step itself starts running.
+        // Resubscribing per pass rather than reusing one for the whole
+        // scenario keeps the same guarantee the old per-wait subscribe gave:
+        // a reply left over from an earlier pass cannot satisfy this one.
+        let mut received = context.received.resubscribe();
+
         for (index, step) in scenario.steps.iter().enumerate() {
             let _ = context
                 .events
@@ -98,7 +107,7 @@ pub(crate) async fn run(mut context: Context) -> Outcome {
                 pass,
                 &context.frames,
                 &context.commands,
-                &mut context.received,
+                &mut received,
                 &mut variables,
             )
             .await
@@ -168,18 +177,6 @@ async fn execute(
                     .map(|held| (held, capture)),
                 _ => None,
             };
-
-            // Started from where the stream is now, not from where the scenario
-            // subscribed. Held across steps, the buffer would let a frame from
-            // an earlier pass, or from before this wait was ever reached,
-            // release it: a repeating handshake would then report success
-            // without the far side having answered once.
-            //
-            // Nothing is lost by starting here. A send is posted to the engine
-            // and travels on from there, so the step that precedes a wait has
-            // not even reached the socket by the time this runs; a reply cannot
-            // already be in the buffer.
-            let mut received = received.resubscribe();
 
             // Every target has to answer, so each one is struck off as it does
             // and the wait ends when none is left.
@@ -400,4 +397,77 @@ fn field_kind<'a>(frame: &'a FrameDef, field: &str) -> Result<&'a crate::frame::
         .find(|declared| declared.name == field)
         .map(|declared| &declared.kind)
         .ok_or_else(|| format!("{} has no field named {field}", frame.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::scenario::Repeat;
+
+    /// A device fast enough to answer before the scenario task gets back
+    /// around to listening for it: echoes the instant it sees the send,
+    /// racing whatever the scenario does next on its own thread.
+    ///
+    /// Reproduces on a real, multi-threaded runtime rather than by
+    /// controlling scheduling directly, since the bug this guards is a
+    /// cross-thread race, not an ordering within one task's own polls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reply_racing_the_send_that_caused_it_is_not_missed() {
+        const PASSES: u32 = 5000;
+        let id = ConnectionId::from("x");
+
+        let scenario = Scenario {
+            name: "Race".to_owned(),
+            description: None,
+            repeat: Some(Repeat {
+                every: Duration::from_micros(200),
+                times: Some(PASSES),
+            }),
+            steps: vec![
+                Step {
+                    targets: vec![id.clone()],
+                    action: Action::Raw { bytes: vec![0xAA] },
+                },
+                Step {
+                    targets: vec![id.clone()],
+                    action: Action::WaitFor {
+                        expect: Expect::Pattern {
+                            pattern: HexPattern::parse("C0 FE").unwrap(),
+                            anchor: Anchor::At(0),
+                        },
+                        timeout: Some(Duration::from_millis(20)),
+                    },
+                },
+            ],
+        };
+
+        let (command_tx, mut command_rx) = mpsc::channel(64);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+        let (heard_tx, heard_rx) = broadcast::channel(64);
+
+        let echo_id = id.clone();
+        tokio::spawn(async move {
+            while command_rx.recv().await.is_some() {
+                let _ = heard_tx.send((echo_id.clone(), vec![0xC0, 0xFE]));
+            }
+        });
+
+        let context = Context {
+            scenario,
+            frames: Vec::new(),
+            commands: command_tx.downgrade(),
+            events: events_tx,
+            received: heard_rx,
+        };
+
+        let outcome = run(context).await;
+        assert_eq!(
+            outcome,
+            Outcome::Completed,
+            "a reply this fast must never be missed"
+        );
+    }
 }
