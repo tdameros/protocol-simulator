@@ -3,6 +3,7 @@
 
 mod app;
 mod connection_form;
+mod headless;
 mod ui;
 
 #[cfg(test)]
@@ -36,7 +37,24 @@ fn main() -> std::io::Result<()> {
     // One positional argument, as the window takes: a project file, or a folder
     // of frame definitions. No file picker, since the machine this runs on is
     // usually reached over ssh and has no desktop to put one on.
-    let opened_with = std::env::args().nth(1).map(PathBuf::from);
+    //
+    // `--run NAME` skips the screen entirely and runs one scenario from the
+    // project, for a service started at boot rather than a person at a
+    // keyboard.
+    let mut opened_with = None;
+    let mut run_scenario = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--run" {
+            run_scenario = args.next();
+        } else {
+            opened_with = Some(PathBuf::from(arg));
+        }
+    }
+
+    if let Some(name) = run_scenario {
+        std::process::exit(headless::run(opened_with, &name));
+    }
 
     // Raw mode, the alternate screen, and a panic hook that puts the terminal
     // back. Restoring is the whole point: a front end that leaves a broken

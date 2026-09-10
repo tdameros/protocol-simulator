@@ -12,6 +12,20 @@ stop.
 A scenario that names a connection the project does not have reports it and does
 not start.
 
+## From the command line
+
+The terminal front end's `--run` runs one scenario with no screen, printing
+what happens and exiting once it ends:
+
+```sh
+protocol-simulator-tui project.toml --run "Heartbeat 10 Hz"
+```
+
+Connections marked autoconnect are opened first. The exit code is 0 once the
+scenario completed, 1 for anything else, including a name `--run` does not
+find. A scenario with no `times` runs until the process is stopped, which for
+a service started at boot is `SIGTERM`, the same as any other.
+
 ## Steps
 
 | Step | Key | Carries |
