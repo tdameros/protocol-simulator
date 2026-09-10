@@ -1161,3 +1161,117 @@ wait_for = { frame = "Beacon", match = { synk = 1 }, timeout_ms = 2000 }
     };
     assert!(reason.contains("synk"), "{reason}");
 }
+
+/// A field one step captures from a reply reaches another step's frame, sent
+/// on an entirely different link, exactly as `sim_core::runner` is meant to
+/// carry it: decoded once, coerced to the target field, gone once the pass
+/// that captured it ends.
+#[tokio::test]
+async fn a_captured_field_reaches_a_frame_sent_on_another_link() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let to_server1 = "127.0.0.1:19870".parse().unwrap();
+    let server1 = "127.0.0.1:19871".parse().unwrap();
+    let to_server2 = "127.0.0.1:19872".parse().unwrap();
+    let server2 = "127.0.0.1:19873".parse().unwrap();
+    for (name, bind, remote) in [
+        ("to_server1", to_server1, server1),
+        ("server1", server1, to_server1),
+        ("to_server2", to_server2, server2),
+        ("server2", server2, to_server2),
+    ] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["to_server1", "server1", "to_server2", "server2"]).await;
+
+    let request = sim_core::frame::schema::from_toml(
+        r#"
+name = "Request"
+[[field]]
+name = "id"
+type = "u8"
+"#,
+    )
+    .expect("the test frame should parse");
+    let response = sim_core::frame::schema::from_toml(
+        r#"
+name = "Response"
+[[field]]
+name = "code"
+type = "u8"
+"#,
+    )
+    .expect("the test frame should parse");
+    let forward = sim_core::frame::schema::from_toml(
+        r#"
+name = "Forward"
+[[field]]
+name = "payload"
+type = "u8"
+"#,
+    )
+    .expect("the test frame should parse");
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Relay"
+
+[[scenario.step]]
+send = "Request"
+on = "to_server1"
+
+[[scenario.step]]
+wait_for = { frame = "Response", timeout_ms = 4000, capture = { code = "server1_code" } }
+on = "to_server1"
+
+[[scenario.step]]
+send = "Forward"
+on = "to_server2"
+from_capture = { payload = "server1_code" }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![request, response, forward],
+    })
+    .await
+    .unwrap();
+
+    wait_for(
+        &mut rx,
+        |event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server1"),
+    )
+    .await;
+
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("server1"),
+        bytes: vec![42],
+    })
+    .await
+    .unwrap();
+
+    let seen = gather_until(&mut rx, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server2"))
+            && finished_with(events, "Relay", &sim_core::Outcome::Completed)
+    })
+    .await;
+
+    let forwarded = beacons(&seen, "server2");
+    assert_eq!(
+        forwarded,
+        vec![vec![42]],
+        "the captured code, not a default"
+    );
+}

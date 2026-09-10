@@ -723,12 +723,24 @@ fn bits_details(ui: &mut Ui, index: usize, repr: &mut ScalarType, bits: &mut Vec
     // A scalar is eight bytes at most, so the width always fits.
     let room = u32::try_from(repr.size() * 8).unwrap_or(64);
     let used: u32 = bits.iter().map(|bit| bit.width).sum();
-    ui.label(
-        RichText::new(format!(
-            "{used} of {room} bits packed, most significant first"
-        ))
-        .weak(),
-    );
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!(
+                "{used} of {room} bits packed, most significant first"
+            ))
+            .weak(),
+        );
+        if ui
+            .add_enabled(
+                bits.len() > 1,
+                egui::Button::new(format!("{} Reverse order", icons::ARROWS_DOWN_UP)),
+            )
+            .on_hover_text("Swap most significant first for least significant first")
+            .clicked()
+        {
+            bits.reverse();
+        }
+    });
 
     let mut remove = None;
     for (at, bit) in bits.iter_mut().enumerate() {

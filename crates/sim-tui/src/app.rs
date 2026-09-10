@@ -80,6 +80,15 @@ enum FramesFocus {
     Fields,
 }
 
+/// Which pane of the Traffic view a key acts on, the same split as
+/// `FramesFocus` and for the same reason: up/down means one thing in the row
+/// list and another once it has moved into the decoded fields underneath it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrafficFocus {
+    Rows,
+    Fields,
+}
+
 /// One line of a frame's detail: a field on its own, or one flag inside a
 /// bitfield.
 ///
@@ -112,6 +121,8 @@ pub enum PickPurpose {
     EnumField { field: usize },
     /// Settles which connection a frame is sent on.
     FrameTarget,
+    /// Settles which connection hand-typed hex bytes are sent on.
+    HexTarget,
 }
 
 /// One value typed as text, and what it belongs to.
@@ -837,7 +848,7 @@ impl StepEdit {
                     frame,
                     with,
                     counters,
-                    ..
+                    from_capture,
                 } = &step.action
                 else {
                     return (String::new(), String::new());
@@ -850,6 +861,8 @@ impl StepEdit {
                 let counted = counters.contains_key(&field_def.name);
                 let value = if let Some(value) = overridden {
                     reading::describe(field_def, value, false)
+                } else if let Some(variable) = from_capture.get(&field_def.name) {
+                    format!("from capture: {variable}")
                 } else if counted {
                     "counted".to_owned()
                 } else {
@@ -948,7 +961,12 @@ impl StepEdit {
             }
             StepField::WaitField(i) => {
                 let Action::WaitFor {
-                    expect: Expect::Frame { frame, values },
+                    expect:
+                        Expect::Frame {
+                            frame,
+                            values,
+                            capture,
+                        },
                     ..
                 } = &step.action
                 else {
@@ -959,13 +977,16 @@ impl StepEdit {
                     return (String::new(), String::new());
                 };
                 let matched = values.contains_key(&field_def.name);
-                let value = if matched {
+                let mut value = if matched {
                     values
                         .get(&field_def.name)
                         .map_or_else(String::new, |v| reading::describe(field_def, v, false))
                 } else {
                     "any value".to_owned()
                 };
+                if let Some(variable) = capture.get(&field_def.name) {
+                    value = format!("{value} · capture as {variable}");
+                }
                 (format!("  {}", field_def.name), value)
             }
             StepField::Limited => {
@@ -1051,32 +1072,64 @@ impl StepEdit {
                     String::new()
                 }
             }
-            StepField::SendField(i) => {
-                if let Action::Send { frame, with, .. } = &step.action {
-                    let field_def = frames
-                        .iter()
-                        .find(|f| &f.name == frame)
-                        .and_then(|d| d.fields.get(*i));
-                    if let Some(field_def) = field_def {
-                        with.get(&field_def.name)
-                            .map_or_else(String::new, |value| match &field_def.kind {
-                                FieldKind::Bytes { .. } => {
-                                    value.as_bytes().map_or_else(String::new, hex::packed)
-                                }
-                                FieldKind::Text { .. } => {
-                                    value.as_text().unwrap_or_default().to_owned()
-                                }
-                                _ => reading::describe(field_def, value, false),
-                            })
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                }
-            }
+            StepField::SendField(i) => Self::reseed_send_field(*i, step, frames),
+            StepField::WaitField(i) => Self::reseed_wait_field(*i, step, frames),
             _ => String::new(),
         };
+    }
+
+    fn reseed_send_field(i: usize, step: &Step, frames: &[FrameDef]) -> String {
+        let Action::Send { frame, with, .. } = &step.action else {
+            return String::new();
+        };
+        let Some(field_def) = frames
+            .iter()
+            .find(|f| &f.name == frame)
+            .and_then(|d| d.fields.get(i))
+        else {
+            return String::new();
+        };
+        with.get(&field_def.name)
+            .map_or_else(String::new, |value| match &field_def.kind {
+                FieldKind::Bytes { .. } => value.as_bytes().map_or_else(String::new, hex::packed),
+                FieldKind::Text { .. } => value.as_text().unwrap_or_default().to_owned(),
+                _ => reading::describe(field_def, value, false),
+            })
+    }
+
+    fn reseed_wait_field(i: usize, step: &Step, frames: &[FrameDef]) -> String {
+        let Action::WaitFor {
+            expect:
+                Expect::Frame {
+                    frame,
+                    values,
+                    capture,
+                },
+            ..
+        } = &step.action
+        else {
+            return String::new();
+        };
+        let Some(field_def) = frames
+            .iter()
+            .find(|f| &f.name == frame)
+            .and_then(|d| d.fields.get(i))
+        else {
+            return String::new();
+        };
+        // A captured name is what free text edits while both could apply, the
+        // two never actually meeting: a field worth remembering by name is
+        // rarely also one pinned to an exact value.
+        if let Some(variable) = capture.get(&field_def.name) {
+            return variable.clone();
+        }
+        values
+            .get(&field_def.name)
+            .map_or_else(String::new, |value| match &field_def.kind {
+                FieldKind::Bytes { .. } => value.as_bytes().map_or_else(String::new, hex::packed),
+                FieldKind::Text { .. } => value.as_text().unwrap_or_default().to_owned(),
+                _ => reading::describe(field_def, value, false),
+            })
     }
 }
 
@@ -1327,6 +1380,11 @@ pub struct App {
     /// differently shaped frame resets the cursor rather than landing on
     /// whatever row happened to share its number.
     field_at: Option<(String, usize)>,
+    /// Which pane of the Traffic view up/down acts on.
+    traffic_focus: TrafficFocus,
+    /// How far the Traffic tab's decoded fields pane has scrolled, reset
+    /// whenever the row it describes changes.
+    traffic_field_scroll: usize,
 }
 
 impl Default for App {
@@ -1353,6 +1411,8 @@ impl Default for App {
             frame_row: None,
             frame_focus: FramesFocus::Library,
             field_at: None,
+            traffic_focus: TrafficFocus::Rows,
+            traffic_field_scroll: 0,
         };
         // Compared against from the first key pressed, so an app that has not
         // been touched yet is never mistaken for one with unsaved work.
@@ -1523,6 +1583,19 @@ impl App {
         self.frame_focus == FramesFocus::Fields
     }
 
+    /// How far the Traffic tab's decoded fields pane has scrolled.
+    #[must_use]
+    pub fn traffic_field_scroll(&self) -> usize {
+        self.traffic_field_scroll
+    }
+
+    /// Whether up/down in the Traffic tab scrolls the decoded fields pane
+    /// rather than moving the row being read.
+    #[must_use]
+    pub fn traffic_focus_is_fields(&self) -> bool {
+        self.traffic_focus == TrafficFocus::Fields
+    }
+
     /// The row under the cursor in the fields pane, for the frame currently
     /// on show.
     #[must_use]
@@ -1582,7 +1655,16 @@ impl App {
     pub fn selected_reading(&mut self) -> Option<(&LogEntry, Reading<'_>)> {
         let id = self.monitor_id()?;
         let seq = self.session.monitors.get(&id)?.selected?;
-        let entry = self.session.log.iter().find(|entry| entry.seq == seq)?;
+        // Binary rather than linear: this runs on every redraw, whether or not
+        // a key was pressed, and the log only ever grows at one end, seq
+        // ascending, which is exactly what a search needs to stay fast at ten
+        // thousand entries and ten redraws a second.
+        let at = self
+            .session
+            .log
+            .binary_search_by_key(&seq, |entry| entry.seq)
+            .ok()?;
+        let entry = self.session.log.get(at)?;
         let decode_as = &mut self.session.monitors.get_mut(&id)?.decode_as;
         let reading = reading::read(&self.session.frames, entry, decode_as);
         Some((entry, reading))
@@ -1700,7 +1782,7 @@ impl App {
         if let Some(Overlay::Step(_)) = self.overlay {
             return Some(&[
                 ("Tab", "next field"),
-                ("left/right", "change"),
+                ("left/right", "change, capture"),
                 ("space", "toggle"),
                 ("type", "edit"),
                 ("Esc", "done"),
@@ -1715,6 +1797,7 @@ impl App {
                 ("left/right", "change"),
                 ("a", "add"),
                 ("x", "remove"),
+                ("r", "reverse bits"),
                 ("Esc", "done"),
             ]);
         }
@@ -1741,11 +1824,16 @@ impl App {
         }
 
         match self.tab {
+            Tab::Traffic if self.traffic_focus == TrafficFocus::Fields => {
+                &[("up/down", "scroll"), ("Left", "row list")]
+            }
             Tab::Traffic => &[
                 ("up/down", "read a row"),
+                ("Right", "fields"),
                 ("Enter", "read as"),
                 ("p", "pause"),
                 ("f", "follow"),
+                ("c", "clear"),
                 ("/", "filter"),
             ],
             Tab::Scenarios if self.session.scenarios.draft.is_some() => &[
@@ -1763,7 +1851,7 @@ impl App {
                 ("n", "new"),
                 ("e", "edit"),
             ],
-            Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
+            Tab::HexInject => &[("Enter", "type bytes"), ("t", "target"), ("x", "clear")],
             Tab::Frames if self.session.frames.draft.is_some() => &[
                 ("up/down", "choose"),
                 ("Enter", "edit"),
@@ -2392,6 +2480,7 @@ impl App {
                 KeyCode::Enter => self.overlay_edit_frame_bit(field_index, *i, &field.kind),
                 KeyCode::Char('a') => self.add_frame_bit(field_index),
                 KeyCode::Char('x') => self.remove_frame_bit(field_index, *i),
+                KeyCode::Char('r') => self.reverse_frame_bits(field_index),
                 _ => {}
             },
             FrameFieldRow::CoversFrom | FrameFieldRow::CoversTo => {
@@ -2564,6 +2653,21 @@ impl App {
         }
     }
 
+    /// Swaps most-significant-first for least-significant-first, so a bitfield
+    /// entered backwards can be fixed in place rather than retyped bit by bit.
+    fn reverse_frame_bits(&mut self, field_index: usize) {
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, field_index)
+        else {
+            return;
+        };
+        if let FieldKind::Bits { bits, .. } = &mut field.kind {
+            bits.reverse();
+        }
+    }
+
     fn cycle_frame_coverage(&mut self, field_index: usize, from_end: bool, delta: isize) {
         let Some(draft) = self.session.frames.draft.as_ref() else {
             return;
@@ -2621,6 +2725,26 @@ impl App {
         self.overlay = Some(Overlay::Pick(
             Picker::new("Target connection", connected),
             PickPurpose::FrameTarget,
+        ));
+    }
+
+    /// Offers the connections currently up, to choose which one hand-typed
+    /// hex bytes go out on.
+    fn pick_hex_target(&mut self) {
+        let connected: Vec<String> = self
+            .session
+            .connections
+            .iter()
+            .filter(|(_, entry)| entry.status == ConnectionStatus::Connected)
+            .map(|(id, _)| id.0.clone())
+            .collect();
+        if connected.is_empty() {
+            self.session.last_error = Some("No connected link to send to.".to_owned());
+            return;
+        }
+        self.overlay = Some(Overlay::Pick(
+            Picker::new("Target connection", connected),
+            PickPurpose::HexTarget,
         ));
     }
 
@@ -2785,6 +2909,7 @@ impl App {
                         monitor.decode_as = Some(taken);
                     }
                 }
+                self.traffic_field_scroll = 0;
             }
             PickPurpose::EnumField { field } => {
                 let Some(frame) = self.session.frames.selected_frame().cloned() else {
@@ -2802,6 +2927,9 @@ impl App {
             }
             PickPurpose::FrameTarget => {
                 self.session.frame_target = Some(sim_core::ConnectionId(taken));
+            }
+            PickPurpose::HexTarget => {
+                self.session.hex_target = Some(sim_core::ConnectionId(taken));
             }
         }
     }
@@ -3111,6 +3239,7 @@ impl App {
         match code {
             KeyCode::Enter | KeyCode::Char('i') => self.editing = true,
             KeyCode::Char('x') => self.session.hex_input.clear(),
+            KeyCode::Char('t') => self.pick_hex_target(),
             _ => return false,
         }
         true
@@ -3414,6 +3543,8 @@ impl App {
                             | StepField::WaitPattern
                             | StepField::WaitOffset
                             | StepField::TimeoutMs
+                            | StepField::SendField(_)
+                            | StepField::WaitField(_)
                     )
                 );
                 if reseed_kinds
@@ -3555,6 +3686,43 @@ impl App {
                 definition,
                 &field_def.name,
                 on,
+            );
+            return;
+        }
+        if matches!(code, KeyCode::Char('c')) {
+            let Action::Send { from_capture, .. } = &step.action else {
+                return;
+            };
+            let on = !from_capture.contains_key(&field_def.name);
+            // Turning it off is always allowed, a step moved or removed out
+            // from under a capture being the one way this field's own
+            // variable can already be gone from `available`. Turning it on
+            // needs something to turn it on to.
+            let available = scenarios::captured_before(&draft.scenario, index);
+            if on && available.is_empty() {
+                return;
+            }
+            scenarios::set_from_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                on.then(|| available[0].as_str()),
+            );
+            return;
+        }
+        let Action::Send { from_capture, .. } = &step.action else {
+            return;
+        };
+        if let Some(variable) = from_capture.get(&field_def.name) {
+            let Some(delta) = arrow_delta(code) else {
+                return;
+            };
+            let available = scenarios::captured_before(&draft.scenario, index);
+            let choices: Vec<&String> = available.iter().collect();
+            let next = crate::connection_form::cycle(&choices, variable, delta).clone();
+            scenarios::set_from_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                Some(&next),
             );
             return;
         }
@@ -3770,7 +3938,12 @@ impl App {
                         if let Some(Step {
                             action:
                                 Action::WaitFor {
-                                    expect: Expect::Frame { frame, values },
+                                    expect:
+                                        Expect::Frame {
+                                            frame,
+                                            values,
+                                            capture,
+                                        },
                                     ..
                                 },
                             ..
@@ -3784,37 +3957,12 @@ impl App {
                             let at = at.rem_euclid(i32::try_from(names.len()).unwrap_or(1));
                             frame.clone_from(&names[usize::try_from(at).unwrap_or(0)]);
                             values.clear();
+                            capture.clear();
                         }
                     }
                 }
             }
-            StepField::WaitField(i) => {
-                let Some(step) = draft.scenario.steps.get(index).cloned() else {
-                    return;
-                };
-                let Action::WaitFor {
-                    expect: Expect::Frame { frame, values },
-                    ..
-                } = &step.action
-                else {
-                    return;
-                };
-                let Some(definition) = frames.iter().find(|f| f.name == *frame) else {
-                    return;
-                };
-                let Some(field_def) = definition.fields.get(*i) else {
-                    return;
-                };
-                if matches!(code, KeyCode::Char(' ')) {
-                    let on = !values.contains_key(&field_def.name);
-                    scenarios::set_match(
-                        draft.scenario.steps.get_mut(index).expect("just read"),
-                        definition,
-                        &field_def.name,
-                        on,
-                    );
-                }
-            }
+            StepField::WaitField(i) => self.act_on_wait_field(index, *i, code, frames, text),
             StepField::Limited => {
                 if matches!(code, KeyCode::Char(' ')) {
                     if let Some(Step {
@@ -3841,6 +3989,97 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn act_on_wait_field(
+        &mut self,
+        index: usize,
+        i: usize,
+        code: KeyCode,
+        frames: &[FrameDef],
+        text: &mut String,
+    ) {
+        let Some(draft) = self.session.scenarios.draft.as_mut() else {
+            return;
+        };
+        let Some(step) = draft.scenario.steps.get(index).cloned() else {
+            return;
+        };
+        let Action::WaitFor {
+            expect:
+                Expect::Frame {
+                    frame,
+                    values,
+                    capture,
+                },
+            ..
+        } = &step.action
+        else {
+            return;
+        };
+        let Some(definition) = frames.iter().find(|f| f.name == *frame) else {
+            return;
+        };
+        let Some(field_def) = definition.fields.get(i) else {
+            return;
+        };
+        if matches!(code, KeyCode::Char(' ')) {
+            let on = !values.contains_key(&field_def.name);
+            scenarios::set_match(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                definition,
+                &field_def.name,
+                on,
+            );
+            return;
+        }
+        // Left/right rather than a letter key: a variable name is free text,
+        // and no letter is safe to reserve as its own toggle once the name
+        // being typed might contain that very letter.
+        if arrow_delta(code).is_some() {
+            let on = !capture.contains_key(&field_def.name);
+            scenarios::set_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                on,
+            );
+            // Turning it on seeds the variable's name from the field's own,
+            // and the scratch buffer has to agree before the next key is
+            // read as extending it rather than starting over from nothing.
+            if on {
+                field_def.name.clone_into(text);
+            }
+            return;
+        }
+        if capture.contains_key(&field_def.name) {
+            edit_text(code, text);
+            scenarios::rename_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                text,
+            );
+            return;
+        }
+        // Editing only reaches a value already ticked in: an untouched field
+        // still means any value at all is accepted.
+        if !values.contains_key(&field_def.name) {
+            return;
+        }
+        edit_text(code, text);
+        let Some(value) = typed_override_value(&field_def.kind, text) else {
+            return;
+        };
+        if let Some(Step {
+            action:
+                Action::WaitFor {
+                    expect: Expect::Frame { values, .. },
+                    ..
+                },
+            ..
+        }) = draft.scenario.steps.get_mut(index)
+        {
+            values.insert(field_def.name.clone(), value);
         }
     }
 
@@ -3881,9 +4120,20 @@ impl App {
     /// The keys the traffic list answers to, and whether it took this one.
     fn watching(&mut self, code: KeyCode) -> bool {
         match code {
-            KeyCode::Down | KeyCode::Char('j') => self.step(1),
-            KeyCode::Up | KeyCode::Char('k') => self.step(-1),
-            KeyCode::Esc => self.with_monitor(|monitor| monitor.selected = None),
+            KeyCode::Down | KeyCode::Char('j') => self.traffic_move(1),
+            KeyCode::Up | KeyCode::Char('k') => self.traffic_move(-1),
+            KeyCode::Left => self.traffic_focus = TrafficFocus::Rows,
+            KeyCode::Right
+                if self
+                    .monitor()
+                    .is_some_and(|monitor| monitor.selected.is_some()) =>
+            {
+                self.traffic_focus = TrafficFocus::Fields;
+            }
+            KeyCode::Esc => {
+                self.traffic_focus = TrafficFocus::Rows;
+                self.with_monitor(|monitor| monitor.selected = None);
+            }
             KeyCode::Enter | KeyCode::Char('d') => self.pick_frame(),
             KeyCode::Char('f') => self.with_monitor(|monitor| monitor.follow = !monitor.follow),
             KeyCode::Char('p') => self.toggle_paused(),
@@ -3901,6 +4151,17 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// Up/down, aimed at whichever pane has the keyboard: the row list, or
+    /// the decoded fields underneath the row currently being read.
+    fn traffic_move(&mut self, delta: isize) {
+        match self.traffic_focus {
+            TrafficFocus::Rows => self.step(delta),
+            TrafficFocus::Fields => {
+                self.traffic_field_scroll = self.traffic_field_scroll.saturating_add_signed(delta);
+            }
+        }
     }
 
     /// Applies `change` to the view on show, if there is one.
@@ -3944,6 +4205,7 @@ impl App {
             return;
         };
         self.current_monitor = Some(crate::connection_form::cycle(&ids, current, delta));
+        self.traffic_focus = TrafficFocus::Rows;
     }
 
     /// Closes the view on show. Refused on the last one: a bench with no
@@ -3956,6 +4218,7 @@ impl App {
         if let Some(id) = self.monitor_id() {
             self.session.close_monitor(id);
             self.current_monitor = None;
+            self.traffic_focus = TrafficFocus::Rows;
         }
     }
 
@@ -4031,5 +4294,6 @@ impl App {
         };
         monitor.selected = Some(seqs[at]);
         monitor.follow = false;
+        self.traffic_field_scroll = 0;
     }
 }

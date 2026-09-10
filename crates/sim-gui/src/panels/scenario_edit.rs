@@ -51,6 +51,12 @@ pub fn steps(ui: &mut Ui, state: &mut Session) {
         return;
     };
     let count = draft.scenario.steps.len();
+    // Worked out before the loop borrows the steps mutably: a step can only
+    // read what an earlier one captured, never what one later in the file
+    // will.
+    let available: Vec<Vec<String>> = (0..count)
+        .map(|index| scenarios::captured_before(&draft.scenario, index))
+        .collect();
 
     for (index, step) in draft.scenario.steps.iter_mut().enumerate() {
         ui.push_id(index, |ui| {
@@ -104,7 +110,7 @@ pub fn steps(ui: &mut Ui, state: &mut Session) {
                 if ActionKind::of(&step.action).needs_a_connection() {
                     targets(ui, step, &links);
                 }
-                body(ui, step, &frames, hex);
+                body(ui, step, &frames, hex, &available[index]);
             });
             ui.separator();
         });
@@ -153,7 +159,7 @@ fn targets(ui: &mut Ui, step: &mut Step, links: &[ConnectionId]) {
     });
 }
 
-fn body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
+fn body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool, available: &[String]) {
     match &mut step.action {
         Action::Wait { delay } => {
             let mut millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
@@ -171,12 +177,12 @@ fn body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
         Action::Raw { bytes } => {
             hex_field(ui, "bytes", bytes);
         }
-        Action::Send { .. } => send_body(ui, step, frames, hex),
+        Action::Send { .. } => send_body(ui, step, frames, hex, available),
         Action::WaitFor { .. } => wait_body(ui, step, frames, hex),
     }
 }
 
-fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
+fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool, available: &[String]) {
     let Action::Send { frame, .. } = &step.action else {
         return;
     };
@@ -217,63 +223,123 @@ fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
         .min_col_width(0.0)
         .show(ui, |ui| {
             for field in &definition.fields {
-                let Action::Send { with, counters, .. } = &mut step.action else {
-                    return;
-                };
                 // Computed on send, so there is nothing here to decide.
                 if matches!(field.kind, sim_core::frame::FieldKind::Checksum { .. }) {
                     continue;
                 }
-
-                let counted = counters.contains_key(&field.name);
-                let mut overridden = with.contains_key(&field.name);
-                if ui
-                    .add_enabled(!counted, egui::Checkbox::new(&mut overridden, &field.name))
-                    .changed()
-                {
-                    scenarios::set_override(step, &definition, &field.name, overridden);
-                }
-
-                let Action::Send { with, counters, .. } = &mut step.action else {
-                    return;
-                };
-                if with.contains_key(&field.name) {
-                    value_widget(ui, field, &field.kind, with, hex);
-                } else if counted {
-                    ui.label(RichText::new("counted").weak());
-                } else {
-                    ui.label(RichText::new("frame default").weak());
-                }
-
-                let mut counting = counters.contains_key(&field.name);
-                if ui.checkbox(&mut counting, "count").changed() {
-                    scenarios::set_counter(step, &field.name, counting);
-                }
-
-                let Action::Send { counters, .. } = &mut step.action else {
-                    return;
-                };
-                if let Some(counter) = counters.get_mut(&field.name) {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("from").weak());
-                        ui.add(DragValue::new(&mut counter.from));
-                        ui.label(RichText::new("by").weak());
-                        ui.add(DragValue::new(&mut counter.step).range(1..=u64::MAX));
-
-                        let mut wraps = counter.wrap.is_some();
-                        if ui.checkbox(&mut wraps, "wrap at").changed() {
-                            counter.wrap = wraps.then_some(255);
-                        }
-                        if let Some(wrap) = &mut counter.wrap {
-                            ui.add(DragValue::new(wrap));
-                        }
-                    });
-                } else {
-                    ui.label("");
-                }
+                override_row(ui, step, &definition, field, hex, available);
                 ui.end_row();
             }
         });
+}
+
+/// One field of a `send` step: held at a value, counted up, filled from a
+/// capture, or left at the frame's own default, exactly one at a time.
+fn override_row(
+    ui: &mut Ui,
+    step: &mut Step,
+    definition: &FrameDef,
+    field: &sim_core::frame::FieldDef,
+    hex: bool,
+    available: &[String],
+) {
+    let Action::Send {
+        with,
+        counters,
+        from_capture,
+        ..
+    } = &step.action
+    else {
+        return;
+    };
+    let captured = from_capture.contains_key(&field.name);
+    let counted = counters.contains_key(&field.name);
+    let mut overridden = with.contains_key(&field.name);
+    if ui
+        .add_enabled(
+            !counted && !captured,
+            egui::Checkbox::new(&mut overridden, &field.name),
+        )
+        .changed()
+    {
+        scenarios::set_override(step, definition, &field.name, overridden);
+    }
+
+    let Action::Send {
+        with, from_capture, ..
+    } = &mut step.action
+    else {
+        return;
+    };
+    if with.contains_key(&field.name) {
+        value_widget(ui, field, &field.kind, with, hex);
+    } else if let Some(variable) = from_capture.get_mut(&field.name) {
+        ComboBox::from_id_salt(("from_capture", &field.name))
+            .selected_text(variable.as_str())
+            .show_ui(ui, |ui| {
+                for name in available {
+                    ui.selectable_value(variable, name.clone(), name);
+                }
+            });
+    } else if counted {
+        ui.label(RichText::new("counted").weak());
+    } else {
+        ui.label(RichText::new("frame default").weak());
+    }
+
+    let Action::Send { counters, .. } = &mut step.action else {
+        return;
+    };
+    let mut counting = counters.contains_key(&field.name);
+    let mut toggled_counting = false;
+    let mut capturing = captured;
+    let mut toggled_capturing = false;
+    ui.horizontal(|ui| {
+        toggled_counting = ui
+            .add_enabled(!captured, egui::Checkbox::new(&mut counting, "count"))
+            .changed();
+        // Shown disabled, never hidden, once it is already on: a step moved
+        // or removed out from under it can leave `captured` true with
+        // `available` empty, and that is exactly the row unticking it from
+        // has to stay reachable on.
+        if captured || !available.is_empty() {
+            toggled_capturing = ui
+                .add_enabled(
+                    !counted,
+                    egui::Checkbox::new(&mut capturing, "from capture"),
+                )
+                .changed();
+        }
+    });
+    if toggled_counting {
+        scenarios::set_counter(step, &field.name, counting);
+    }
+    if toggled_capturing {
+        let variable = capturing.then(|| available.first()).flatten();
+        scenarios::set_from_capture(step, &field.name, variable.map(String::as_str));
+    }
+
+    let Action::Send { counters, .. } = &mut step.action else {
+        return;
+    };
+    if let Some(counter) = counters.get_mut(&field.name) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("from").weak());
+            ui.add(DragValue::new(&mut counter.from));
+            ui.label(RichText::new("by").weak());
+            ui.add(DragValue::new(&mut counter.step).range(1..=u64::MAX));
+
+            let mut wraps = counter.wrap.is_some();
+            if ui.checkbox(&mut wraps, "wrap at").changed() {
+                counter.wrap = wraps.then_some(255);
+            }
+            if let Some(wrap) = &mut counter.wrap {
+                ui.add(DragValue::new(wrap));
+            }
+        });
+    } else {
+        ui.label("");
+    }
 }
 
 fn wait_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
@@ -351,7 +417,12 @@ fn pattern_body(ui: &mut Ui, expect: &mut Expect) {
 
 fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
     let Action::WaitFor {
-        expect: Expect::Frame { frame, values },
+        expect:
+            Expect::Frame {
+                frame,
+                values,
+                capture,
+            },
         ..
     } = &mut step.action
     else {
@@ -375,6 +446,7 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
                             {
                                 frame.clone_from(&known.name);
                                 values.clear();
+                                capture.clear();
                             }
                         }
                     });
@@ -406,15 +478,20 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
             // A ticked field carries the value it has to arrive with, edited
             // with the very widgets a `send` step uses. Ticking seeds the
             // frame's own default, so a sync word is still one click, and
-            // anything else can be asked for outright.
+            // anything else can be asked for outright. A field can also be
+            // remembered under a name of its own, for a later step to send on.
             let mut toggled: Option<(String, bool)> = None;
+            let mut capture_toggled: Option<(String, bool)> = None;
             Grid::new("matching")
-                .num_columns(2)
+                .num_columns(3)
                 .min_col_width(0.0)
                 .show(ui, |ui| {
                     for field in &definition.fields {
                         let Action::WaitFor {
-                            expect: Expect::Frame { values, .. },
+                            expect:
+                                Expect::Frame {
+                                    values, capture, ..
+                                },
                             ..
                         } = &mut step.action
                         else {
@@ -429,11 +506,24 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
                         } else {
                             ui.label(RichText::new("any value").weak());
                         }
+
+                        let mut capturing = capture.contains_key(&field.name);
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut capturing, "capture as").changed() {
+                                capture_toggled = Some((field.name.clone(), capturing));
+                            }
+                            if let Some(variable) = capture.get_mut(&field.name) {
+                                ui.text_edit_singleline(variable);
+                            }
+                        });
                         ui.end_row();
                     }
                 });
             if let Some((name, on)) = toggled {
                 scenarios::set_match(step, &definition, &name, on);
+            }
+            if let Some((name, on)) = capture_toggled {
+                scenarios::set_capture(step, &name, on);
             }
         }
     }

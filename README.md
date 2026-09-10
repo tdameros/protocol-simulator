@@ -38,6 +38,13 @@ make tui-embedded
 scp target/aarch64-unknown-linux-musl/release/protocol-simulator-tui root@board:/tmp/
 ```
 
+`--run` skips the screen and runs one scenario from a project, exiting once it
+completes, for a service started at boot rather than a person at a keyboard:
+
+```sh
+protocol-simulator-tui project.toml --run "Heartbeat 10 Hz"
+```
+
 ## Concepts
 
 | Term | Is |

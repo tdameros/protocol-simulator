@@ -52,7 +52,7 @@ pub(crate) struct Context {
     pub received: broadcast::Receiver<Heard>,
 }
 
-pub(crate) async fn run(mut context: Context) -> Outcome {
+pub(crate) async fn run(context: Context) -> Outcome {
     let scenario = context.scenario.clone();
 
     // The first tick completes at once, so pass zero starts without waiting a
@@ -78,6 +78,19 @@ pub(crate) async fn run(mut context: Context) -> Outcome {
             ticker.tick().await;
         }
 
+        // Fresh every pass: a value a repeat's earlier pass captured has
+        // nothing to do with the reply this one is about to wait for.
+        let mut variables: BTreeMap<String, Value> = BTreeMap::new();
+
+        // Subscribed here, before this pass's first send, rather than inside
+        // each wait: a reply can be broadcast the instant the engine writes
+        // it to the socket, which can beat a scenario task back to a
+        // subscribe call made only once the wait step itself starts running.
+        // Resubscribing per pass rather than reusing one for the whole
+        // scenario keeps the same guarantee the old per-wait subscribe gave:
+        // a reply left over from an earlier pass cannot satisfy this one.
+        let mut received = context.received.resubscribe();
+
         for (index, step) in scenario.steps.iter().enumerate() {
             let _ = context
                 .events
@@ -94,7 +107,8 @@ pub(crate) async fn run(mut context: Context) -> Outcome {
                 pass,
                 &context.frames,
                 &context.commands,
-                &mut context.received,
+                &mut received,
+                &mut variables,
             )
             .await
             {
@@ -125,6 +139,7 @@ async fn execute(
     frames: &[FrameDef],
     commands: &mpsc::WeakSender<Command>,
     received: &mut broadcast::Receiver<Heard>,
+    variables: &mut BTreeMap<String, Value>,
 ) -> StepResult {
     match &step.action {
         Action::Wait { delay } => {
@@ -136,7 +151,8 @@ async fn execute(
             frame,
             with,
             counters,
-        } => match encode(frame, with, counters, pass, frames) {
+            from_capture,
+        } => match encode(frame, with, counters, from_capture, variables, pass, frames) {
             // The same bytes to every target, so two links carrying the same
             // simulated device see the same counter on the same pass.
             Ok(bytes) => send_to_all(commands, &step.targets, &bytes).await,
@@ -151,17 +167,16 @@ async fn execute(
                 Err(reason) => return StepResult::Failed(reason),
             };
             let (pattern, anchor) = (&pattern, &anchor);
-            // Started from where the stream is now, not from where the scenario
-            // subscribed. Held across steps, the buffer would let a frame from
-            // an earlier pass, or from before this wait was ever reached,
-            // release it: a repeating handshake would then report success
-            // without the far side having answered once.
-            //
-            // Nothing is lost by starting here. A send is posted to the engine
-            // and travels on from there, so the step that precedes a wait has
-            // not even reached the socket by the time this runs; a reply cannot
-            // already be in the buffer.
-            let mut received = received.resubscribe();
+
+            // Non-empty only on a single target, enforced at load: there is
+            // exactly one answer here to decode and remember.
+            let capturing = match expect {
+                Expect::Frame { frame, capture, .. } if !capture.is_empty() => frames
+                    .iter()
+                    .find(|held| &held.name == frame)
+                    .map(|held| (held, capture)),
+                _ => None,
+            };
 
             // Every target has to answer, so each one is struck off as it does
             // and the wait ends when none is left.
@@ -172,6 +187,9 @@ async fn execute(
                         Ok((id, bytes)) => {
                             if pattern.found_in(&bytes, *anchor) {
                                 pending.remove(&id);
+                                if let Some((frame, capture)) = capturing {
+                                    store_capture(frame, capture, &bytes, variables);
+                                }
                             }
                         }
                         // Frames arrived faster than this step could look at
@@ -255,7 +273,7 @@ async fn send(
 fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor), String> {
     match expect {
         Expect::Pattern { pattern, anchor } => Ok((pattern.clone(), *anchor)),
-        Expect::Frame { frame, values } => {
+        Expect::Frame { frame, values, .. } => {
             let definition = frames
                 .iter()
                 .find(|known| &known.name == frame)
@@ -286,12 +304,16 @@ fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor),
     }
 }
 
-/// The frame's own defaults, overlaid with what the step overrides and what its
-/// counters have reached.
+/// The frame's own defaults, overlaid with what the step overrides, what an
+/// earlier step captured, and what its counters have reached, in that order:
+/// a counter is the one source that changes every pass, so it wins if a field
+/// is somehow named in more than one.
 fn encode(
     name: &str,
     with: &BTreeMap<String, Value>,
     counters: &BTreeMap<String, Counter>,
+    from_capture: &BTreeMap<String, String>,
+    variables: &BTreeMap<String, Value>,
     pass: u32,
     frames: &[FrameDef],
 ) -> Result<Vec<u8>, String> {
@@ -301,6 +323,17 @@ fn encode(
         .ok_or_else(|| format!("no frame named {name}"))?;
 
     let mut values = overlaid(frame, with)?;
+    for (field, variable) in from_capture {
+        let kind = field_kind(frame, field)?;
+        let held = variables
+            .get(variable)
+            .ok_or_else(|| format!("{name}.{field} is filled from {variable}, which is not set"))?;
+        let coerced = held
+            .clone()
+            .coerced_to(kind)
+            .ok_or_else(|| format!("{name}.{field} cannot hold {}", held.type_name()))?;
+        values.insert(field.clone(), coerced);
+    }
     for (field, counter) in counters {
         let kind = field_kind(frame, field)?;
         let value = Value::Uint(counter.at(u64::from(pass)))
@@ -310,6 +343,29 @@ fn encode(
     }
 
     codec::encode(frame, &values).map_err(|error| error.to_string())
+}
+
+/// Remembers the fields a matched frame asked to keep, decoded against the
+/// frame the wait already knows how to read.
+///
+/// A frame that will not decode, or a field with no counterpart in the frame,
+/// leaves the variable unset rather than the run: `encode` reports the gap by
+/// name when a later step actually reaches for it, which is a clearer failure
+/// than one raised here about a reply nothing yet needs.
+fn store_capture(
+    frame: &FrameDef,
+    capture: &BTreeMap<String, String>,
+    bytes: &[u8],
+    variables: &mut BTreeMap<String, Value>,
+) {
+    let Ok(decoded) = codec::decode(frame, bytes) else {
+        return;
+    };
+    for (field, variable) in capture {
+        if let Some(value) = decoded.values.get(field) {
+            variables.insert(variable.clone(), value.clone());
+        }
+    }
 }
 
 /// The frame's own defaults with `given` laid over them.
@@ -341,4 +397,77 @@ fn field_kind<'a>(frame: &'a FrameDef, field: &str) -> Result<&'a crate::frame::
         .find(|declared| declared.name == field)
         .map(|declared| &declared.kind)
         .ok_or_else(|| format!("{} has no field named {field}", frame.name))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::scenario::Repeat;
+
+    /// A device fast enough to answer before the scenario task gets back
+    /// around to listening for it: echoes the instant it sees the send,
+    /// racing whatever the scenario does next on its own thread.
+    ///
+    /// Reproduces on a real, multi-threaded runtime rather than by
+    /// controlling scheduling directly, since the bug this guards is a
+    /// cross-thread race, not an ordering within one task's own polls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reply_racing_the_send_that_caused_it_is_not_missed() {
+        const PASSES: u32 = 5000;
+        let id = ConnectionId::from("x");
+
+        let scenario = Scenario {
+            name: "Race".to_owned(),
+            description: None,
+            repeat: Some(Repeat {
+                every: Duration::from_micros(200),
+                times: Some(PASSES),
+            }),
+            steps: vec![
+                Step {
+                    targets: vec![id.clone()],
+                    action: Action::Raw { bytes: vec![0xAA] },
+                },
+                Step {
+                    targets: vec![id.clone()],
+                    action: Action::WaitFor {
+                        expect: Expect::Pattern {
+                            pattern: HexPattern::parse("C0 FE").unwrap(),
+                            anchor: Anchor::At(0),
+                        },
+                        timeout: Some(Duration::from_millis(20)),
+                    },
+                },
+            ],
+        };
+
+        let (command_tx, mut command_rx) = mpsc::channel(64);
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+        let (heard_tx, heard_rx) = broadcast::channel(64);
+
+        let echo_id = id.clone();
+        tokio::spawn(async move {
+            while command_rx.recv().await.is_some() {
+                let _ = heard_tx.send((echo_id.clone(), vec![0xC0, 0xFE]));
+            }
+        });
+
+        let context = Context {
+            scenario,
+            frames: Vec::new(),
+            commands: command_tx.downgrade(),
+            events: events_tx,
+            received: heard_rx,
+        };
+
+        let outcome = run(context).await;
+        assert_eq!(
+            outcome,
+            Outcome::Completed,
+            "a reply this fast must never be missed"
+        );
+    }
 }
