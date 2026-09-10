@@ -121,6 +121,8 @@ pub enum PickPurpose {
     EnumField { field: usize },
     /// Settles which connection a frame is sent on.
     FrameTarget,
+    /// Settles which connection hand-typed hex bytes are sent on.
+    HexTarget,
 }
 
 /// One value typed as text, and what it belongs to.
@@ -1849,7 +1851,7 @@ impl App {
                 ("n", "new"),
                 ("e", "edit"),
             ],
-            Tab::HexInject => &[("Enter", "type bytes"), ("x", "clear")],
+            Tab::HexInject => &[("Enter", "type bytes"), ("t", "target"), ("x", "clear")],
             Tab::Frames if self.session.frames.draft.is_some() => &[
                 ("up/down", "choose"),
                 ("Enter", "edit"),
@@ -2726,6 +2728,26 @@ impl App {
         ));
     }
 
+    /// Offers the connections currently up, to choose which one hand-typed
+    /// hex bytes go out on.
+    fn pick_hex_target(&mut self) {
+        let connected: Vec<String> = self
+            .session
+            .connections
+            .iter()
+            .filter(|(_, entry)| entry.status == ConnectionStatus::Connected)
+            .map(|(id, _)| id.0.clone())
+            .collect();
+        if connected.is_empty() {
+            self.session.last_error = Some("No connected link to send to.".to_owned());
+            return;
+        }
+        self.overlay = Some(Overlay::Pick(
+            Picker::new("Target connection", connected),
+            PickPurpose::HexTarget,
+        ));
+    }
+
     fn frame_move(&mut self, delta: isize) {
         match self.frame_focus {
             FramesFocus::Library => self.pick_frame_in_library(delta),
@@ -2905,6 +2927,9 @@ impl App {
             }
             PickPurpose::FrameTarget => {
                 self.session.frame_target = Some(sim_core::ConnectionId(taken));
+            }
+            PickPurpose::HexTarget => {
+                self.session.hex_target = Some(sim_core::ConnectionId(taken));
             }
         }
     }
@@ -3214,6 +3239,7 @@ impl App {
         match code {
             KeyCode::Enter | KeyCode::Char('i') => self.editing = true,
             KeyCode::Char('x') => self.session.hex_input.clear(),
+            KeyCode::Char('t') => self.pick_hex_target(),
             _ => return false,
         }
         true

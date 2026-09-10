@@ -622,6 +622,27 @@ fn bytes_typed_by_hand_are_counted_before_they_are_sent() {
     assert!(shown.contains("on bus"), "{shown}");
 }
 
+/// The only way to aim hand-typed bytes anywhere but the first connection.
+#[test]
+fn a_hex_targets_link_can_be_chosen_from_the_connected_ones() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    linked(&mut app, "spare", ConnectionStatus::Connected);
+
+    press(&mut app, KeyCode::Char('3'));
+    let shown = screen(&mut app);
+    assert!(shown.contains("on bus"), "defaults to the first: {shown}");
+
+    press(&mut app, KeyCode::Char('t'));
+    let shown = screen(&mut app);
+    assert!(shown.contains("spare"), "{shown}");
+
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let shown = screen(&mut app);
+    assert!(shown.contains("on spare"), "{shown}");
+}
+
 #[test]
 fn a_half_typed_byte_says_what_is_wrong_with_it() {
     let mut app = App::default();
