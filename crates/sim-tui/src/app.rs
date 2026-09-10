@@ -80,6 +80,15 @@ enum FramesFocus {
     Fields,
 }
 
+/// Which pane of the Traffic view a key acts on, the same split as
+/// `FramesFocus` and for the same reason: up/down means one thing in the row
+/// list and another once it has moved into the decoded fields underneath it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrafficFocus {
+    Rows,
+    Fields,
+}
+
 /// One line of a frame's detail: a field on its own, or one flag inside a
 /// bitfield.
 ///
@@ -1369,6 +1378,8 @@ pub struct App {
     /// differently shaped frame resets the cursor rather than landing on
     /// whatever row happened to share its number.
     field_at: Option<(String, usize)>,
+    /// Which pane of the Traffic view up/down acts on.
+    traffic_focus: TrafficFocus,
     /// How far the Traffic tab's decoded fields pane has scrolled, reset
     /// whenever the row it describes changes.
     traffic_field_scroll: usize,
@@ -1398,6 +1409,7 @@ impl Default for App {
             frame_row: None,
             frame_focus: FramesFocus::Library,
             field_at: None,
+            traffic_focus: TrafficFocus::Rows,
             traffic_field_scroll: 0,
         };
         // Compared against from the first key pressed, so an app that has not
@@ -1573,6 +1585,13 @@ impl App {
     #[must_use]
     pub fn traffic_field_scroll(&self) -> usize {
         self.traffic_field_scroll
+    }
+
+    /// Whether up/down in the Traffic tab scrolls the decoded fields pane
+    /// rather than moving the row being read.
+    #[must_use]
+    pub fn traffic_focus_is_fields(&self) -> bool {
+        self.traffic_focus == TrafficFocus::Fields
     }
 
     /// The row under the cursor in the fields pane, for the frame currently
@@ -1802,8 +1821,12 @@ impl App {
         }
 
         match self.tab {
+            Tab::Traffic if self.traffic_focus == TrafficFocus::Fields => {
+                &[("up/down", "scroll"), ("Left", "row list")]
+            }
             Tab::Traffic => &[
                 ("up/down", "read a row"),
+                ("Right", "fields"),
                 ("Enter", "read as"),
                 ("p", "pause"),
                 ("f", "follow"),
@@ -4054,9 +4077,20 @@ impl App {
     /// The keys the traffic list answers to, and whether it took this one.
     fn watching(&mut self, code: KeyCode) -> bool {
         match code {
-            KeyCode::Down | KeyCode::Char('j') => self.step(1),
-            KeyCode::Up | KeyCode::Char('k') => self.step(-1),
-            KeyCode::Esc => self.with_monitor(|monitor| monitor.selected = None),
+            KeyCode::Down | KeyCode::Char('j') => self.traffic_move(1),
+            KeyCode::Up | KeyCode::Char('k') => self.traffic_move(-1),
+            KeyCode::Left => self.traffic_focus = TrafficFocus::Rows,
+            KeyCode::Right
+                if self
+                    .monitor()
+                    .is_some_and(|monitor| monitor.selected.is_some()) =>
+            {
+                self.traffic_focus = TrafficFocus::Fields;
+            }
+            KeyCode::Esc => {
+                self.traffic_focus = TrafficFocus::Rows;
+                self.with_monitor(|monitor| monitor.selected = None);
+            }
             KeyCode::Enter | KeyCode::Char('d') => self.pick_frame(),
             KeyCode::Char('f') => self.with_monitor(|monitor| monitor.follow = !monitor.follow),
             KeyCode::Char('p') => self.toggle_paused(),
@@ -4071,15 +4105,20 @@ impl App {
             KeyCode::Char(']') => self.switch_monitor(1),
             KeyCode::Char('h') => self.send_row_to_hex(),
             KeyCode::Char('F') => self.open_row_in_frames(),
-            KeyCode::PageDown => {
-                self.traffic_field_scroll = self.traffic_field_scroll.saturating_add(5);
-            }
-            KeyCode::PageUp => {
-                self.traffic_field_scroll = self.traffic_field_scroll.saturating_sub(5);
-            }
             _ => return false,
         }
         true
+    }
+
+    /// Up/down, aimed at whichever pane has the keyboard: the row list, or
+    /// the decoded fields underneath the row currently being read.
+    fn traffic_move(&mut self, delta: isize) {
+        match self.traffic_focus {
+            TrafficFocus::Rows => self.step(delta),
+            TrafficFocus::Fields => {
+                self.traffic_field_scroll = self.traffic_field_scroll.saturating_add_signed(delta);
+            }
+        }
     }
 
     /// Applies `change` to the view on show, if there is one.
@@ -4123,6 +4162,7 @@ impl App {
             return;
         };
         self.current_monitor = Some(crate::connection_form::cycle(&ids, current, delta));
+        self.traffic_focus = TrafficFocus::Rows;
     }
 
     /// Closes the view on show. Refused on the last one: a bench with no
@@ -4135,6 +4175,7 @@ impl App {
         if let Some(id) = self.monitor_id() {
             self.session.close_monitor(id);
             self.current_monitor = None;
+            self.traffic_focus = TrafficFocus::Rows;
         }
     }
 

@@ -857,13 +857,14 @@ fn watch(frame: &mut Frame, area: Rect, app: &mut App) {
     if let (Some(pane), Some(lines)) = (pane, fields) {
         // A frame with more fields than the pane's own share of the screen
         // used to have the rest simply cut off, with no way to reach them.
+        let focused = app.traffic_focus_is_fields();
         let room = pane.height.saturating_sub(2) as usize;
         let start = app
             .traffic_field_scroll()
             .min(lines.len().saturating_sub(room));
         let end = (start + room).min(lines.len());
-        let title = if lines.len() > room {
-            " Fields (PageUp/PageDown to scroll) "
+        let title = if focused {
+            " Fields (focused) "
         } else {
             " Fields "
         };

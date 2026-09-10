@@ -2946,11 +2946,11 @@ fn a_matched_field_can_be_given_an_exact_value_to_wait_for() {
 /// A frame with more fields than the pane's own share of the screen used to
 /// leave the rest simply cut off, with no way to reach them.
 #[test]
-fn a_long_decoded_reading_scrolls_with_page_up_and_down() {
+fn a_long_decoded_reading_scrolls_once_the_fields_pane_has_the_keyboard() {
     let mut app = App::default();
     with_many_fields(
         &mut app,
-        "a_long_decoded_reading_scrolls_with_page_up_and_down",
+        "a_long_decoded_reading_scrolls_once_the_fields_pane_has_the_keyboard",
         20,
     );
     captured(&mut app, &[0; 20], Duration::from_secs(1));
@@ -2967,24 +2967,29 @@ fn a_long_decoded_reading_scrolls_with_page_up_and_down() {
         "the bottom is not, or there was nothing to fix: {shown}"
     );
 
-    for _ in 0..5 {
-        press(&mut app, KeyCode::PageDown);
+    press(&mut app, KeyCode::Right); // hand the keyboard to the fields pane
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Down);
     }
     let scrolled = screen(&mut app);
     assert!(
         scrolled.contains("f19"),
-        "page down reaches the bottom: {scrolled}"
+        "down, now aimed at the pane, reaches the bottom: {scrolled}"
     );
     assert!(
         !scrolled.contains("f0"),
         "and the top scrolled out to make room: {scrolled}"
     );
 
-    for _ in 0..5 {
-        press(&mut app, KeyCode::PageUp);
+    press(&mut app, KeyCode::Left); // back to the row list
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Up);
     }
     let back = screen(&mut app);
-    assert!(back.contains("f0"), "page up returns to the top: {back}");
+    assert!(
+        back.contains("f0"),
+        "left handed up/down back to the row list, which never scrolled the pane: {back}"
+    );
 }
 
 /// Clearing the traffic view already worked from "c", but nothing ever said
