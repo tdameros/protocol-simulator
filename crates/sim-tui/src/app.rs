@@ -1795,6 +1795,7 @@ impl App {
                 ("left/right", "change"),
                 ("a", "add"),
                 ("x", "remove"),
+                ("r", "reverse bits"),
                 ("Esc", "done"),
             ]);
         }
@@ -2477,6 +2478,7 @@ impl App {
                 KeyCode::Enter => self.overlay_edit_frame_bit(field_index, *i, &field.kind),
                 KeyCode::Char('a') => self.add_frame_bit(field_index),
                 KeyCode::Char('x') => self.remove_frame_bit(field_index, *i),
+                KeyCode::Char('r') => self.reverse_frame_bits(field_index),
                 _ => {}
             },
             FrameFieldRow::CoversFrom | FrameFieldRow::CoversTo => {
@@ -2646,6 +2648,21 @@ impl App {
             if bits.len() > 1 && bit < bits.len() {
                 bits.remove(bit);
             }
+        }
+    }
+
+    /// Swaps most-significant-first for least-significant-first, so a bitfield
+    /// entered backwards can be fixed in place rather than retyped bit by bit.
+    fn reverse_frame_bits(&mut self, field_index: usize) {
+        let Some(draft) = self.session.frames.draft.as_mut() else {
+            return;
+        };
+        let Some(field) = sim_session::layout::plain_field_mut(&mut draft.frame, field_index)
+        else {
+            return;
+        };
+        if let FieldKind::Bits { bits, .. } = &mut field.kind {
+            bits.reverse();
         }
     }
 

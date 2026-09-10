@@ -2370,6 +2370,33 @@ fn the_last_bit_cannot_be_removed() {
     );
 }
 
+/// A bitfield entered backwards used to mean retyping every bit's name and
+/// width by hand; `r` swaps the whole order in place instead.
+#[test]
+fn a_bitfields_order_can_be_reversed_without_retyping_it() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "bits");
+    press(&mut app, KeyCode::Down); // Repr
+    press(&mut app, KeyCode::Down); // Bit 0
+    press(&mut app, KeyCode::Char('a'));
+
+    press(&mut app, KeyCode::Char('r'));
+    let shown = screen(&mut app);
+    let bit0 = shown
+        .lines()
+        .find(|line| line.contains("Bit 0"))
+        .unwrap_or_else(|| panic!("{shown}"));
+    let bit1 = shown
+        .lines()
+        .find(|line| line.contains("Bit 1"))
+        .unwrap_or_else(|| panic!("{shown}"));
+    assert!(bit0.contains("bit1"), "{bit0}");
+    assert!(bit1.contains("value"), "{bit1}");
+}
+
 #[test]
 fn a_checksum_covers_from_and_to_can_be_cycled() {
     let mut app = App::default();

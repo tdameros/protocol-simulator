@@ -529,6 +529,54 @@ fn a_bits_field(name: &str) -> sim_core::frame::FrameDef {
     )
 }
 
+fn two_bits_field(name: &str) -> sim_core::frame::FrameDef {
+    sim_core::frame::FrameDef::flat(
+        "Flags",
+        vec![sim_core::frame::FieldDef {
+            name: name.to_owned(),
+            description: None,
+            kind: sim_core::frame::FieldKind::Bits {
+                repr: sim_core::frame::ScalarType::U8,
+                bits: vec![
+                    sim_core::frame::BitDef {
+                        name: "low".to_owned(),
+                        width: 1,
+                    },
+                    sim_core::frame::BitDef {
+                        name: "high".to_owned(),
+                        width: 1,
+                    },
+                ],
+            },
+            endian: sim_core::frame::Endianness::Big,
+            default: None,
+            range: None,
+        }],
+    )
+}
+
+/// A technician who entered a bitfield backwards fixes it with one click
+/// rather than retyping every bit's name and width in the other order.
+#[test]
+fn reversing_a_bitfields_order_swaps_the_bits_in_place() {
+    let frame = two_bits_field("flags");
+    let mut harness = frame_edit_panel(frame);
+    harness.run();
+
+    // The row starts folded, and the bit list is drawn in its body.
+    harness.get_by_role(accesskit::Role::Unknown).click();
+    harness.run();
+
+    harness.get_by_label_contains("Reverse order").click();
+    harness.run();
+
+    let sim_core::frame::FieldKind::Bits { bits, .. } = &harness.state().fields[0].kind else {
+        panic!("still a bitfield");
+    };
+    assert_eq!(bits[0].name, "high");
+    assert_eq!(bits[1].name, "low");
+}
+
 /// A bitfield used to be stuck at whatever repr `New` gave it: nothing in the
 /// editor let a technician widen one byte of flags into two.
 #[test]
