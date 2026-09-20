@@ -622,6 +622,22 @@ fn bytes_typed_by_hand_are_counted_before_they_are_sent() {
     assert!(shown.contains("on bus"), "{shown}");
 }
 
+/// "c" empties the box, matching the same letter's meaning in Traffic.
+#[test]
+fn the_hex_box_is_cleared_with_c() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    for letter in "AA55".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('c'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Type hexadecimal bytes."), "{shown}");
+}
+
 /// The only way to aim hand-typed bytes anywhere but the first connection.
 #[test]
 fn a_hex_targets_link_can_be_chosen_from_the_connected_ones() {
@@ -1074,7 +1090,7 @@ fn autoconnect_can_be_flipped_from_the_list() {
     linked(&mut app, "bus", ConnectionStatus::Disconnected);
     assert!(!app.session().connections[0].1.autoconnect);
 
-    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char(' '));
     assert!(app.session().connections[0].1.autoconnect);
 }
 
@@ -1426,7 +1442,7 @@ fn a_new_monitor_watches_the_same_buffer_on_its_own() {
     let mut app = App::default();
     captured(&mut app, &[0x01], Duration::from_secs(1));
     press(&mut app, KeyCode::Char('2'));
-    press(&mut app, KeyCode::Char('m'));
+    press(&mut app, KeyCode::Char('n'));
 
     let shown = screen(&mut app);
     assert!(shown.contains("[2/2]"), "{shown}");
@@ -1462,7 +1478,7 @@ fn the_last_monitor_cannot_be_closed() {
 fn closing_a_monitor_falls_back_to_another_one() {
     let mut app = App::default();
     press(&mut app, KeyCode::Char('2'));
-    press(&mut app, KeyCode::Char('m'));
+    press(&mut app, KeyCode::Char('n'));
     press(&mut app, KeyCode::Char('x'));
 
     assert_eq!(app.session().monitors.len(), 1);
@@ -3047,4 +3063,24 @@ fn clearing_the_traffic_view_is_documented_in_the_key_map() {
 
     let shown = screen(&mut app);
     assert!(shown.contains("clear"), "{shown}");
+}
+
+/// Sending a row to Hex or Frames, and managing traffic views themselves,
+/// used to work without appearing anywhere a person could discover them.
+#[test]
+fn the_traffic_tab_management_keys_are_documented_in_the_key_map() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('?'));
+
+    let shown = screen(&mut app);
+    for key in [
+        "to hex",
+        "to frames",
+        "new view",
+        "close view",
+        "switch view",
+    ] {
+        assert!(shown.contains(key), "{key}: {shown}");
+    }
 }

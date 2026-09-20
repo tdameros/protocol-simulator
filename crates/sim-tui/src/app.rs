@@ -1706,9 +1706,10 @@ impl App {
     }
 
     /// What every view answers to, whichever one is on show.
-    pub const KEYS: [(&'static str, &'static str); 5] = [
+    pub const KEYS: [(&'static str, &'static str); 6] = [
         ("o", "open"),
         ("w", "save"),
+        ("W", "save as"),
         ("1-5", "go to a view"),
         ("Tab", "next view"),
         ("Shift+Tab", "previous view"),
@@ -1835,12 +1836,19 @@ impl App {
                 ("f", "follow"),
                 ("c", "clear"),
                 ("/", "filter"),
+                ("n", "new view"),
+                ("x", "close view"),
+                ("[/]", "switch view"),
+                ("h", "to hex"),
+                ("F", "to frames"),
             ],
             Tab::Scenarios if self.session.scenarios.draft.is_some() => &[
                 ("up/down", "choose"),
                 ("Enter", "edit"),
                 ("a", "add step"),
                 ("x", "remove step"),
+                ("[/]", "reorder"),
+                ("space", "repeat"),
                 ("s", "save"),
                 ("Esc", "cancel"),
             ],
@@ -1850,31 +1858,44 @@ impl App {
                 ("x", "stop"),
                 ("n", "new"),
                 ("e", "edit"),
+                ("d", "delete"),
+                ("r", "reload"),
             ],
-            Tab::HexInject => &[("Enter", "type bytes"), ("t", "target"), ("x", "clear")],
+            Tab::HexInject => &[("Enter", "type bytes"), ("t", "target"), ("c", "clear")],
             Tab::Frames if self.session.frames.draft.is_some() => &[
                 ("up/down", "choose"),
                 ("Enter", "edit"),
                 ("a", "add field"),
                 ("x", "remove field"),
+                ("[/]", "reorder"),
                 ("s", "save"),
                 ("Esc", "cancel"),
             ],
             Tab::Frames if self.frame_focus == FramesFocus::Fields => &[
                 ("up/down", "choose"),
                 ("Enter", "edit"),
+                ("space", "toggle a bit"),
                 ("s", "send"),
                 ("Left", "list"),
+                ("n", "new"),
+                ("e", "edit frame"),
+                ("d", "delete"),
+                ("r", "reload"),
             ],
             Tab::Frames => &[
                 ("up/down", "choose"),
                 ("Right", "fields"),
                 ("t", "target"),
                 ("s", "send"),
+                ("n", "new"),
+                ("e", "edit"),
+                ("d", "delete"),
+                ("r", "reload"),
             ],
             Tab::Connections => &[
                 ("up/down", "choose"),
                 ("Enter", "toggle"),
+                ("space", "autoconnect"),
                 ("n", "new"),
                 ("x", "remove"),
             ],
@@ -2159,7 +2180,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.pick_connection(1),
             KeyCode::Up | KeyCode::Char('k') => self.pick_connection(-1),
             KeyCode::Enter => self.toggle_selected_connection(),
-            KeyCode::Char('a') => self.toggle_selected_autoconnect(),
+            KeyCode::Char(' ') => self.toggle_selected_autoconnect(),
             KeyCode::Char('x') => self.remove_selected_connection(),
             _ => return false,
         }
@@ -3238,7 +3259,7 @@ impl App {
     fn injecting(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Enter | KeyCode::Char('i') => self.editing = true,
-            KeyCode::Char('x') => self.session.hex_input.clear(),
+            KeyCode::Char('c') => self.session.hex_input.clear(),
             KeyCode::Char('t') => self.pick_hex_target(),
             _ => return false,
         }
@@ -4124,12 +4145,12 @@ impl App {
                 self.traffic_focus = TrafficFocus::Rows;
                 self.with_monitor(|monitor| monitor.selected = None);
             }
-            KeyCode::Enter | KeyCode::Char('d') => self.pick_frame(),
+            KeyCode::Enter => self.pick_frame(),
             KeyCode::Char('f') => self.with_monitor(|monitor| monitor.follow = !monitor.follow),
             KeyCode::Char('p') => self.toggle_paused(),
             KeyCode::Char('c') => self.clear_monitor(),
             KeyCode::Char('/') => self.open_filter(),
-            KeyCode::Char('m') => {
+            KeyCode::Char('n') => {
                 let id = self.session.open_monitor();
                 self.current_monitor = Some(id);
             }
