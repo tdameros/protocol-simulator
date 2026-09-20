@@ -3689,40 +3689,30 @@ impl App {
             );
             return;
         }
-        if matches!(code, KeyCode::Char('c')) {
+        // Left/right rather than a letter key, and one cycle rather than a
+        // toggle plus a separate cycle: a captured value is free text picked
+        // from another step, not typed here, but the override value below
+        // is typed here, and no letter is safe to reserve as its own toggle
+        // once that typed value might contain it (a hex byte like `AC` or
+        // `0C`, a text field spelling out "capture").
+        //
+        // `None` sits first in the choices, so cycling past either end always
+        // reaches "not captured" without needing `available` to hold
+        // anything: turning it off never depends on what turning it on to
+        // would need.
+        if let Some(delta) = arrow_delta(code) {
             let Action::Send { from_capture, .. } = &step.action else {
                 return;
             };
-            let on = !from_capture.contains_key(&field_def.name);
-            // Turning it off is always allowed, a step moved or removed out
-            // from under a capture being the one way this field's own
-            // variable can already be gone from `available`. Turning it on
-            // needs something to turn it on to.
             let available = scenarios::captured_before(&draft.scenario, index);
-            if on && available.is_empty() {
-                return;
-            }
+            let mut choices: Vec<Option<&String>> = vec![None];
+            choices.extend(available.iter().map(Some));
+            let current = from_capture.get(&field_def.name);
+            let next = crate::connection_form::cycle(&choices, current, delta);
             scenarios::set_from_capture(
                 draft.scenario.steps.get_mut(index).expect("just read"),
                 &field_def.name,
-                on.then(|| available[0].as_str()),
-            );
-            return;
-        }
-        let Action::Send { from_capture, .. } = &step.action else {
-            return;
-        };
-        if let Some(variable) = from_capture.get(&field_def.name) {
-            let Some(delta) = arrow_delta(code) else {
-                return;
-            };
-            let available = scenarios::captured_before(&draft.scenario, index);
-            let choices: Vec<&String> = available.iter().collect();
-            let next = crate::connection_form::cycle(&choices, variable, delta).clone();
-            scenarios::set_from_capture(
-                draft.scenario.steps.get_mut(index).expect("just read"),
-                &field_def.name,
-                Some(&next),
+                next.map(String::as_str),
             );
             return;
         }

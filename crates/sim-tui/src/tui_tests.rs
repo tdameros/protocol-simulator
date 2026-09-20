@@ -2709,7 +2709,8 @@ fn capturing_a_replys_field_lets_a_later_send_fill_from_it() {
     press(&mut app, KeyCode::Char('a'));
     // cursor already sits on the new (second) step
 
-    // Step 2: a Send of Forward. Nothing captures yet, so "c" does nothing.
+    // Step 2: a Send of Forward. Nothing captures yet, so left/right stays on
+    // "not captured".
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Left); // Raw -> Send
     press(&mut app, KeyCode::Down); // bus target
@@ -2717,7 +2718,7 @@ fn capturing_a_replys_field_lets_a_later_send_fill_from_it() {
     press(&mut app, KeyCode::Right); // Response
     press(&mut app, KeyCode::Right); // Forward
     press(&mut app, KeyCode::Down); // payload row
-    press(&mut app, KeyCode::Char('c'));
+    press(&mut app, KeyCode::Right);
     assert!(
         screen(&mut app).contains("frame default"),
         "nothing to capture from yet: {}",
@@ -2754,13 +2755,13 @@ fn capturing_a_replys_field_lets_a_later_send_fill_from_it() {
     );
     press(&mut app, KeyCode::Esc);
 
-    // Step 2 again: "c" on payload now has a variable to offer.
+    // Step 2 again: left/right on payload now has a variable to offer.
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
     for _ in 0..3 {
         press(&mut app, KeyCode::Down); // bus, Frame, payload
     }
-    press(&mut app, KeyCode::Char('c'));
+    press(&mut app, KeyCode::Right);
     assert!(
         screen(&mut app).contains("from capture: server1_code"),
         "the one variable in scope is picked automatically: {}",
@@ -2832,7 +2833,7 @@ fn cycling_a_captured_field_picks_a_different_variable() {
     for _ in 0..3 {
         press(&mut app, KeyCode::Down); // bus, Frame, payload
     }
-    press(&mut app, KeyCode::Char('c'));
+    press(&mut app, KeyCode::Right);
     let first = screen(&mut app);
     assert!(
         first.contains("from capture: first"),
@@ -2848,16 +2849,13 @@ fn cycling_a_captured_field_picks_a_different_variable() {
 }
 
 /// A step moved or removed can leave a `from_capture` pointing at a variable
-/// nothing captures any more. "c" still has to turn that off, even though
-/// there is nothing left to turn it on to.
+/// nothing captures any more. Left/right still has to turn that off, even
+/// though there is nothing left to turn it on to.
 #[test]
-fn a_dangling_capture_can_still_be_turned_off_with_c() {
+fn a_dangling_capture_can_still_be_turned_off() {
     let mut app = App::default();
     linked(&mut app, "bus", ConnectionStatus::Connected);
-    with_relay_frames(
-        &mut app,
-        "a_dangling_capture_can_still_be_turned_off_with_c",
-    );
+    with_relay_frames(&mut app, "a_dangling_capture_can_still_be_turned_off");
     app.session_mut()
         .scenarios
         .begin_new(sim_session::scenarios::blank());
@@ -2890,11 +2888,11 @@ fn a_dangling_capture_can_still_be_turned_off_with_c() {
         "the dangling reference is still shown: {before}"
     );
 
-    press(&mut app, KeyCode::Char('c'));
+    press(&mut app, KeyCode::Left);
     let after = screen(&mut app);
     assert!(
         after.contains("frame default"),
-        "c still turns it off with nothing left to turn it on to: {after}"
+        "left/right still turns it off with nothing left to turn it on to: {after}"
     );
 }
 
@@ -2931,9 +2929,8 @@ fn typing_right_after_turning_a_capture_on_continues_its_seeded_name() {
     );
 }
 
-/// The hint line used to advertise "c" for capturing a field, but the wait
-/// side of a step popup does that with left/right instead, "c" doing nothing
-/// there and something different on the send side.
+/// The hint line used to advertise "c" for capturing a field, when only the
+/// send side ever answered to it; both sides now use left/right instead.
 #[test]
 fn the_step_hint_does_not_promise_a_key_the_wait_side_does_not_answer_to() {
     let mut app = App::default();
