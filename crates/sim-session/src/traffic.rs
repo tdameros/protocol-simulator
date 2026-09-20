@@ -51,7 +51,7 @@ pub fn delta(delta: Option<Duration>) -> String {
     };
     let millis = delta.as_secs_f64() * 1000.0;
     if millis < 1000.0 {
-        format!("+{millis:6.1}m")
+        format!("+{millis:5.1}ms")
     } else {
         format!("+{:6.2}s", delta.as_secs_f64())
     }
@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn a_delta_switches_unit_at_a_second() {
-        assert!(delta(Some(Duration::from_millis(999))).ends_with('m'));
+        assert!(delta(Some(Duration::from_millis(999))).ends_with("ms"));
         assert!(delta(Some(Duration::from_secs(1))).ends_with('s'));
     }
 }

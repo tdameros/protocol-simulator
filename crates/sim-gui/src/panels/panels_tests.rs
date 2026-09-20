@@ -529,6 +529,54 @@ fn a_bits_field(name: &str) -> sim_core::frame::FrameDef {
     )
 }
 
+fn two_bits_field(name: &str) -> sim_core::frame::FrameDef {
+    sim_core::frame::FrameDef::flat(
+        "Flags",
+        vec![sim_core::frame::FieldDef {
+            name: name.to_owned(),
+            description: None,
+            kind: sim_core::frame::FieldKind::Bits {
+                repr: sim_core::frame::ScalarType::U8,
+                bits: vec![
+                    sim_core::frame::BitDef {
+                        name: "low".to_owned(),
+                        width: 1,
+                    },
+                    sim_core::frame::BitDef {
+                        name: "high".to_owned(),
+                        width: 1,
+                    },
+                ],
+            },
+            endian: sim_core::frame::Endianness::Big,
+            default: None,
+            range: None,
+        }],
+    )
+}
+
+/// A technician who entered a bitfield backwards fixes it with one click
+/// rather than retyping every bit's name and width in the other order.
+#[test]
+fn reversing_a_bitfields_order_swaps_the_bits_in_place() {
+    let frame = two_bits_field("flags");
+    let mut harness = frame_edit_panel(frame);
+    harness.run();
+
+    // The row starts folded, and the bit list is drawn in its body.
+    harness.get_by_role(accesskit::Role::Unknown).click();
+    harness.run();
+
+    harness.get_by_label_contains("Reverse order").click();
+    harness.run();
+
+    let sim_core::frame::FieldKind::Bits { bits, .. } = &harness.state().fields[0].kind else {
+        panic!("still a bitfield");
+    };
+    assert_eq!(bits[0].name, "high");
+    assert_eq!(bits[1].name, "low");
+}
+
 /// A bitfield used to be stuck at whatever repr `New` gave it: nothing in the
 /// editor let a technician widen one byte of flags into two.
 #[test]
@@ -550,4 +598,163 @@ fn a_bitfields_repr_can_be_widened_past_one_byte() {
         panic!("still a bitfield");
     };
     assert_eq!(repr, sim_core::frame::ScalarType::U16);
+}
+
+const RESPONSE: &str = r#"
+name = "Response"
+[[field]]
+name = "code"
+type = "u8"
+"#;
+
+const FORWARD: &str = r#"
+name = "Forward"
+[[field]]
+name = "payload"
+type = "u8"
+"#;
+
+/// A field captured from one step's reply can fill another step's frame, from
+/// the panel alone: the two checkboxes and the picker between them are the
+/// whole of the new feature's own code, everything before them being scenario
+/// editing that already had its own tests.
+#[test]
+fn a_captured_field_can_be_sent_from_the_panel() {
+    let (dir, mut world) = folder(
+        "captures",
+        &[("response.toml", RESPONSE), ("forward.toml", FORWARD)],
+    );
+    world.state.scenarios.load_from(dir);
+    world
+        .state
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    {
+        let draft = world.state.scenarios.draft.as_mut().unwrap();
+        draft.scenario.steps[0].action = sim_core::scenario::Action::WaitFor {
+            expect: sim_core::scenario::Expect::Frame {
+                frame: "Response".to_owned(),
+                values: std::collections::BTreeMap::default(),
+                capture: std::collections::BTreeMap::default(),
+            },
+            timeout: None,
+        };
+        draft.scenario.steps[0].targets = vec![sim_core::ConnectionId::from("server1")];
+        draft.scenario.steps.push(sim_core::scenario::Step {
+            targets: vec![sim_core::ConnectionId::from("server2")],
+            action: sim_core::scenario::Action::Send {
+                frame: "Forward".to_owned(),
+                with: std::collections::BTreeMap::default(),
+                counters: std::collections::BTreeMap::default(),
+                from_capture: std::collections::BTreeMap::default(),
+            },
+        });
+    }
+
+    let mut harness = scenarios_panel(world);
+    harness.run();
+
+    harness.get_by_label_contains("capture as").click();
+    harness.run();
+
+    assert_eq!(
+        {
+            let sim_core::scenario::Action::WaitFor {
+                expect: sim_core::scenario::Expect::Frame { capture, .. },
+                ..
+            } = &harness
+                .state()
+                .state
+                .scenarios
+                .draft
+                .as_ref()
+                .unwrap()
+                .scenario
+                .steps[0]
+                .action
+            else {
+                panic!("expected a frame wait");
+            };
+            capture.get("code").cloned()
+        },
+        Some("code".to_owned()),
+        "ticking the box captures the field under its own name to start with"
+    );
+
+    harness.get_by_label_contains("from capture").click();
+    harness.run();
+
+    let sim_core::scenario::Action::Send { from_capture, .. } = &harness
+        .state()
+        .state
+        .scenarios
+        .draft
+        .as_ref()
+        .unwrap()
+        .scenario
+        .steps[1]
+        .action
+    else {
+        panic!("expected a send");
+    };
+    assert_eq!(
+        from_capture.get("payload").map(String::as_str),
+        Some("code"),
+        "the one variable in scope is picked automatically"
+    );
+}
+
+/// A step moved or removed can leave a `from_capture` pointing at a variable
+/// nothing captures any more. The row it lives on has to keep offering a way
+/// to clear it, not hide the control the moment nothing is left to pick from.
+#[test]
+fn a_dangling_capture_can_still_be_cleared_from_its_own_row() {
+    let (dir, mut world) = folder(
+        "dangling",
+        &[("response.toml", RESPONSE), ("forward.toml", FORWARD)],
+    );
+    world.state.scenarios.load_from(dir);
+    world
+        .state
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    {
+        let draft = world.state.scenarios.draft.as_mut().unwrap();
+        draft.scenario.steps = vec![sim_core::scenario::Step {
+            targets: vec![sim_core::ConnectionId::from("server2")],
+            action: sim_core::scenario::Action::Send {
+                frame: "Forward".to_owned(),
+                with: std::collections::BTreeMap::new(),
+                counters: std::collections::BTreeMap::new(),
+                from_capture: std::collections::BTreeMap::from([(
+                    "payload".to_owned(),
+                    "gone".to_owned(),
+                )]),
+            },
+        }];
+    }
+
+    let mut harness = scenarios_panel(world);
+    harness.run();
+
+    harness.get_by_label_contains("from capture").click();
+    harness.run();
+
+    let sim_core::scenario::Action::Send { from_capture, .. } = &harness
+        .state()
+        .state
+        .scenarios
+        .draft
+        .as_ref()
+        .unwrap()
+        .scenario
+        .steps[0]
+        .action
+    else {
+        panic!("expected a send");
+    };
+    assert!(
+        from_capture.is_empty(),
+        "unticking it clears the stale reference: {from_capture:?}"
+    );
 }

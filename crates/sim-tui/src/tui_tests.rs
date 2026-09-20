@@ -622,6 +622,43 @@ fn bytes_typed_by_hand_are_counted_before_they_are_sent() {
     assert!(shown.contains("on bus"), "{shown}");
 }
 
+/// "c" empties the box, matching the same letter's meaning in Traffic.
+#[test]
+fn the_hex_box_is_cleared_with_c() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('3'));
+    press(&mut app, KeyCode::Enter);
+    for letter in "AA55".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('c'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("Type hexadecimal bytes."), "{shown}");
+}
+
+/// The only way to aim hand-typed bytes anywhere but the first connection.
+#[test]
+fn a_hex_targets_link_can_be_chosen_from_the_connected_ones() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    linked(&mut app, "spare", ConnectionStatus::Connected);
+
+    press(&mut app, KeyCode::Char('3'));
+    let shown = screen(&mut app);
+    assert!(shown.contains("on bus"), "defaults to the first: {shown}");
+
+    press(&mut app, KeyCode::Char('t'));
+    let shown = screen(&mut app);
+    assert!(shown.contains("spare"), "{shown}");
+
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let shown = screen(&mut app);
+    assert!(shown.contains("on spare"), "{shown}");
+}
+
 #[test]
 fn a_half_typed_byte_says_what_is_wrong_with_it() {
     let mut app = App::default();
@@ -1053,7 +1090,7 @@ fn autoconnect_can_be_flipped_from_the_list() {
     linked(&mut app, "bus", ConnectionStatus::Disconnected);
     assert!(!app.session().connections[0].1.autoconnect);
 
-    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char(' '));
     assert!(app.session().connections[0].1.autoconnect);
 }
 
@@ -1405,7 +1442,7 @@ fn a_new_monitor_watches_the_same_buffer_on_its_own() {
     let mut app = App::default();
     captured(&mut app, &[0x01], Duration::from_secs(1));
     press(&mut app, KeyCode::Char('2'));
-    press(&mut app, KeyCode::Char('m'));
+    press(&mut app, KeyCode::Char('n'));
 
     let shown = screen(&mut app);
     assert!(shown.contains("[2/2]"), "{shown}");
@@ -1441,7 +1478,7 @@ fn the_last_monitor_cannot_be_closed() {
 fn closing_a_monitor_falls_back_to_another_one() {
     let mut app = App::default();
     press(&mut app, KeyCode::Char('2'));
-    press(&mut app, KeyCode::Char('m'));
+    press(&mut app, KeyCode::Char('n'));
     press(&mut app, KeyCode::Char('x'));
 
     assert_eq!(app.session().monitors.len(), 1);
@@ -2370,6 +2407,33 @@ fn the_last_bit_cannot_be_removed() {
     );
 }
 
+/// A bitfield entered backwards used to mean retyping every bit's name and
+/// width by hand; `r` swaps the whole order in place instead.
+#[test]
+fn a_bitfields_order_can_be_reversed_without_retyping_it() {
+    let mut app = App::default();
+    on_the_one_field(&mut app);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Kind row
+    cycle_kind_to(&mut app, "bits");
+    press(&mut app, KeyCode::Down); // Repr
+    press(&mut app, KeyCode::Down); // Bit 0
+    press(&mut app, KeyCode::Char('a'));
+
+    press(&mut app, KeyCode::Char('r'));
+    let shown = screen(&mut app);
+    let bit0 = shown
+        .lines()
+        .find(|line| line.contains("Bit 0"))
+        .unwrap_or_else(|| panic!("{shown}"));
+    let bit1 = shown
+        .lines()
+        .find(|line| line.contains("Bit 1"))
+        .unwrap_or_else(|| panic!("{shown}"));
+    assert!(bit0.contains("bit1"), "{bit0}");
+    assert!(bit1.contains("value"), "{bit1}");
+}
+
 #[test]
 fn a_checksum_covers_from_and_to_can_be_cycled() {
     let mut app = App::default();
@@ -2621,4 +2685,402 @@ fn a_step_overriding_a_wide_frame_scrolls_to_keep_the_focus_on_screen() {
         !shown.contains("f0 "),
         "and the first scrolled out to make room: {shown}"
     );
+}
+
+const RESPONSE: &str = r#"
+name = "Response"
+[[field]]
+name = "code"
+type = "u8"
+"#;
+
+const FORWARD: &str = r#"
+name = "Forward"
+[[field]]
+name = "payload"
+type = "u8"
+"#;
+
+fn with_relay_frames(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join(format!("sim-tui-relay-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    std::fs::write(dir.join("response.toml"), RESPONSE).expect("a frame file");
+    std::fs::write(dir.join("forward.toml"), FORWARD).expect("a frame file");
+    app.session_mut().frames.load_from(dir);
+}
+
+/// Nothing offered to fill from until something has captured a variable, and
+/// once something has, the picker starts on the one variable in scope.
+#[test]
+fn capturing_a_replys_field_lets_a_later_send_fill_from_it() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_relay_frames(
+        &mut app,
+        "capturing_a_replys_field_lets_a_later_send_fill_from_it",
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('a'));
+    // cursor already sits on the new (second) step
+
+    // Step 2: a Send of Forward. Nothing captures yet, so left/right stays on
+    // "not captured".
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Left); // Raw -> Send
+    press(&mut app, KeyCode::Down); // bus target
+    press(&mut app, KeyCode::Down); // Frame row
+    press(&mut app, KeyCode::Right); // Response
+    press(&mut app, KeyCode::Right); // Forward
+    press(&mut app, KeyCode::Down); // payload row
+    press(&mut app, KeyCode::Right);
+    assert!(
+        screen(&mut app).contains("frame default"),
+        "nothing to capture from yet: {}",
+        screen(&mut app)
+    );
+    press(&mut app, KeyCode::Esc);
+
+    // Step 1: a WaitFor of Response, capturing "code".
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait -> WaitFor
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, wait-by-frame, Frame
+    }
+    press(&mut app, KeyCode::Right); // Response
+    press(&mut app, KeyCode::Down); // code row
+    press(&mut app, KeyCode::Right); // capture it
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("capture as code"),
+        "captured under its own name to start with: {shown}"
+    );
+
+    for _ in 0.."code".len() {
+        press(&mut app, KeyCode::Backspace);
+    }
+    for letter in "server1_code".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+    assert!(
+        screen(&mut app).contains("capture as server1_code"),
+        "{}",
+        screen(&mut app)
+    );
+    press(&mut app, KeyCode::Esc);
+
+    // Step 2 again: left/right on payload now has a variable to offer.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, Frame, payload
+    }
+    press(&mut app, KeyCode::Right);
+    assert!(
+        screen(&mut app).contains("from capture: server1_code"),
+        "the one variable in scope is picked automatically: {}",
+        screen(&mut app)
+    );
+}
+
+/// With more than one variable in scope, left and right cycle between them
+/// rather than only ever offering the first.
+#[test]
+fn cycling_a_captured_field_picks_a_different_variable() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_relay_frames(
+        &mut app,
+        "cycling_a_captured_field_picks_a_different_variable",
+    );
+    app.session_mut()
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    {
+        let draft = app.session_mut().scenarios.draft.as_mut().unwrap();
+        let target = sim_core::ConnectionId::from("bus");
+        draft.scenario.steps = vec![
+            sim_core::scenario::Step {
+                targets: vec![target.clone()],
+                action: sim_core::scenario::Action::WaitFor {
+                    expect: sim_core::scenario::Expect::Frame {
+                        frame: "Response".to_owned(),
+                        values: std::collections::BTreeMap::default(),
+                        capture: std::collections::BTreeMap::from([(
+                            "code".to_owned(),
+                            "first".to_owned(),
+                        )]),
+                    },
+                    timeout: None,
+                },
+            },
+            sim_core::scenario::Step {
+                targets: vec![target.clone()],
+                action: sim_core::scenario::Action::WaitFor {
+                    expect: sim_core::scenario::Expect::Frame {
+                        frame: "Response".to_owned(),
+                        values: std::collections::BTreeMap::default(),
+                        capture: std::collections::BTreeMap::from([(
+                            "code".to_owned(),
+                            "second".to_owned(),
+                        )]),
+                    },
+                    timeout: None,
+                },
+            },
+            sim_core::scenario::Step {
+                targets: vec![target],
+                action: sim_core::scenario::Action::Send {
+                    frame: "Forward".to_owned(),
+                    with: std::collections::BTreeMap::default(),
+                    counters: std::collections::BTreeMap::default(),
+                    from_capture: std::collections::BTreeMap::default(),
+                },
+            },
+        ];
+    }
+    press(&mut app, KeyCode::Char('5'));
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Down); // Name, Description, Repeat, step1, step2, step3
+    }
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, Frame, payload
+    }
+    press(&mut app, KeyCode::Right);
+    let first = screen(&mut app);
+    assert!(
+        first.contains("from capture: first"),
+        "the first variable in scope: {first}"
+    );
+
+    press(&mut app, KeyCode::Right);
+    let second = screen(&mut app);
+    assert!(
+        second.contains("from capture: second"),
+        "cycled to the other one: {second}"
+    );
+}
+
+/// A step moved or removed can leave a `from_capture` pointing at a variable
+/// nothing captures any more. Left/right still has to turn that off, even
+/// though there is nothing left to turn it on to.
+#[test]
+fn a_dangling_capture_can_still_be_turned_off() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_relay_frames(&mut app, "a_dangling_capture_can_still_be_turned_off");
+    app.session_mut()
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    {
+        let draft = app.session_mut().scenarios.draft.as_mut().unwrap();
+        draft.scenario.steps = vec![sim_core::scenario::Step {
+            targets: vec![sim_core::ConnectionId::from("bus")],
+            action: sim_core::scenario::Action::Send {
+                frame: "Forward".to_owned(),
+                with: std::collections::BTreeMap::new(),
+                counters: std::collections::BTreeMap::new(),
+                from_capture: std::collections::BTreeMap::from([(
+                    "payload".to_owned(),
+                    "gone".to_owned(),
+                )]),
+            },
+        }];
+    }
+    press(&mut app, KeyCode::Char('5'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // Name, Description, Repeat, step1
+    }
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, Frame, payload
+    }
+    let before = screen(&mut app);
+    assert!(
+        before.contains("from capture: gone"),
+        "the dangling reference is still shown: {before}"
+    );
+
+    press(&mut app, KeyCode::Left);
+    let after = screen(&mut app);
+    assert!(
+        after.contains("frame default"),
+        "left/right still turns it off with nothing left to turn it on to: {after}"
+    );
+}
+
+/// Turning a capture on seeds its variable name from the field, and typing
+/// straight away has to continue from that name rather than from nothing:
+/// the screen already says "capture as code" before the first keystroke.
+#[test]
+fn typing_right_after_turning_a_capture_on_continues_its_seeded_name() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_relay_frames(
+        &mut app,
+        "typing_right_after_turning_a_capture_on_continues_its_seeded_name",
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // Name, Description, Repeat, step1
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait -> WaitFor
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, wait-by-frame, Frame
+    }
+    press(&mut app, KeyCode::Right); // Response
+    press(&mut app, KeyCode::Down); // code row
+    press(&mut app, KeyCode::Right); // capture it, seeded "code"
+
+    press(&mut app, KeyCode::Char('!'));
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("capture as code!"),
+        "the seeded name, not an empty buffer, is what the key extends: {shown}"
+    );
+}
+
+/// The hint line used to advertise "c" for capturing a field, when only the
+/// send side ever answered to it; both sides now use left/right instead.
+#[test]
+fn the_step_hint_does_not_promise_a_key_the_wait_side_does_not_answer_to() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let hints = screen(&mut app)
+        .lines()
+        .last()
+        .expect("a hint line")
+        .to_owned();
+    assert!(!hints.contains("c capture"), "{hints}");
+    assert!(hints.contains("left/right"), "{hints}");
+}
+
+/// Ticking a matched field seeds the frame's own default, but a wait for an
+/// exact number needs more than that default: typing has to reach it too,
+/// the same way it already reaches a send step's overridden value.
+#[test]
+fn a_matched_field_can_be_given_an_exact_value_to_wait_for() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_scenario_frames(
+        &mut app,
+        "a_matched_field_can_be_given_an_exact_value_to_wait_for",
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Right); // Wait -> WaitFor, starts by frame
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down); // bus, wait-by-frame, Frame
+    }
+    press(&mut app, KeyCode::Right); // choose Status
+    press(&mut app, KeyCode::Down); // sync
+    press(&mut app, KeyCode::Char(' ')); // match it, seeded from the default
+
+    for letter in "56".chars() {
+        press(&mut app, KeyCode::Char(letter));
+    }
+
+    let shown = screen(&mut app);
+    let sync_line = shown.lines().rfind(|l| l.contains("sync")).unwrap_or("");
+    assert!(
+        sync_line.contains("56"),
+        "the typed value, not the seeded default: {shown}"
+    );
+}
+
+/// A frame with more fields than the pane's own share of the screen used to
+/// leave the rest simply cut off, with no way to reach them.
+#[test]
+fn a_long_decoded_reading_scrolls_once_the_fields_pane_has_the_keyboard() {
+    let mut app = App::default();
+    with_many_fields(
+        &mut app,
+        "a_long_decoded_reading_scrolls_once_the_fields_pane_has_the_keyboard",
+        20,
+    );
+    captured(&mut app, &[0; 20], Duration::from_secs(1));
+
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter); // the one candidate, Wide
+    press(&mut app, KeyCode::Enter); // confirm it
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("f0"), "the top is visible at first: {shown}");
+    assert!(
+        !shown.contains("f19"),
+        "the bottom is not, or there was nothing to fix: {shown}"
+    );
+
+    press(&mut app, KeyCode::Right); // hand the keyboard to the fields pane
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Down);
+    }
+    let scrolled = screen(&mut app);
+    assert!(
+        scrolled.contains("f19"),
+        "down, now aimed at the pane, reaches the bottom: {scrolled}"
+    );
+    assert!(
+        !scrolled.contains("f0"),
+        "and the top scrolled out to make room: {scrolled}"
+    );
+
+    press(&mut app, KeyCode::Left); // back to the row list
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Up);
+    }
+    let back = screen(&mut app);
+    assert!(
+        back.contains("f0"),
+        "left handed up/down back to the row list, which never scrolled the pane: {back}"
+    );
+}
+
+/// Clearing the traffic view already worked from "c", but nothing ever said
+/// so, the key map included, which is as good as it not existing.
+#[test]
+fn clearing_the_traffic_view_is_documented_in_the_key_map() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('?'));
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("clear"), "{shown}");
+}
+
+/// Sending a row to Hex or Frames, and managing traffic views themselves,
+/// used to work without appearing anywhere a person could discover them.
+#[test]
+fn the_traffic_tab_management_keys_are_documented_in_the_key_map() {
+    let mut app = App::default();
+    press(&mut app, KeyCode::Char('2'));
+    press(&mut app, KeyCode::Char('?'));
+
+    let shown = screen(&mut app);
+    for key in [
+        "to hex",
+        "to frames",
+        "new view",
+        "close view",
+        "switch view",
+    ] {
+        assert!(shown.contains(key), "{key}: {shown}");
+    }
 }
