@@ -3,6 +3,7 @@
 
 mod app;
 mod connection_form;
+mod control;
 mod headless;
 mod ui;
 
