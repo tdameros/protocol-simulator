@@ -26,6 +26,26 @@ scenario completed, 1 for anything else, including a name `--run` does not
 find. A scenario with no `times` runs until the process is stopped, which for
 a service started at boot is `SIGTERM`, the same as any other.
 
+`--control-port PORT`, given alongside `--run`, opens a local TCP socket for
+an external script: one JSON request per line in, one JSON response per line
+out.
+
+```
+{"cmd":"set","step":2,"field":"speed","value":42}
+-> {"ok":true}  |  {"ok":false,"error":"..."}
+
+{"cmd":"last_received","on":"drive","as":"Telemetry"}
+-> {"ok":true,"bytes":"AA 55 ...","fields":{"speed":42,"mode":1}}
+-> {"ok":false,"error":"nothing received yet on drive"}
+```
+
+`step` counts from one, as the row above it in this page already does. `set`
+only ever takes effect on a field already present in that step's `with`: the
+scenario file declares up front which fields are live-editable by putting
+them there. `set` reports no error for a step or field the running scenario
+does not recognise; it behaves exactly as a mistyped `with` value in the file
+already does.
+
 ## Steps
 
 | Step | Key | Carries |

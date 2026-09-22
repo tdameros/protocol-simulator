@@ -41,20 +41,26 @@ fn main() -> std::io::Result<()> {
     //
     // `--run NAME` skips the screen entirely and runs one scenario from the
     // project, for a service started at boot rather than a person at a
-    // keyboard.
+    // keyboard. `--control-port PORT`, only meaningful alongside `--run`,
+    // opens a local TCP socket an external script can use to override a
+    // `send` step's field live and read back the last frame received on a
+    // connection.
     let mut opened_with = None;
     let mut run_scenario = None;
+    let mut control_port = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--run" {
             run_scenario = args.next();
+        } else if arg == "--control-port" {
+            control_port = args.next().and_then(|value| value.parse().ok());
         } else {
             opened_with = Some(PathBuf::from(arg));
         }
     }
 
     if let Some(name) = run_scenario {
-        std::process::exit(headless::run(opened_with, &name));
+        std::process::exit(headless::run(opened_with, &name, control_port));
     }
 
     // Raw mode, the alternate screen, and a panic hook that puts the terminal
