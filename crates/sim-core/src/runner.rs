@@ -11,6 +11,7 @@
 //! loop stops when its command channel closes.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
@@ -44,12 +45,22 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// Live overrides for a running scenario's `send` steps, keyed by the step's
+/// one-based number and field name, matching what `Event::ScenarioStep` and
+/// every step-numbered error already mean by "step 2".
+///
+/// Shared directly with the engine's command loop rather than reached through
+/// a channel into this task, the same way `StopScenario` already reaches
+/// `ScenarioHandle` directly instead of sending the task a message.
+pub(crate) type Overrides = Arc<Mutex<BTreeMap<(usize, String), Value>>>;
+
 pub(crate) struct Context {
     pub scenario: Scenario,
     pub frames: Vec<FrameDef>,
     pub commands: mpsc::WeakSender<Command>,
     pub events: mpsc::Sender<Event>,
     pub received: broadcast::Receiver<Heard>,
+    pub overrides: Overrides,
 }
 
 pub(crate) async fn run(context: Context) -> Outcome {
@@ -104,9 +115,9 @@ pub(crate) async fn run(context: Context) -> Outcome {
 
             match execute(
                 step,
+                index + 1,
                 pass,
-                &context.frames,
-                &context.commands,
+                &context,
                 &mut received,
                 &mut variables,
             )
@@ -135,12 +146,14 @@ enum StepResult {
 
 async fn execute(
     step: &Step,
+    number: usize,
     pass: u32,
-    frames: &[FrameDef],
-    commands: &mpsc::WeakSender<Command>,
+    context: &Context,
     received: &mut broadcast::Receiver<Heard>,
     variables: &mut BTreeMap<String, Value>,
 ) -> StepResult {
+    let commands = &context.commands;
+    let frames = &context.frames;
     match &step.action {
         Action::Wait { delay } => {
             tokio::time::sleep(*delay).await;
@@ -152,12 +165,24 @@ async fn execute(
             with,
             counters,
             from_capture,
-        } => match encode(frame, with, counters, from_capture, variables, pass, frames) {
-            // The same bytes to every target, so two links carrying the same
-            // simulated device see the same counter on the same pass.
-            Ok(bytes) => send_to_all(commands, &step.targets, &bytes).await,
-            Err(reason) => StepResult::Failed(reason),
-        },
+        } => {
+            let with = merged(with, number, &context.overrides);
+            match encode(
+                frame,
+                &with,
+                counters,
+                from_capture,
+                variables,
+                pass,
+                frames,
+            ) {
+                // The same bytes to every target, so two links carrying the
+                // same simulated device see the same counter on the same
+                // pass.
+                Ok(bytes) => send_to_all(commands, &step.targets, &bytes).await,
+                Err(reason) => StepResult::Failed(reason),
+            }
+        }
         Action::WaitFor { expect, timeout } => {
             // Resolved here rather than at load, because turning a frame into
             // bytes needs the definitions, and only a running scenario has
@@ -302,6 +327,28 @@ fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor),
             Ok((HexPattern::masked(&bytes, &keep), Anchor::At(0)))
         }
     }
+}
+
+/// The step's own `with`, replaced field by field with whatever a live
+/// override currently holds for this step's number.
+///
+/// Only ever touches a field already present in `with`: a scenario declares,
+/// by putting a field there at all, which of its fields can be steered live.
+/// An override naming anything else is written down but never read here,
+/// since no field of `with` ever matches it.
+fn merged(
+    with: &BTreeMap<String, Value>,
+    number: usize,
+    overrides: &Overrides,
+) -> BTreeMap<String, Value> {
+    let mut merged = with.clone();
+    let held = overrides.lock().expect("overrides mutex poisoned");
+    for field in with.keys() {
+        if let Some(value) = held.get(&(number, field.clone())) {
+            merged.insert(field.clone(), value.clone());
+        }
+    }
+    merged
 }
 
 /// The frame's own defaults, overlaid with what the step overrides, what an
@@ -461,6 +508,7 @@ mod tests {
             commands: command_tx.downgrade(),
             events: events_tx,
             received: heard_rx,
+            overrides: Arc::new(Mutex::new(BTreeMap::new())),
         };
 
         let outcome = run(context).await;

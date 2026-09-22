@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use tokio::sync::{broadcast, mpsc};
@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use crate::connection::{ConnectionId, ConnectionStatus, RetryPolicy, TcpMode, TransportConfig};
 use crate::error::{EngineError, TransportError};
+use crate::frame::value::Value;
 use crate::frame::FrameDef;
 use crate::runner::{self, Heard, Outcome};
 use crate::scenario::Scenario;
@@ -49,6 +50,17 @@ pub enum Command {
     },
     StopScenario {
         name: String,
+    },
+    /// Overrides one field of a running scenario's `send` step, effective
+    /// from the next time that step runs. `step` counts from one, as the
+    /// file and `Event::ScenarioStep` already do. Naming a step or field the
+    /// scenario does not recognise is not reported: it behaves exactly as a
+    /// bad `with` value in the file already does.
+    SetStepValue {
+        scenario: String,
+        step: usize,
+        field: String,
+        value: Value,
     },
 }
 
@@ -133,6 +145,7 @@ struct ConnectionHandle {
 struct ScenarioHandle {
     task: JoinHandle<()>,
     generation: u64,
+    overrides: runner::Overrides,
 }
 
 /// Every channel a command handler may need, kept together so that adding one
@@ -306,6 +319,21 @@ async fn handle_command(
             }
             None => report_error(events, None, EngineError::UnknownScenario(name)).await,
         },
+        Command::SetStepValue {
+            scenario,
+            step,
+            field,
+            value,
+        } => match scenarios.get(&scenario) {
+            Some(handle) => {
+                handle
+                    .overrides
+                    .lock()
+                    .expect("overrides mutex poisoned")
+                    .insert((step, field), value);
+            }
+            None => report_error(events, None, EngineError::UnknownScenario(scenario)).await,
+        },
     }
 }
 
@@ -316,6 +344,7 @@ fn start_scenario(
     generation: u64,
 ) -> ScenarioHandle {
     let name = scenario.name.clone();
+    let overrides: runner::Overrides = Arc::new(Mutex::new(BTreeMap::new()));
     let context = runner::Context {
         scenario,
         frames,
@@ -324,6 +353,7 @@ fn start_scenario(
         // Subscribed before the first step runs, so a reply arriving between
         // the send and the wait is still seen.
         received: wiring.heard.subscribe(),
+        overrides: Arc::clone(&overrides),
     };
     let ended = wiring.ended.clone();
 
@@ -334,7 +364,11 @@ fn start_scenario(
         let _ = ended.send((name, generation, outcome)).await;
     });
 
-    ScenarioHandle { task, generation }
+    ScenarioHandle {
+        task,
+        generation,
+        overrides,
+    }
 }
 
 async fn report_error(events: &mpsc::Sender<Event>, id: Option<ConnectionId>, error: EngineError) {
