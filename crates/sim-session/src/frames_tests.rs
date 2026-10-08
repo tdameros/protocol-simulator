@@ -461,7 +461,7 @@ fn deleting_a_frame_takes_its_file_with_it() {
     let (dir, mut library) = library_of("delete", &[("telemetry.toml", GOOD)]);
     library.delete_selected().unwrap();
 
-    assert!(library.entries.is_empty());
+    assert_eq!(library.entries, Vec::new());
     assert_eq!(library.selected, None);
     assert!(!dir.join("telemetry.toml").exists());
 }
@@ -794,7 +794,7 @@ fn widening_a_subtype_touches_no_frame_and_keeps_the_comments() {
     draft.definition.narrows.as_mut().unwrap().range = Some(ValueRange::Uint { min: 0, max: 200 });
 
     assert_eq!(library.type_draft_problem(), None);
-    assert!(library.type_draft_impact().is_empty());
+    assert_eq!(library.type_draft_impact(), Vec::new());
     library.save_type_draft().unwrap();
 
     let text = std::fs::read_to_string(dir.join(TYPES_DIR).join("shared.toml")).unwrap();
@@ -1209,7 +1209,7 @@ fn the_type_review_is_worked_out_once_per_change() {
     // the same draft must not go back to the disk.
     std::fs::remove_dir_all(dir.join(TYPES_DIR)).unwrap();
     assert_eq!(library.type_draft_problem(), first);
-    assert!(library.type_draft_impact().is_empty());
+    assert_eq!(library.type_draft_impact(), Vec::new());
 }
 
 /// The frame a technician would build: one byte, then a shared type.
@@ -1293,7 +1293,7 @@ fn dropping_the_type_leaves_one_plain_field_again() {
 
     assert_eq!(draft.frame.declared, ["colour"]);
     assert_eq!(draft.frame.fields.len(), 1);
-    assert!(draft.frame.stated.is_empty());
+    assert_eq!(draft.frame.stated.len(), 0);
     assert_eq!(library.draft_problem(), None);
 }
 
@@ -1329,7 +1329,7 @@ fn a_field_set_to_a_type_by_mistake_can_be_set_back() {
     assert_eq!(draft.frame.declared, ["colour"]);
     assert_eq!(draft.frame.fields.len(), 1);
     assert_eq!(draft.frame.fields[0].name, "colour");
-    assert!(draft.frame.stated.is_empty());
+    assert_eq!(draft.frame.stated.len(), 0);
     assert_eq!(library.draft_problem(), None);
 }
 
@@ -1548,7 +1548,7 @@ fn a_type_made_on_its_own_is_given_to_nothing() {
     library.save_type_draft().unwrap();
 
     let draft = library.draft.as_ref().expect("still waiting");
-    assert!(draft.frame.stated.is_empty());
+    assert_eq!(draft.frame.stated.len(), 0);
     assert_eq!(draft.frame.size(), 1);
 }
 
@@ -1760,7 +1760,7 @@ fn a_frame_waiting_under_a_type_survives_it_being_deleted() {
     // nothing defines.
     let draft = library.draft.as_ref().expect("the frame is still waiting");
     assert_eq!(draft.frame.fields, was);
-    assert!(draft.frame.stated.is_empty());
+    assert_eq!(draft.frame.stated.len(), 0);
     assert_eq!(
         draft.frame.declared,
         ["colour.red", "colour.green", "colour.blue"]

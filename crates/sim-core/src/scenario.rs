@@ -1089,7 +1089,7 @@ counters = { seq = { wrap = 255 } }
         ));
         // A delay is the one step the default does not reach, having no link
         // to act on in the first place.
-        assert!(scenario.steps[3].targets.is_empty());
+        assert_eq!(scenario.steps[3].targets, Vec::new());
     }
 
     #[test]
@@ -1490,7 +1490,7 @@ raw = "00"
 "#);
         // The scenario default reaches the send and stops at the delay, so
         // writing it back cannot invent a link the delay never had.
-        assert!(scenario.steps[0].targets.is_empty());
+        assert_eq!(scenario.steps[0].targets, Vec::new());
         assert_eq!(scenario.steps[1].targets, [ConnectionId::from("bus")]);
 
         // And saying it outright is refused rather than quietly ignored.

@@ -1428,7 +1428,7 @@ from_capture = { payload = "server1_code" }
         draft.add_step(&[], None);
         let last = draft.scenario.steps.last().expect("just added");
         assert_eq!(ActionKind::of(&last.action), ActionKind::Wait);
-        assert!(last.targets.is_empty());
+        assert_eq!(last.targets, Vec::new());
     }
 
     #[test]
@@ -1445,7 +1445,7 @@ from_capture = { payload = "server1_code" }
 
         // A delay aims at nothing, canonically, so it drops what it had.
         draft.set_action(0, ActionKind::Wait, &links(&["bus"]));
-        assert!(draft.scenario.steps[0].targets.is_empty());
+        assert_eq!(draft.scenario.steps[0].targets, Vec::new());
 
         // And coming back out of a delay it is given somewhere to go.
         draft.set_action(0, ActionKind::Raw, &links(&["bus"]));
@@ -1543,8 +1543,8 @@ counters = { seq = { wrap = 255 } }
         };
         assert_eq!(frame, "Status");
         // Invisible in the editor if kept, and fatal at run time.
-        assert!(with.is_empty());
-        assert!(counters.is_empty());
+        assert_eq!(with.len(), 0);
+        assert_eq!(counters.len(), 0);
     }
 
     #[test]
@@ -1709,7 +1709,7 @@ on = "bus"
 raw = "00"
 "#,
         );
-        assert!(unknown_connections(&state, &good).is_empty());
+        assert_eq!(unknown_connections(&state, &good), Vec::<String>::new());
 
         let typo = parse(
             r#"
@@ -1736,7 +1736,7 @@ name = "Waiting"
 wait_ms = 10
 "#,
         );
-        assert!(unknown_connections(&state, &waiting).is_empty());
+        assert_eq!(unknown_connections(&state, &waiting), Vec::<String>::new());
     }
 
     #[test]

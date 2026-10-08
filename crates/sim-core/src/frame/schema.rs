@@ -1989,7 +1989,7 @@ endian = "big"
         assert_eq!(&bytes[..2], &[0xAA, 0x55]);
 
         let decoded = codec::decode(&frame, &bytes).unwrap();
-        assert!(decoded.checksum_mismatches.is_empty());
+        assert_eq!(decoded.checksum_mismatches.len(), 0);
         assert_eq!(decoded.values["timestamp"], Value::Uint(0x1234_5678));
         assert_eq!(decoded.values["mode"], Value::Uint(1));
     }
@@ -2241,7 +2241,7 @@ covers = { from = "header", to = "led" }
         let bytes = codec::encode(&frame, &values).unwrap();
         assert_eq!(bytes.len(), 19);
         let decoded = codec::decode(&frame, &bytes).unwrap();
-        assert!(decoded.checksum_mismatches.is_empty());
+        assert_eq!(decoded.checksum_mismatches.len(), 0);
         assert_eq!(decoded.values["led[3].brightness"], Value::Uint(200));
     }
 

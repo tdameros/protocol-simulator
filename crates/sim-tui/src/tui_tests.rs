@@ -1061,7 +1061,7 @@ fn cancelling_the_form_creates_nothing() {
     press(&mut app, KeyCode::Esc);
 
     assert!(app.overlay().is_none());
-    assert!(app.session().connections.is_empty());
+    assert_eq!(app.session().connections.len(), 0);
 }
 
 #[test]
@@ -1070,7 +1070,7 @@ fn a_link_can_be_removed_once_it_is_down() {
     linked(&mut app, "bus", ConnectionStatus::Disconnected);
     press(&mut app, KeyCode::Char('x'));
 
-    assert!(app.session().connections.is_empty());
+    assert_eq!(app.session().connections.len(), 0);
 }
 
 /// The window refuses this too: a link has to be told to stop before it can
@@ -1978,7 +1978,7 @@ fn delete_removes_a_scenario_from_disk() {
     press(&mut app, KeyCode::Char('5'));
     press(&mut app, KeyCode::Char('d'));
 
-    assert!(app.session().scenarios.entries.is_empty());
+    assert_eq!(app.session().scenarios.entries, Vec::new());
 }
 
 fn scratch_project_dir(name: &str) -> std::path::PathBuf {
