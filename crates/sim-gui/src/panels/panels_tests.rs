@@ -96,7 +96,7 @@ fn an_emptied_folder_still_offers_a_way_to_make_a_frame() {
     harness.state_mut().state.frames.delete_selected().unwrap();
     harness.run();
 
-    assert!(harness.state().state.frames.is_empty());
+    assert_eq!(harness.state().state.frames.entries.len(), 0);
     let new = harness
         .query_by_label_contains("New")
         .expect("New is still offered with nothing left in the folder");
@@ -249,7 +249,7 @@ fn a_first_scenario_can_be_made_in_an_empty_folder() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut world = World::new();
     world.state.scenarios.load_from(dir);
-    assert!(world.state.scenarios.entries.is_empty());
+    assert_eq!(world.state.scenarios.entries, Vec::new());
 
     let mut harness = scenarios_panel(world);
     harness.run();
@@ -635,9 +635,11 @@ fn a_captured_field_can_be_sent_from_the_panel() {
             expect: sim_core::scenario::Expect::Frame {
                 frame: "Response".to_owned(),
                 values: std::collections::BTreeMap::default(),
+                match_from_capture: std::collections::BTreeMap::default(),
                 capture: std::collections::BTreeMap::default(),
             },
             timeout: None,
+            on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
         };
         draft.scenario.steps[0].targets = vec![sim_core::ConnectionId::from("server1")];
         draft.scenario.steps.push(sim_core::scenario::Step {
@@ -647,6 +649,7 @@ fn a_captured_field_can_be_sent_from_the_panel() {
                 with: std::collections::BTreeMap::default(),
                 counters: std::collections::BTreeMap::default(),
                 from_capture: std::collections::BTreeMap::default(),
+                capture: std::collections::BTreeMap::default(),
             },
         });
     }
@@ -730,6 +733,7 @@ fn a_dangling_capture_can_still_be_cleared_from_its_own_row() {
                     "payload".to_owned(),
                     "gone".to_owned(),
                 )]),
+                capture: std::collections::BTreeMap::new(),
             },
         }];
     }

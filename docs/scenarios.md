@@ -26,6 +26,35 @@ scenario completed, 1 for anything else, including a name `--run` does not
 find. A scenario with no `times` runs until the process is stopped, which for
 a service started at boot is `SIGTERM`, the same as any other.
 
+`--control-port PORT`, given alongside `--run`, opens a local TCP socket for
+an external script: one JSON request per line in, one JSON response per line
+out.
+
+```
+{"cmd":"set","step":2,"field":"speed","value":42}
+-> {"ok":true}  |  {"ok":false,"error":"..."}
+
+{"cmd":"last_received","on":"drive","as":"Telemetry"}
+-> {"ok":true,"bytes":"AA 55 ...","fields":{"speed":42,"mode":1},"kinds":{"speed":"u16","mode":"enum"},"field_order":["speed","mode"]}
+-> {"ok":false,"error":"nothing received yet on drive"}
+
+{"cmd":"last_sent","on":"drive","as":"Telemetry"}
+-> {"ok":true,"bytes":"AA 55 ...","fields":{"speed":42,"mode":1},"kinds":{"speed":"u16","mode":"enum"},"field_order":["speed","mode"]}
+-> {"ok":false,"error":"nothing sent yet on drive"}
+```
+
+`step` counts from one, as the row above it in this page already does. Every
+field declared by a `send` step's frame can be changed live, whether it uses a
+frame default or is listed in `with`. A request naming another step or field
+returns `ok: false` with an error instead of being silently ignored.
+
+`last_received` and `last_sent` decode the most recent frame in each direction
+on a connection. `as` selects the frame definition to use for decoding, and
+`kinds` maps each decoded field name to its declared type. `field_order` lists
+the fields in their declaration order, for clients that display them.
+Bitfield values are represented as their packed decimal integer; `set` accepts
+that same unsigned decimal value for a bitfield.
+
 ## Steps
 
 | Step | Key | Carries |
@@ -40,6 +69,13 @@ a service started at boot is `SIGTERM`, the same as any other.
 ```toml
 wait_for = { frame = "Status", match = { state = 2 }, timeout_ms = 500 }
 wait_for = { hex = "AA 55 ?? 01", at = 0, timeout_ms = 500 }
+```
+
+By default, a timeout stops the scenario. A repeating scenario can log a
+timeout and start its next pass instead:
+
+```toml
+wait_for = { frame = "Status", match = { state = 2 }, timeout_ms = 500, on_timeout = "continue" }
 ```
 
 Naming a frame is resolved against the definition when the scenario starts, so
@@ -79,6 +115,26 @@ with the first. `from_capture` is refused where it names a variable no earlier
 step captures, caught when the scenario loads rather than partway through a
 run. A variable is remembered for one pass and is gone before the next repeat
 starts, so a step reading it always reads what this pass captured.
+
+## Correlating a reply to a request
+
+A `send` can remember a field after all of its values, captures, live
+overrides, and counters have been resolved. A later frame wait can match a
+field against that remembered value. This is useful for request IDs:
+
+```toml
+[[scenario.step]]
+send = "Request"
+counters = { id = { wrap = 65535 } }
+capture = { id = "request_id" }
+
+[[scenario.step]]
+wait_for = { frame = "Response", match_from_capture = { id = "request_id" }, timeout_ms = 500 }
+```
+
+`match` and `match_from_capture` may name different fields in the same wait,
+but never the same field. The variable must have been captured by an earlier
+`send` or `wait_for` step. As with other captures, it exists for one pass only.
 
 ## Targets
 

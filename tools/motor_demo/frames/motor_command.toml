@@ -1,0 +1,14 @@
+name = "MotorCommand"
+description = "The command sent to the motor controller, at a fixed rate"
+
+[[field]]
+name = "target_rpm"
+type = "u16"
+default = 0
+description = "Requested motor speed"
+
+[[field]]
+name = "mode"
+type = "u8"
+default = 1
+description = "0 = stop, 1 = run, 2 = clear fault"

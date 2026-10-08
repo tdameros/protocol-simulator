@@ -212,7 +212,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!shown.is_empty());
+        assert_ne!(shown, Vec::<MonitorId>::new());
         for id in shown {
             assert!(state.monitors.contains_key(&id), "{id:?} has no monitor");
         }

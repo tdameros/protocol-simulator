@@ -1,0 +1,9 @@
+[[scenario]]
+name = "Motor demo"
+description = "Sends a motor command 5 times a second, forever"
+on = "motor"
+repeat = { every_ms = 200 }
+
+[[scenario.step]]
+send = "MotorCommand"
+with = { target_rpm = 1500, mode = 1 }

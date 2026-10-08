@@ -590,6 +590,90 @@ counters = { seq = { from = 10, step = 5 } }
     assert_eq!(frames[2], vec![0xAA, 0x55, 20, 7]);
 }
 
+/// A live override reaches a running scenario without restarting it: the
+/// pass already under way when it lands still carries the file's own value,
+/// and every pass after that carries the pushed one.
+#[tokio::test]
+async fn a_live_override_changes_what_a_running_scenario_sends() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let addr_a = "127.0.0.1:19891".parse().unwrap();
+    let addr_b = "127.0.0.1:19892".parse().unwrap();
+    for (name, bind, remote) in [("a", addr_a, addr_b), ("b", addr_b, addr_a)] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["a", "b"]).await;
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Steerable"
+on = "a"
+repeat = { every_ms = 30, times = 3 }
+
+[[scenario.step]]
+send = "Beacon"
+with = { mode = 1 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![scenario_frame()],
+    })
+    .await
+    .unwrap();
+
+    // The first pass has to have landed before the override is pushed, or it
+    // would be ambiguous which pass it took effect from. `wait_for` consumes
+    // this event off the channel, so its bytes are kept here rather than
+    // expected to still be in whatever `gather_until` collects afterwards.
+    let first = wait_for(
+        &mut rx,
+        |event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "b"),
+    )
+    .await;
+    let Event::FrameReceived {
+        bytes: first_bytes, ..
+    } = first
+    else {
+        unreachable!()
+    };
+
+    tx.send(Command::SetStepValue {
+        scenario: "Steerable".to_owned(),
+        step: 1,
+        field: "mode".to_owned(),
+        value: sim_core::frame::value::Value::Uint(9),
+    })
+    .await
+    .unwrap();
+
+    // Both conditions, in either order: the scenario announces itself done
+    // before its last frame has finished crossing the loopback.
+    let seen = gather_until(&mut rx, |events| {
+        beacons(events, "b").len() >= 2
+            && finished_with(events, "Steerable", &sim_core::Outcome::Completed)
+    })
+    .await;
+
+    let rest = beacons(&seen, "b");
+    assert_eq!(rest.len(), 2, "the two passes after the first");
+    assert_eq!(
+        first_bytes[3], 1,
+        "the file's own value, before the override"
+    );
+    assert_eq!(rest[1][3], 9, "the pushed value, once it has landed");
+}
+
 /// `wait_for` holds the sequence until the far side answers, and the step after
 /// it only runs then.
 #[tokio::test]

@@ -3,6 +3,7 @@
 
 mod app;
 mod connection_form;
+mod control;
 mod headless;
 mod ui;
 
@@ -33,6 +34,22 @@ const TICK: Duration = Duration::from_millis(100);
 /// serial console tends to actually be.
 const FALLBACK_SIZE: (u16, u16) = (80, 24);
 
+const USAGE: &str = "\
+Protocol Simulator TUI
+
+Usage:
+  protocol-simulator-tui [PROJECT]
+  protocol-simulator-tui PROJECT --run SCENARIO [--control-port PORT]
+
+Arguments:
+  PROJECT                 Project TOML file, or a folder of frame definitions
+
+Options:
+  --run SCENARIO          Run one scenario without opening the interactive TUI
+  --control-port PORT     Open a local control socket while using --run
+  -h, --help              Print this help message
+";
+
 fn main() -> std::io::Result<()> {
     // One positional argument, as the window takes: a project file, or a folder
     // of frame definitions. No file picker, since the machine this runs on is
@@ -40,20 +57,29 @@ fn main() -> std::io::Result<()> {
     //
     // `--run NAME` skips the screen entirely and runs one scenario from the
     // project, for a service started at boot rather than a person at a
-    // keyboard.
+    // keyboard. `--control-port PORT`, only meaningful alongside `--run`,
+    // opens a local TCP socket an external script can use to override a
+    // `send` step's field live and read back the last frame received on a
+    // connection.
     let mut opened_with = None;
     let mut run_scenario = None;
+    let mut control_port = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--run" {
+        if arg == "-h" || arg == "--help" {
+            print!("{USAGE}");
+            return Ok(());
+        } else if arg == "--run" {
             run_scenario = args.next();
+        } else if arg == "--control-port" {
+            control_port = args.next().and_then(|value| value.parse().ok());
         } else {
             opened_with = Some(PathBuf::from(arg));
         }
     }
 
     if let Some(name) = run_scenario {
-        std::process::exit(headless::run(opened_with, &name));
+        std::process::exit(headless::run(opened_with, &name, control_port));
     }
 
     // Raw mode, the alternate screen, and a panic hook that puts the terminal

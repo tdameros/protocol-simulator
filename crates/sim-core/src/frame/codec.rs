@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(decoded.range_violations[0].field, "percent");
         assert_eq!(decoded.range_violations[0].found, "120");
 
-        assert!(decode(&frame, &[99]).unwrap().range_violations.is_empty());
+        assert_eq!(decode(&frame, &[99]).unwrap().range_violations.len(), 0);
     }
 
     #[test]
@@ -681,7 +681,7 @@ mod tests {
         );
 
         let decoded = decode(&frame, &bytes).unwrap();
-        assert!(decoded.checksum_mismatches.is_empty());
+        assert_eq!(decoded.checksum_mismatches.len(), 0);
     }
 
     #[test]

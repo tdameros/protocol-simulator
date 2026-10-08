@@ -54,6 +54,18 @@ impl EngineHandle {
         self.send(Command::StopScenario { name });
     }
 
+    /// A cloned handle to the command channel alone, for a caller that only
+    /// ever issues commands and has no use for the event side.
+    ///
+    /// `EngineHandle` itself cannot be shared across threads: its drop
+    /// counter is a `Cell`, so the type is deliberately not `Sync`. A caller
+    /// on another thread, such as a control socket's own connection
+    /// handler, takes this instead.
+    #[must_use]
+    pub fn command_sender(&self) -> mpsc::Sender<Command> {
+        self.command_tx.clone()
+    }
+
     /// Drains every event currently queued from the engine.
     ///
     /// Called once per frame; never blocks the UI thread.
@@ -149,5 +161,39 @@ impl EngineHandle {
 impl Default for EngineHandle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EngineHandle;
+    use sim_core::{Command, ConnectionId};
+
+    /// The sender handed out reaches the same engine `drain_events` does,
+    /// proven by a command that produces an event `drain_events` can see.
+    #[test]
+    fn command_sender_reaches_the_same_engine() {
+        let mut handle = EngineHandle::new();
+        let sender = handle.command_sender();
+
+        sender
+            .blocking_send(Command::Disconnect {
+                id: ConnectionId::from("nothing"),
+            })
+            .expect("the engine's command channel should still be open");
+
+        let events = loop {
+            let events = handle.drain_events();
+            if !events.is_empty() {
+                break events;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, sim_core::Event::Error { .. })),
+            "disconnecting a connection that does not exist should be reported"
+        );
     }
 }
