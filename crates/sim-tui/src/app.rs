@@ -696,7 +696,9 @@ impl StepEdit {
                 // library; the caller expands `SendField` once it has one.
                 let _ = with;
             }
-            Action::WaitFor { expect, timeout } => {
+            Action::WaitFor {
+                expect, timeout, ..
+            } => {
                 fields.push(StepField::WaitByFrame);
                 match expect {
                     Expect::Pattern { anchor, .. } => {
@@ -849,6 +851,7 @@ impl StepEdit {
                     with,
                     counters,
                     from_capture,
+                    capture,
                 } = &step.action
                 else {
                     return (String::new(), String::new());
@@ -868,6 +871,10 @@ impl StepEdit {
                 } else {
                     "frame default".to_owned()
                 };
+                let value = capture.get(&field_def.name).map_or_else(
+                    || value.clone(),
+                    |variable| format!("{value} · save as {variable}"),
+                );
                 (format!("  {}", field_def.name), value)
             }
             _ => (String::new(), String::new()),
@@ -965,7 +972,9 @@ impl StepEdit {
                         Expect::Frame {
                             frame,
                             values,
+                            match_from_capture,
                             capture,
+                            ..
                         },
                     ..
                 } = &step.action
@@ -986,6 +995,9 @@ impl StepEdit {
                 };
                 if let Some(variable) = capture.get(&field_def.name) {
                     value = format!("{value} · capture as {variable}");
+                }
+                if let Some(variable) = match_from_capture.get(&field_def.name) {
+                    value = format!("{value} · match from {variable}");
                 }
                 (format!("  {}", field_def.name), value)
             }
@@ -1104,6 +1116,7 @@ impl StepEdit {
                     frame,
                     values,
                     capture,
+                    ..
                 },
             ..
         } = &step.action
@@ -1785,6 +1798,8 @@ impl App {
                 ("Tab", "next field"),
                 ("left/right", "change, capture"),
                 ("space", "toggle"),
+                ("F2", "save sent field"),
+                ("F3", "match from capture"),
                 ("type", "edit"),
                 ("Esc", "done"),
             ]);
@@ -3694,6 +3709,21 @@ impl App {
         else {
             return;
         };
+        if matches!(code, KeyCode::F(2)) {
+            let Action::Send { capture, .. } = &step.action else {
+                return;
+            };
+            let on = !capture.contains_key(&field_def.name);
+            scenarios::set_sent_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                on,
+            );
+            if on {
+                field_def.name.clone_into(text);
+            }
+            return;
+        }
         if matches!(code, KeyCode::Char(' ')) {
             let Action::Send { with, .. } = &step.action else {
                 return;
@@ -3954,6 +3984,7 @@ impl App {
                                             frame,
                                             values,
                                             capture,
+                                            match_from_capture,
                                         },
                                     ..
                                 },
@@ -3968,6 +3999,7 @@ impl App {
                             let at = at.rem_euclid(i32::try_from(names.len()).unwrap_or(1));
                             frame.clone_from(&names[usize::try_from(at).unwrap_or(0)]);
                             values.clear();
+                            match_from_capture.clear();
                             capture.clear();
                         }
                     }
@@ -4022,6 +4054,7 @@ impl App {
                 Expect::Frame {
                     frame,
                     values,
+                    match_from_capture,
                     capture,
                 },
             ..
@@ -4035,6 +4068,19 @@ impl App {
         let Some(field_def) = definition.fields.get(i) else {
             return;
         };
+        if matches!(code, KeyCode::F(3)) {
+            let available = scenarios::captured_before(&draft.scenario, index);
+            let mut choices: Vec<Option<&String>> = vec![None];
+            choices.extend(available.iter().map(Some));
+            let current = match_from_capture.get(&field_def.name);
+            let next = crate::connection_form::cycle(&choices, current, 1);
+            scenarios::set_match_from_capture(
+                draft.scenario.steps.get_mut(index).expect("just read"),
+                &field_def.name,
+                next.map(String::as_str),
+            );
+            return;
+        }
         if matches!(code, KeyCode::Char(' ')) {
             let on = !values.contains_key(&field_def.name);
             scenarios::set_match(

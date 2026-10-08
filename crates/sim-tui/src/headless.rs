@@ -22,7 +22,7 @@ use sim_session::scenarios;
 use sim_session::state::Session;
 use sim_session::{hex, links};
 
-use crate::control::{self, LastReceived};
+use crate::control::{self, LastReceived, LastSent, RunStatus};
 
 const POLL: Duration = Duration::from_millis(20);
 
@@ -70,13 +70,20 @@ pub fn run(opened_with: Option<PathBuf>, scenario_name: &str, control_port: Opti
     }
 
     let last_received: LastReceived = Arc::new(Mutex::new(HashMap::new()));
+    let last_sent: LastSent = Arc::new(Mutex::new(HashMap::new()));
+    let status: RunStatus = Arc::new(Mutex::new(
+        serde_json::json!({"ok": true, "state": "running"}),
+    ));
     if let Some(port) = control_port {
-        let frames = session.frames.frames().cloned().collect();
+        let frames: Vec<_> = session.frames.frames().cloned().collect();
         if let Err(error) = control::spawn(
             port,
             engine.command_sender(),
             scenario_name.to_owned(),
+            control::editable_fields(&scenario, &frames),
             Arc::clone(&last_received),
+            Arc::clone(&last_sent),
+            Arc::clone(&status),
             frames,
         ) {
             eprintln!("cannot open the control socket on port {port}: {error}");
@@ -90,10 +97,16 @@ pub fn run(opened_with: Option<PathBuf>, scenario_name: &str, control_port: Opti
         return 1;
     }
 
-    watch(engine, scenario_name, &last_received)
+    watch(engine, scenario_name, &last_received, &last_sent, &status)
 }
 
-fn watch(mut engine: EngineHandle, scenario_name: &str, last_received: &LastReceived) -> i32 {
+fn watch(
+    mut engine: EngineHandle,
+    scenario_name: &str,
+    last_received: &LastReceived,
+    last_sent: &LastSent,
+    status: &RunStatus,
+) -> i32 {
     loop {
         for event in engine.drain_events() {
             match event {
@@ -102,6 +115,7 @@ fn watch(mut engine: EngineHandle, scenario_name: &str, last_received: &LastRece
                 }
                 Event::FrameSent { id, bytes, .. } => {
                     println!("TX {} {}", id.0, hex::spaced(&bytes));
+                    last_sent.lock().unwrap().insert(id, bytes);
                 }
                 Event::FrameReceived { id, bytes, .. } => {
                     println!("RX {} {}", id.0, hex::spaced(&bytes));
@@ -110,12 +124,16 @@ fn watch(mut engine: EngineHandle, scenario_name: &str, last_received: &LastRece
                 Event::Error { id, error } => {
                     let who = id.map(|id| id.0).unwrap_or_default();
                     eprintln!("{who}: {error}");
+                    *status.lock().unwrap() = serde_json::json!({"ok": true, "state": "error", "reason": error.to_string(), "connection": who});
                 }
                 Event::ScenarioStep { name, step, pass } if name == scenario_name => {
                     println!("[{name}] pass {pass}, step {step}");
+                    *status.lock().unwrap() = serde_json::json!({"ok": true, "state": "running", "step": step, "pass": pass});
                 }
                 Event::ScenarioFinished { name, outcome } if name == scenario_name => {
                     println!("[{name}] {outcome:?}");
+                    *status.lock().unwrap() =
+                        serde_json::json!({"ok": true, "state": format!("{outcome:?}")});
                     return i32::from(outcome != Outcome::Completed);
                 }
                 Event::ScenarioStep { .. } | Event::ScenarioFinished { .. } => {}
@@ -250,6 +268,14 @@ mod tests {
             r#"{{"cmd":"last_received","on":"loop","as":"Ping"}}"#
         )
         .expect("write should succeed");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read should succeed");
+        let response: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(response["ok"], true, "{line}");
+        assert_eq!(response["fields"]["mode"], 9, "{line}");
+
+        writeln!(client, r#"{{"cmd":"last_sent","on":"loop","as":"Ping"}}"#)
+            .expect("write should succeed");
         let mut line = String::new();
         reader.read_line(&mut line).expect("read should succeed");
         let response: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");

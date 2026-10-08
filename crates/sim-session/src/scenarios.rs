@@ -334,6 +334,7 @@ impl ActionKind {
                 with: BTreeMap::new(),
                 counters: BTreeMap::new(),
                 from_capture: BTreeMap::new(),
+                capture: BTreeMap::new(),
             },
             // One byte rather than none: an empty `raw` is not a step the
             // loader accepts, and a half-made step must never be unsavable.
@@ -345,9 +346,11 @@ impl ActionKind {
                 expect: Expect::Frame {
                     frame: frame.unwrap_or_default().to_owned(),
                     values: BTreeMap::new(),
+                    match_from_capture: BTreeMap::new(),
                     capture: BTreeMap::new(),
                 },
                 timeout: Some(Duration::from_millis(500)),
+                on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
             },
         }
     }
@@ -465,6 +468,7 @@ pub fn set_frame(step: &mut Step, name: &str) {
         with,
         counters,
         from_capture,
+        ..
     } = &mut step.action
     else {
         return;
@@ -476,6 +480,9 @@ pub fn set_frame(step: &mut Step, name: &str) {
     with.clear();
     counters.clear();
     from_capture.clear();
+    if let Action::Send { capture, .. } = &mut step.action {
+        capture.clear();
+    }
 }
 
 /// Starts or stops overriding one field of a `send` step.
@@ -557,11 +564,39 @@ pub fn set_from_capture(step: &mut Step, field: &str, variable: Option<&str>) {
     }
 }
 
+/// Starts or stops remembering one field from a sent frame. The saved value is
+/// the final value on the wire, including counters and live overrides.
+pub fn set_sent_capture(step: &mut Step, field: &str, on: bool) {
+    let Action::Send { capture, .. } = &mut step.action else {
+        return;
+    };
+    if on {
+        capture.insert(field.to_owned(), field.to_owned());
+    } else {
+        capture.remove(field);
+    }
+}
+
+/// Renames the variable a sent field is stored as.
+pub fn rename_sent_capture(step: &mut Step, field: &str, name: &str) {
+    let Action::Send { capture, .. } = &mut step.action else {
+        return;
+    };
+    if let Some(held) = capture.get_mut(field) {
+        name.clone_into(held);
+    }
+}
+
 /// Starts or stops watching one field of a frame, seeded from the frame's own
 /// default so that ticking a sync word is still a single click.
 pub fn set_match(step: &mut Step, frame: &FrameDef, field: &str, on: bool) {
     let Action::WaitFor {
-        expect: Expect::Frame { values, .. },
+        expect:
+            Expect::Frame {
+                values,
+                match_from_capture,
+                ..
+            },
         ..
     } = &mut step.action
     else {
@@ -572,8 +607,34 @@ pub fn set_match(step: &mut Step, frame: &FrameDef, field: &str, on: bool) {
         if let Some(value) = seeded.get(field) {
             values.insert(field.to_owned(), value.clone());
         }
+        match_from_capture.remove(field);
     } else {
         values.remove(field);
+    }
+}
+
+/// Matches a reply field against a variable produced by an earlier step.
+pub fn set_match_from_capture(step: &mut Step, field: &str, variable: Option<&str>) {
+    let Action::WaitFor {
+        expect:
+            Expect::Frame {
+                values,
+                match_from_capture,
+                ..
+            },
+        ..
+    } = &mut step.action
+    else {
+        return;
+    };
+    match variable {
+        Some(variable) => {
+            match_from_capture.insert(field.to_owned(), variable.to_owned());
+            values.remove(field);
+        }
+        None => {
+            match_from_capture.remove(field);
+        }
     }
 }
 
@@ -609,7 +670,7 @@ pub fn rename_capture(step: &mut Step, field: &str, name: &str) {
 }
 
 /// Every variable a step at `index` could read from, which is every one an
-/// earlier step's `wait_for` captures.
+/// earlier step's `send` or `wait_for` captures.
 ///
 /// Forward only, in file order: a run reaches step `index` having executed
 /// every step before it and none after, so a name introduced later is not
@@ -622,7 +683,8 @@ pub fn captured_before(scenario: &Scenario, index: usize) -> Vec<String> {
         .iter()
         .take(index)
         .filter_map(|step| match &step.action {
-            Action::WaitFor {
+            Action::Send { capture, .. }
+            | Action::WaitFor {
                 expect: Expect::Frame { capture, .. },
                 ..
             } => Some(capture.values().cloned()),
@@ -648,6 +710,18 @@ fn prune_dangling_captures(scenario: &mut Scenario) {
             from_capture.retain(|_, variable| known.contains(variable));
         }
         if let Action::WaitFor {
+            expect: Expect::Frame {
+                match_from_capture, ..
+            },
+            ..
+        } = &mut step.action
+        {
+            match_from_capture.retain(|_, variable| known.contains(variable));
+        }
+        if let Action::Send { capture, .. } = &step.action {
+            known.extend(capture.values().cloned());
+        }
+        if let Action::WaitFor {
             expect: Expect::Frame { capture, .. },
             ..
         } = &step.action
@@ -667,6 +741,7 @@ pub fn set_wait_by_frame(step: &mut Step, by_frame: bool, frame: Option<&str>) {
         Expect::Frame {
             frame: frame.unwrap_or_default().to_owned(),
             values: BTreeMap::new(),
+            match_from_capture: BTreeMap::new(),
             capture: BTreeMap::new(),
         }
     } else {
@@ -836,6 +911,7 @@ pub fn describe(step: &Step) -> String {
             with,
             counters,
             from_capture,
+            capture,
         } => {
             let mut text = format!("send {frame}");
             if !with.is_empty() {
@@ -845,6 +921,10 @@ pub fn describe(step: &Step) -> String {
             if !from_capture.is_empty() {
                 let fields: Vec<&str> = from_capture.keys().map(String::as_str).collect();
                 let _ = write!(text, " filling {} from capture", fields.join(", "));
+            }
+            if !capture.is_empty() {
+                let fields: Vec<&str> = capture.keys().map(String::as_str).collect();
+                let _ = write!(text, " saving {}", fields.join(", "));
             }
             if !counters.is_empty() {
                 let fields: Vec<&str> = counters.keys().map(String::as_str).collect();
@@ -857,11 +937,14 @@ pub fn describe(step: &Step) -> String {
             format!("send raw {}", hex.join(" "))
         }
         Action::Wait { delay } => format!("wait {} ms", delay.as_millis()),
-        Action::WaitFor { expect, timeout } => {
+        Action::WaitFor {
+            expect, timeout, ..
+        } => {
             let mut text = match expect {
                 Expect::Frame {
                     frame,
                     values,
+                    match_from_capture,
                     capture,
                 } => {
                     let mut text = format!("wait for {frame}");
@@ -872,6 +955,11 @@ pub fn describe(step: &Step) -> String {
                     if !capture.is_empty() {
                         let named: Vec<&str> = capture.keys().map(String::as_str).collect();
                         let _ = write!(text, " capturing {}", named.join(", "));
+                    }
+                    if !match_from_capture.is_empty() {
+                        let fields: Vec<&str> =
+                            match_from_capture.keys().map(String::as_str).collect();
+                        let _ = write!(text, " matching {} from capture", fields.join(", "));
                     }
                     text
                 }
@@ -1135,9 +1223,11 @@ raw = "01"
                         expect: Expect::Frame {
                             frame: "Telemetry".to_owned(),
                             values: BTreeMap::new(),
+                            match_from_capture: BTreeMap::new(),
                             capture: BTreeMap::new(),
                         },
                         timeout: None,
+                        on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
                     };
                 }),
             ),

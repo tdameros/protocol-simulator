@@ -635,9 +635,11 @@ fn a_captured_field_can_be_sent_from_the_panel() {
             expect: sim_core::scenario::Expect::Frame {
                 frame: "Response".to_owned(),
                 values: std::collections::BTreeMap::default(),
+                match_from_capture: std::collections::BTreeMap::default(),
                 capture: std::collections::BTreeMap::default(),
             },
             timeout: None,
+            on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
         };
         draft.scenario.steps[0].targets = vec![sim_core::ConnectionId::from("server1")];
         draft.scenario.steps.push(sim_core::scenario::Step {
@@ -647,6 +649,7 @@ fn a_captured_field_can_be_sent_from_the_panel() {
                 with: std::collections::BTreeMap::default(),
                 counters: std::collections::BTreeMap::default(),
                 from_capture: std::collections::BTreeMap::default(),
+                capture: std::collections::BTreeMap::default(),
             },
         });
     }
@@ -730,6 +733,7 @@ fn a_dangling_capture_can_still_be_cleared_from_its_own_row() {
                     "payload".to_owned(),
                     "gone".to_owned(),
                 )]),
+                capture: std::collections::BTreeMap::new(),
             },
         }];
     }

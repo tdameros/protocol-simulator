@@ -34,6 +34,22 @@ const TICK: Duration = Duration::from_millis(100);
 /// serial console tends to actually be.
 const FALLBACK_SIZE: (u16, u16) = (80, 24);
 
+const USAGE: &str = "\
+Protocol Simulator TUI
+
+Usage:
+  protocol-simulator-tui [PROJECT]
+  protocol-simulator-tui PROJECT --run SCENARIO [--control-port PORT]
+
+Arguments:
+  PROJECT                 Project TOML file, or a folder of frame definitions
+
+Options:
+  --run SCENARIO          Run one scenario without opening the interactive TUI
+  --control-port PORT     Open a local control socket while using --run
+  -h, --help              Print this help message
+";
+
 fn main() -> std::io::Result<()> {
     // One positional argument, as the window takes: a project file, or a folder
     // of frame definitions. No file picker, since the machine this runs on is
@@ -50,7 +66,10 @@ fn main() -> std::io::Result<()> {
     let mut control_port = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--run" {
+        if arg == "-h" || arg == "--help" {
+            print!("{USAGE}");
+            return Ok(());
+        } else if arg == "--run" {
             run_scenario = args.next();
         } else if arg == "--control-port" {
             control_port = args.next().and_then(|value| value.parse().ok());

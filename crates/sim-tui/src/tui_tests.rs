@@ -2808,12 +2808,14 @@ fn cycling_a_captured_field_picks_a_different_variable() {
                     expect: sim_core::scenario::Expect::Frame {
                         frame: "Response".to_owned(),
                         values: std::collections::BTreeMap::default(),
+                        match_from_capture: std::collections::BTreeMap::default(),
                         capture: std::collections::BTreeMap::from([(
                             "code".to_owned(),
                             "first".to_owned(),
                         )]),
                     },
                     timeout: None,
+                    on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
                 },
             },
             sim_core::scenario::Step {
@@ -2822,12 +2824,14 @@ fn cycling_a_captured_field_picks_a_different_variable() {
                     expect: sim_core::scenario::Expect::Frame {
                         frame: "Response".to_owned(),
                         values: std::collections::BTreeMap::default(),
+                        match_from_capture: std::collections::BTreeMap::default(),
                         capture: std::collections::BTreeMap::from([(
                             "code".to_owned(),
                             "second".to_owned(),
                         )]),
                     },
                     timeout: None,
+                    on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
                 },
             },
             sim_core::scenario::Step {
@@ -2837,6 +2841,7 @@ fn cycling_a_captured_field_picks_a_different_variable() {
                     with: std::collections::BTreeMap::default(),
                     counters: std::collections::BTreeMap::default(),
                     from_capture: std::collections::BTreeMap::default(),
+                    capture: std::collections::BTreeMap::default(),
                 },
             },
         ];
@@ -2887,6 +2892,7 @@ fn a_dangling_capture_can_still_be_turned_off() {
                     "payload".to_owned(),
                     "gone".to_owned(),
                 )]),
+                capture: std::collections::BTreeMap::new(),
             },
         }];
     }
