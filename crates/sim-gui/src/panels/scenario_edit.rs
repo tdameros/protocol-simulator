@@ -178,7 +178,7 @@ fn body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool, available:
             hex_field(ui, "bytes", bytes);
         }
         Action::Send { .. } => send_body(ui, step, frames, hex, available),
-        Action::WaitFor { .. } => wait_body(ui, step, frames, hex),
+        Action::WaitFor { .. } => wait_body(ui, step, frames, hex, available),
     }
 }
 
@@ -235,6 +235,10 @@ fn send_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool, avail
 
 /// One field of a `send` step: held at a value, counted up, filled from a
 /// capture, or left at the frame's own default, exactly one at a time.
+#[expect(
+    clippy::too_many_lines,
+    reason = "a field's mutually exclusive send sources and its saved output share one row"
+)]
 fn override_row(
     ui: &mut Ui,
     step: &mut Step,
@@ -247,6 +251,7 @@ fn override_row(
         with,
         counters,
         from_capture,
+        capture,
         ..
     } = &step.action
     else {
@@ -254,6 +259,7 @@ fn override_row(
     };
     let captured = from_capture.contains_key(&field.name);
     let counted = counters.contains_key(&field.name);
+    let saved = capture.contains_key(&field.name);
     let mut overridden = with.contains_key(&field.name);
     if ui
         .add_enabled(
@@ -340,10 +346,32 @@ fn override_row(
     } else {
         ui.label("");
     }
+
+    let Action::Send { capture, .. } = &mut step.action else {
+        return;
+    };
+    let mut saving = saved;
+    let mut toggled_saving = false;
+    ui.horizontal(|ui| {
+        if ui.checkbox(&mut saving, "save as").changed() {
+            toggled_saving = true;
+        }
+        if let Some(variable) = capture.get_mut(&field.name) {
+            ui.text_edit_singleline(variable);
+        }
+    });
+    if toggled_saving {
+        scenarios::set_sent_capture(step, &field.name, saving);
+    }
 }
 
-fn wait_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
-    let Action::WaitFor { expect, timeout } = &mut step.action else {
+fn wait_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool, available: &[String]) {
+    let Action::WaitFor {
+        expect,
+        timeout,
+        on_timeout,
+    } = &mut step.action
+    else {
         return;
     };
 
@@ -371,6 +399,19 @@ fn wait_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
                 *limit = Duration::from_millis(millis);
             }
         }
+        if timeout.is_some() {
+            let mut continuing = *on_timeout == sim_core::scenario::TimeoutPolicy::Continue;
+            if ui
+                .checkbox(&mut continuing, "continue after timeout")
+                .changed()
+            {
+                *on_timeout = if continuing {
+                    sim_core::scenario::TimeoutPolicy::Continue
+                } else {
+                    sim_core::scenario::TimeoutPolicy::Fail
+                };
+            }
+        }
     });
     if by_frame != before {
         scenarios::set_wait_by_frame(step, by_frame, frames.first().map(|f| f.name.as_str()));
@@ -383,7 +424,7 @@ fn wait_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
         pattern_body(ui, expect);
         return;
     }
-    frame_body(ui, step, frames, hex);
+    frame_body(ui, step, frames, hex, available);
 }
 
 fn pattern_body(ui: &mut Ui, expect: &mut Expect) {
@@ -415,12 +456,17 @@ fn pattern_body(ui: &mut Ui, expect: &mut Expect) {
     }
 }
 
-fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "the wait editor keeps matching, dynamic matching, and reply capture in one grid"
+)]
+fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool, available: &[String]) {
     let Action::WaitFor {
         expect:
             Expect::Frame {
                 frame,
                 values,
+                match_from_capture,
                 capture,
             },
         ..
@@ -446,6 +492,7 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
                             {
                                 frame.clone_from(&known.name);
                                 values.clear();
+                                match_from_capture.clear();
                                 capture.clear();
                             }
                         }
@@ -481,28 +528,54 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
             // anything else can be asked for outright. A field can also be
             // remembered under a name of its own, for a later step to send on.
             let mut toggled: Option<(String, bool)> = None;
+            let mut match_from_toggled: Option<(String, Option<String>)> = None;
             let mut capture_toggled: Option<(String, bool)> = None;
             Grid::new("matching")
-                .num_columns(3)
+                .num_columns(4)
                 .min_col_width(0.0)
                 .show(ui, |ui| {
                     for field in &definition.fields {
                         let Action::WaitFor {
                             expect:
                                 Expect::Frame {
-                                    values, capture, ..
+                                    values,
+                                    match_from_capture,
+                                    capture,
+                                    ..
                                 },
                             ..
                         } = &mut step.action
                         else {
                             return;
                         };
+                        let matching_from = match_from_capture.get(&field.name);
                         let mut on = values.contains_key(&field.name);
                         if ui.checkbox(&mut on, &field.name).changed() {
                             toggled = Some((field.name.clone(), on));
                         }
                         if values.contains_key(&field.name) {
                             value_widget(ui, field, &field.kind, values, hex);
+                        } else {
+                            ui.label(RichText::new("any value").weak());
+                        }
+
+                        let mut choice = matching_from.cloned();
+                        if matching_from.is_some() || !available.is_empty() {
+                            ComboBox::from_id_salt(("match_from_capture", &field.name))
+                                .selected_text(choice.as_deref().unwrap_or("any value"))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut choice, None, "any value");
+                                    for variable in available {
+                                        ui.selectable_value(
+                                            &mut choice,
+                                            Some(variable.clone()),
+                                            variable,
+                                        );
+                                    }
+                                });
+                            if choice != matching_from.cloned() {
+                                match_from_toggled = Some((field.name.clone(), choice));
+                            }
                         } else {
                             ui.label(RichText::new("any value").weak());
                         }
@@ -521,6 +594,9 @@ fn frame_body(ui: &mut Ui, step: &mut Step, frames: &[FrameDef], hex: bool) {
                 });
             if let Some((name, on)) = toggled {
                 scenarios::set_match(step, &definition, &name, on);
+            }
+            if let Some((name, variable)) = match_from_toggled {
+                scenarios::set_match_from_capture(step, &name, variable.as_deref());
             }
             if let Some((name, on)) = capture_toggled {
                 scenarios::set_capture(step, &name, on);

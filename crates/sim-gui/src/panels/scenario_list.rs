@@ -37,18 +37,20 @@ pub fn show(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
     // Editing a copy, so what the list and the disk hold is untouched until
     // Save says otherwise.
     if state.scenarios.draft.is_some() {
-        let dirty = state.scenarios.draft_is_dirty();
-        let problem = state
-            .scenarios
-            .draft
-            .as_ref()
-            .and_then(sim_session::scenarios::Draft::problem);
         scenario_edit::header(ui, state);
         ui.separator();
         ScrollArea::vertical()
             .id_salt("scenario_editor")
             .show(ui, |ui| scenario_edit::steps(ui, state));
         ui.separator();
+        // Both are read after the widgets above have applied this frame's
+        // edits, so Save reacts to every setting rather than one frame late.
+        let dirty = state.scenarios.draft_is_dirty();
+        let problem = state
+            .scenarios
+            .draft
+            .as_ref()
+            .and_then(sim_session::scenarios::Draft::problem);
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(

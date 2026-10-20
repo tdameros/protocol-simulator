@@ -11,6 +11,7 @@
 //! loop stops when its command channel closes.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
@@ -20,7 +21,7 @@ use crate::engine::{Command, Event};
 use crate::frame::value::{seed_values, Value};
 use crate::frame::{codec, FrameDef};
 use crate::pattern::{Anchor, HexPattern};
-use crate::scenario::{Action, Counter, Expect, Scenario, Step};
+use crate::scenario::{Action, Counter, Expect, Scenario, Step, TimeoutPolicy};
 
 /// A frame as it arrived, republished for whoever is waiting for one.
 ///
@@ -44,12 +45,22 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// Live overrides for a running scenario's `send` steps, keyed by the step's
+/// one-based number and field name, matching what `Event::ScenarioStep` and
+/// every step-numbered error already mean by "step 2".
+///
+/// Shared directly with the engine's command loop rather than reached through
+/// a channel into this task, the same way `StopScenario` already reaches
+/// `ScenarioHandle` directly instead of sending the task a message.
+pub(crate) type Overrides = Arc<Mutex<BTreeMap<(usize, String), Value>>>;
+
 pub(crate) struct Context {
     pub scenario: Scenario,
     pub frames: Vec<FrameDef>,
     pub commands: mpsc::WeakSender<Command>,
     pub events: mpsc::Sender<Event>,
     pub received: broadcast::Receiver<Heard>,
+    pub overrides: Overrides,
 }
 
 pub(crate) async fn run(context: Context) -> Outcome {
@@ -68,7 +79,7 @@ pub(crate) async fn run(context: Context) -> Outcome {
     });
 
     let mut pass: u32 = 0;
-    loop {
+    'passes: loop {
         if let Some(repeat) = scenario.repeat {
             if repeat.times.is_some_and(|times| pass >= times) {
                 return Outcome::Completed;
@@ -104,15 +115,28 @@ pub(crate) async fn run(context: Context) -> Outcome {
 
             match execute(
                 step,
+                index + 1,
                 pass,
-                &context.frames,
-                &context.commands,
+                &context,
                 &mut received,
                 &mut variables,
             )
             .await
             {
                 StepResult::Done => {}
+                StepResult::Continue(reason) => {
+                    eprintln!(
+                        "[{}] pass {}, step {}: {reason}; continuing",
+                        scenario.name,
+                        pass + 1,
+                        index + 1
+                    );
+                    if scenario.repeat.is_none() {
+                        return Outcome::Completed;
+                    }
+                    pass = pass.saturating_add(1);
+                    continue 'passes;
+                }
                 StepResult::Stopped => return Outcome::Stopped,
                 StepResult::Failed(reason) => {
                     return Outcome::Failed(format!("step {}: {reason}", index + 1))
@@ -131,16 +155,23 @@ enum StepResult {
     Done,
     Stopped,
     Failed(String),
+    Continue(String),
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one dispatcher keeps every scenario action's shared runtime state together"
+)]
 async fn execute(
     step: &Step,
+    number: usize,
     pass: u32,
-    frames: &[FrameDef],
-    commands: &mpsc::WeakSender<Command>,
+    context: &Context,
     received: &mut broadcast::Receiver<Heard>,
     variables: &mut BTreeMap<String, Value>,
 ) -> StepResult {
+    let commands = &context.commands;
+    let frames = &context.frames;
     match &step.action {
         Action::Wait { delay } => {
             tokio::time::sleep(*delay).await;
@@ -152,17 +183,47 @@ async fn execute(
             with,
             counters,
             from_capture,
-        } => match encode(frame, with, counters, from_capture, variables, pass, frames) {
-            // The same bytes to every target, so two links carrying the same
-            // simulated device see the same counter on the same pass.
-            Ok(bytes) => send_to_all(commands, &step.targets, &bytes).await,
-            Err(reason) => StepResult::Failed(reason),
-        },
-        Action::WaitFor { expect, timeout } => {
+            capture,
+        } => {
+            let with = frames
+                .iter()
+                .find(|definition| definition.name == *frame)
+                .map_or_else(
+                    || with.clone(),
+                    |definition| merged(with, definition, number, &context.overrides),
+                );
+            match encode(
+                frame,
+                &with,
+                counters,
+                from_capture,
+                variables,
+                pass,
+                frames,
+            ) {
+                // The same bytes to every target, so two links carrying the
+                // same simulated device see the same counter on the same
+                // pass.
+                Ok((bytes, values)) => {
+                    for (field, variable) in capture {
+                        if let Some(value) = values.get(field) {
+                            variables.insert(variable.clone(), value.clone());
+                        }
+                    }
+                    send_to_all(commands, &step.targets, &bytes).await
+                }
+                Err(reason) => StepResult::Failed(reason),
+            }
+        }
+        Action::WaitFor {
+            expect,
+            timeout,
+            on_timeout,
+        } => {
             // Resolved here rather than at load, because turning a frame into
             // bytes needs the definitions, and only a running scenario has
             // them.
-            let (pattern, anchor) = match resolve(expect, frames) {
+            let (pattern, anchor) = match resolve(expect, frames, variables) {
                 Ok(resolved) => resolved,
                 Err(reason) => return StepResult::Failed(reason),
             };
@@ -209,11 +270,18 @@ async fn execute(
                     Ok(false) => StepResult::Stopped,
                     // Names what is still missing, not what was asked for: on
                     // several links, which one stayed silent is the answer.
-                    Err(_) => StepResult::Failed(format!(
-                        "no matching frame on {} within {} ms",
-                        join(&pending),
-                        limit.as_millis()
-                    )),
+                    Err(_) => {
+                        let reason = format!(
+                            "no matching frame on {} within {} ms",
+                            join(&pending),
+                            limit.as_millis()
+                        );
+                        if *on_timeout == TimeoutPolicy::Continue {
+                            StepResult::Continue(reason)
+                        } else {
+                            StepResult::Failed(reason)
+                        }
+                    }
                 },
                 None if waiting.await => StepResult::Done,
                 None => StepResult::Stopped,
@@ -270,10 +338,19 @@ async fn send(
 /// masked down to the fields that were named: everything else is free to be
 /// anything. Anchored at the start, a received frame beginning where the
 /// definition says it does.
-fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor), String> {
+fn resolve(
+    expect: &Expect,
+    frames: &[FrameDef],
+    variables: &BTreeMap<String, Value>,
+) -> Result<(HexPattern, Anchor), String> {
     match expect {
         Expect::Pattern { pattern, anchor } => Ok((pattern.clone(), *anchor)),
-        Expect::Frame { frame, values, .. } => {
+        Expect::Frame {
+            frame,
+            values,
+            match_from_capture,
+            ..
+        } => {
             let definition = frames
                 .iter()
                 .find(|known| &known.name == frame)
@@ -283,7 +360,14 @@ fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor),
             // masked down to the fields that were asked about. Everything else
             // is free, so a reply matches on what was specified and nothing
             // more.
-            let wanted = overlaid(definition, values)?;
+            let mut given = values.clone();
+            for (field, variable) in match_from_capture {
+                let held = variables.get(variable).ok_or_else(|| {
+                    format!("{frame}.{field} is matched from {variable}, which is not set")
+                })?;
+                given.insert(field.clone(), held.clone());
+            }
+            let wanted = overlaid(definition, &given)?;
             let bytes = codec::encode(definition, &wanted)
                 .map_err(|error| format!("{frame} cannot be encoded: {error}"))?;
 
@@ -291,7 +375,7 @@ fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor),
             let mut offset = 0;
             for declared in &definition.fields {
                 let width = declared.kind.size();
-                if values.contains_key(&declared.name) {
+                if given.contains_key(&declared.name) {
                     for slot in keep.iter_mut().skip(offset).take(width) {
                         *slot = true;
                     }
@@ -302,6 +386,25 @@ fn resolve(expect: &Expect, frames: &[FrameDef]) -> Result<(HexPattern, Anchor),
             Ok((HexPattern::masked(&bytes, &keep), Anchor::At(0)))
         }
     }
+}
+
+/// The step's own `with`, replaced field by field with whatever a live
+/// override currently holds for this step's number. Every field declared by
+/// the frame may be overridden, including one that uses its frame default.
+fn merged(
+    with: &BTreeMap<String, Value>,
+    frame: &FrameDef,
+    number: usize,
+    overrides: &Overrides,
+) -> BTreeMap<String, Value> {
+    let mut merged = with.clone();
+    let held = overrides.lock().expect("overrides mutex poisoned");
+    for field in &frame.fields {
+        if let Some(value) = held.get(&(number, field.name.clone())) {
+            merged.insert(field.name.clone(), value.clone());
+        }
+    }
+    merged
 }
 
 /// The frame's own defaults, overlaid with what the step overrides, what an
@@ -316,7 +419,7 @@ fn encode(
     variables: &BTreeMap<String, Value>,
     pass: u32,
     frames: &[FrameDef],
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, crate::frame::value::FieldValues), String> {
     let frame = frames
         .iter()
         .find(|frame| frame.name == name)
@@ -342,7 +445,8 @@ fn encode(
         values.insert(field.clone(), value);
     }
 
-    codec::encode(frame, &values).map_err(|error| error.to_string())
+    let bytes = codec::encode(frame, &values).map_err(|error| error.to_string())?;
+    Ok((bytes, values))
 }
 
 /// Remembers the fields a matched frame asked to keep, decoded against the
@@ -406,6 +510,51 @@ mod tests {
     use super::*;
     use crate::scenario::Repeat;
 
+    #[test]
+    fn a_saved_counter_value_matches_the_reply_that_echoes_it() {
+        let frame = crate::frame::schema::from_toml(
+            r#"
+name = "Packet"
+[[field]]
+name = "id"
+type = "u8"
+default = 0
+"#,
+        )
+        .expect("a frame");
+        let counters = BTreeMap::from([(
+            "id".to_owned(),
+            Counter {
+                from: 10,
+                step: 1,
+                wrap: Some(255),
+            },
+        )]);
+        let (bytes, sent) = encode(
+            "Packet",
+            &BTreeMap::new(),
+            &counters,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            3,
+            std::slice::from_ref(&frame),
+        )
+        .expect("the counter encodes");
+        assert_eq!(bytes, [13]);
+
+        let mut variables = BTreeMap::new();
+        variables.insert("request_id".to_owned(), sent["id"].clone());
+        let expect = Expect::Frame {
+            frame: "Packet".to_owned(),
+            values: BTreeMap::new(),
+            match_from_capture: BTreeMap::from([("id".to_owned(), "request_id".to_owned())]),
+            capture: BTreeMap::new(),
+        };
+        let (pattern, anchor) = resolve(&expect, &[frame], &variables).expect("a matcher");
+        assert!(pattern.found_in(&[13], anchor));
+        assert!(!pattern.found_in(&[12], anchor));
+    }
+
     /// A device fast enough to answer before the scenario task gets back
     /// around to listening for it: echoes the instant it sees the send,
     /// racing whatever the scenario does next on its own thread.
@@ -438,6 +587,7 @@ mod tests {
                             anchor: Anchor::At(0),
                         },
                         timeout: Some(Duration::from_millis(20)),
+                        on_timeout: TimeoutPolicy::Fail,
                     },
                 },
             ],
@@ -461,6 +611,7 @@ mod tests {
             commands: command_tx.downgrade(),
             events: events_tx,
             received: heard_rx,
+            overrides: Arc::new(Mutex::new(BTreeMap::new())),
         };
 
         let outcome = run(context).await;

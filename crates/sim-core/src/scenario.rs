@@ -103,6 +103,12 @@ pub enum StepError {
 
     #[error("{field} is filled from {variable}, which no earlier step captures")]
     UnknownVariable { field: String, variable: String },
+
+    #[error("matches {field} from {variable}, which no earlier step captures")]
+    UnknownMatchVariable { field: String, variable: String },
+
+    #[error("matches {field} both at a fixed value and from a variable")]
+    ConflictingMatch { field: String },
 }
 
 /// A scenario as the engine runs it.
@@ -175,6 +181,9 @@ pub enum Action {
         counters: BTreeMap<String, Counter>,
         /// Fields filled from a variable an earlier step captured, by name.
         from_capture: BTreeMap<String, String>,
+        /// Fields from the fully resolved outgoing frame remembered for a
+        /// later step to compare against a reply.
+        capture: BTreeMap<String, String>,
     },
     /// Send bytes as they are, for the malformed frame a definition cannot
     /// express.
@@ -193,7 +202,17 @@ pub enum Action {
         expect: Expect,
         /// Giving up is a scenario failure, not a silent pass.
         timeout: Option<Duration>,
+        on_timeout: TimeoutPolicy,
     },
+}
+
+/// What a timed-out frame wait does to a repeating scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutPolicy {
+    #[default]
+    Fail,
+    Continue,
 }
 
 /// What a wait is watching for.
@@ -219,6 +238,8 @@ pub enum Expect {
     Frame {
         frame: String,
         values: BTreeMap<String, Value>,
+        /// Fields that must equal a variable saved by an earlier step.
+        match_from_capture: BTreeMap<String, String>,
         /// Fields to remember once this matches, as a variable name a later
         /// step's `from_capture` can read back.
         ///
@@ -335,6 +356,8 @@ struct RawStep {
     counters: BTreeMap<String, RawCounter>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     from_capture: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    capture: BTreeMap<String, String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     raw: Option<String>,
@@ -365,10 +388,22 @@ struct RawWaitFor {
     #[serde(default, rename = "match", skip_serializing_if = "BTreeMap::is_empty")]
     match_values: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    match_from_capture: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     capture: BTreeMap<String, String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_fail_timeout")]
+    on_timeout: TimeoutPolicy,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if predicate receives a reference"
+)]
+fn is_fail_timeout(policy: &TimeoutPolicy) -> bool {
+    *policy == TimeoutPolicy::Fail
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -672,6 +707,7 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
             with,
             counters,
             from_capture,
+            capture,
         } => {
             raw.send = Some(frame.clone());
             raw.with = with.clone();
@@ -689,6 +725,7 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
                 })
                 .collect();
             raw.from_capture.clone_from(from_capture);
+            raw.capture.clone_from(capture);
         }
         Action::Raw { bytes } => {
             raw.raw = Some(
@@ -700,9 +737,14 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
             );
         }
         Action::Wait { delay } => raw.wait_ms = Some(as_millis(*delay)),
-        Action::WaitFor { expect, timeout } => {
+        Action::WaitFor {
+            expect,
+            timeout,
+            on_timeout,
+        } => {
             let mut wait = RawWaitFor {
                 timeout_ms: timeout.map(as_millis),
+                on_timeout: *on_timeout,
                 ..RawWaitFor::default()
             };
             match expect {
@@ -713,10 +755,12 @@ fn lower_step(step: &Step, default: Option<&[ConnectionId]>) -> RawStep {
                 Expect::Frame {
                     frame,
                     values,
+                    match_from_capture,
                     capture,
                 } => {
                     wait.frame = Some(frame.clone());
                     wait.match_values.clone_from(values);
+                    wait.match_from_capture.clone_from(match_from_capture);
                     wait.capture.clone_from(capture);
                 }
             }
@@ -771,6 +815,25 @@ fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
             }
         }
         if let Action::WaitFor {
+            expect: Expect::Frame {
+                match_from_capture, ..
+            },
+            ..
+        } = &step.action
+        {
+            for (field, variable) in match_from_capture {
+                if !known.contains(variable) {
+                    return Err(wrap(StepError::UnknownMatchVariable {
+                        field: field.clone(),
+                        variable: variable.clone(),
+                    }));
+                }
+            }
+        }
+        if let Action::Send { capture, .. } = &step.action {
+            known.extend(capture.values().cloned());
+        }
+        if let Action::WaitFor {
             expect: Expect::Frame { capture, .. },
             ..
         } = &step.action
@@ -805,7 +868,7 @@ fn build_wait_for(wait: RawWaitFor) -> Result<Action, StepError> {
         (Some(_), Some(_)) => return Err(StepError::AmbiguousWait),
         (None, None) => return Err(StepError::EmptyWait),
         (Some(hex), None) => {
-            if !wait.match_values.is_empty() {
+            if !wait.match_values.is_empty() || !wait.match_from_capture.is_empty() {
                 return Err(StepError::AmbiguousWait);
             }
             if !wait.capture.is_empty() {
@@ -821,12 +884,25 @@ fn build_wait_for(wait: RawWaitFor) -> Result<Action, StepError> {
             if wait.at.is_some() {
                 return Err(StepError::PointlessOffset);
             }
-            if wait.match_values.is_empty() && wait.capture.is_empty() {
+            if wait.match_values.is_empty()
+                && wait.match_from_capture.is_empty()
+                && wait.capture.is_empty()
+            {
                 return Err(StepError::NoFieldsToMatch);
+            }
+            if let Some(field) = wait
+                .match_values
+                .keys()
+                .find(|field| wait.match_from_capture.contains_key(*field))
+            {
+                return Err(StepError::ConflictingMatch {
+                    field: field.clone(),
+                });
             }
             Expect::Frame {
                 frame,
                 values: wait.match_values,
+                match_from_capture: wait.match_from_capture,
                 capture: wait.capture,
             }
         }
@@ -834,6 +910,7 @@ fn build_wait_for(wait: RawWaitFor) -> Result<Action, StepError> {
     Ok(Action::WaitFor {
         expect,
         timeout: wait.timeout_ms.map(Duration::from_millis),
+        on_timeout: wait.on_timeout,
     })
 }
 
@@ -867,6 +944,7 @@ fn build_step(raw: RawStep, default: &[&str]) -> Result<Step, StepError> {
                 })
                 .collect(),
             from_capture: raw.from_capture,
+            capture: raw.capture,
         }
     } else if let Some(hex) = raw.raw {
         Action::Raw {
@@ -1011,7 +1089,7 @@ counters = { seq = { wrap = 255 } }
         ));
         // A delay is the one step the default does not reach, having no link
         // to act on in the first place.
-        assert!(scenario.steps[3].targets.is_empty());
+        assert_eq!(scenario.steps[3].targets, Vec::new());
     }
 
     #[test]
@@ -1412,7 +1490,7 @@ raw = "00"
 "#);
         // The scenario default reaches the send and stops at the delay, so
         // writing it back cannot invent a link the delay never had.
-        assert!(scenario.steps[0].targets.is_empty());
+        assert_eq!(scenario.steps[0].targets, Vec::new());
         assert_eq!(scenario.steps[1].targets, [ConnectionId::from("bus")]);
 
         // And saying it outright is refused rather than quietly ignored.
@@ -1552,6 +1630,7 @@ wait_for = { frame = "Telemetry", match = { sync = 43605, mode = 3 }, timeout_ms
         let Action::WaitFor {
             expect: Expect::Frame { frame, values, .. },
             timeout: Some(_),
+            ..
         } = &scenario.steps[0].action
         else {
             panic!("expected a frame wait");
@@ -1628,6 +1707,53 @@ on = "server2"
 from_capture = { payload = "server1_code" }
 "#,
         );
+    }
+
+    #[test]
+    fn a_sent_field_can_be_saved_and_matched_in_a_later_reply() {
+        let text = r#"
+[[scenario]]
+name = "Correlated"
+on = "bus"
+[[scenario.step]]
+send = "Request"
+counters = { id = { wrap = 255 } }
+capture = { id = "request_id" }
+[[scenario.step]]
+wait_for = { frame = "Response", match_from_capture = { id = "request_id" }, timeout_ms = 500 }
+"#;
+        let scenario = one(text);
+        let Action::Send { capture, .. } = &scenario.steps[0].action else {
+            panic!("expected a send");
+        };
+        assert_eq!(capture["id"], "request_id");
+        let Action::WaitFor {
+            expect: Expect::Frame {
+                match_from_capture, ..
+            },
+            ..
+        } = &scenario.steps[1].action
+        else {
+            panic!("expected a frame wait");
+        };
+        assert_eq!(match_from_capture["id"], "request_id");
+        round_trips(text);
+    }
+
+    #[test]
+    fn a_timeout_can_continue_a_repeating_scenario() {
+        let scenario = one(r#"
+[[scenario]]
+name = "Retry"
+on = "bus"
+repeat = { every_ms = 100 }
+[[scenario.step]]
+wait_for = { frame = "Status", match = { state = 1 }, timeout_ms = 10, on_timeout = "continue" }
+"#);
+        let Action::WaitFor { on_timeout, .. } = &scenario.steps[0].action else {
+            panic!("expected a wait");
+        };
+        assert_eq!(*on_timeout, TimeoutPolicy::Continue);
     }
 
     /// A capture needs a frame to decode by, needs one target to have a single

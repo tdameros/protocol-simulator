@@ -1,0 +1,13 @@
+version = 1
+frames_dir = "frames"
+scenarios_dir = "scenarios"
+
+# Bound to itself: this demo has no real motor controller to talk to, so the
+# connection answers its own sends, which is enough for "last_received" to
+# show what actually went out.
+[[connection]]
+name = "motor"
+transport = "udp"
+bind = "127.0.0.1:20000"
+remote = "127.0.0.1:20000"
+autoconnect = true

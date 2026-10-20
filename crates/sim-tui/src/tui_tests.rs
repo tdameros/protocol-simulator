@@ -1061,7 +1061,7 @@ fn cancelling_the_form_creates_nothing() {
     press(&mut app, KeyCode::Esc);
 
     assert!(app.overlay().is_none());
-    assert!(app.session().connections.is_empty());
+    assert_eq!(app.session().connections.len(), 0);
 }
 
 #[test]
@@ -1070,7 +1070,7 @@ fn a_link_can_be_removed_once_it_is_down() {
     linked(&mut app, "bus", ConnectionStatus::Disconnected);
     press(&mut app, KeyCode::Char('x'));
 
-    assert!(app.session().connections.is_empty());
+    assert_eq!(app.session().connections.len(), 0);
 }
 
 /// The window refuses this too: a link has to be told to stop before it can
@@ -1978,7 +1978,7 @@ fn delete_removes_a_scenario_from_disk() {
     press(&mut app, KeyCode::Char('5'));
     press(&mut app, KeyCode::Char('d'));
 
-    assert!(app.session().scenarios.entries.is_empty());
+    assert_eq!(app.session().scenarios.entries, Vec::new());
 }
 
 fn scratch_project_dir(name: &str) -> std::path::PathBuf {
@@ -2808,12 +2808,14 @@ fn cycling_a_captured_field_picks_a_different_variable() {
                     expect: sim_core::scenario::Expect::Frame {
                         frame: "Response".to_owned(),
                         values: std::collections::BTreeMap::default(),
+                        match_from_capture: std::collections::BTreeMap::default(),
                         capture: std::collections::BTreeMap::from([(
                             "code".to_owned(),
                             "first".to_owned(),
                         )]),
                     },
                     timeout: None,
+                    on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
                 },
             },
             sim_core::scenario::Step {
@@ -2822,12 +2824,14 @@ fn cycling_a_captured_field_picks_a_different_variable() {
                     expect: sim_core::scenario::Expect::Frame {
                         frame: "Response".to_owned(),
                         values: std::collections::BTreeMap::default(),
+                        match_from_capture: std::collections::BTreeMap::default(),
                         capture: std::collections::BTreeMap::from([(
                             "code".to_owned(),
                             "second".to_owned(),
                         )]),
                     },
                     timeout: None,
+                    on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
                 },
             },
             sim_core::scenario::Step {
@@ -2837,6 +2841,7 @@ fn cycling_a_captured_field_picks_a_different_variable() {
                     with: std::collections::BTreeMap::default(),
                     counters: std::collections::BTreeMap::default(),
                     from_capture: std::collections::BTreeMap::default(),
+                    capture: std::collections::BTreeMap::default(),
                 },
             },
         ];
@@ -2887,6 +2892,7 @@ fn a_dangling_capture_can_still_be_turned_off() {
                     "payload".to_owned(),
                     "gone".to_owned(),
                 )]),
+                capture: std::collections::BTreeMap::new(),
             },
         }];
     }

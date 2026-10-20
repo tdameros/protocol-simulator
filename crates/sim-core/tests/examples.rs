@@ -313,7 +313,7 @@ fn a_shared_type_is_read_as_the_two_things_a_type_can_be() {
         celsius.narrows.and_then(|narrows| narrows.range),
         Some(ValueRange::Int { min: -40, max: 125 })
     );
-    assert!(celsius.layout.fields.is_empty());
+    assert_eq!(celsius.layout.fields, Vec::new());
 
     let header = types.definition("Header").expect("valid").expect("there");
     assert!(header.narrows.is_none());

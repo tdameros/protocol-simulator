@@ -12,6 +12,9 @@ path = "src/main.rs"
 # Default pulls every widget, calendar included, which drags in `time` for a
 # board that will never show one.
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sim-core = { path = "../sim-core" }
 sim-session = { path = "../sim-session" }
+tokio = { version = "1.53.1", features = ["sync"] }
 tokio-serial = "5.5.0"

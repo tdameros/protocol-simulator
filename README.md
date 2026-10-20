@@ -45,6 +45,14 @@ completes, for a service started at boot rather than a person at a keyboard:
 protocol-simulator-tui project.toml --run "Heartbeat 10 Hz"
 ```
 
+`--control-port PORT`, alongside `--run`, opens a local TCP socket an external
+script can use to push a new field value into the running scenario and read
+back the last frame received on a connection, without restarting it:
+
+```sh
+protocol-simulator-tui project.toml --run "Heartbeat 10 Hz" --control-port 7878
+```
+
 ## Concepts
 
 | Term | Is |

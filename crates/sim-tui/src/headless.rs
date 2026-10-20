@@ -10,7 +10,9 @@
 //! enough. A scenario meant to run until stopped (no `times`) is stopped that
 //! way, by whatever manages the service.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sim_core::{Event, Outcome};
@@ -20,12 +22,18 @@ use sim_session::scenarios;
 use sim_session::state::Session;
 use sim_session::{hex, links};
 
+use crate::control::{self, LastReceived, LastSent, RunStatus};
+
 const POLL: Duration = Duration::from_millis(20);
 
 /// Loads `opened_with`, starts the scenario named `scenario_name`, and prints
 /// what happens until it ends. The exit code a shell or a service manager
 /// reads: 0 once the scenario completed, 1 for anything else.
-pub fn run(opened_with: Option<PathBuf>, scenario_name: &str) -> i32 {
+///
+/// `control_port`, when given, opens a local TCP socket an external script
+/// can use to override a `send` step's field live and read back the last
+/// frame received on a connection, without restarting the scenario.
+pub fn run(opened_with: Option<PathBuf>, scenario_name: &str, control_port: Option<u16>) -> i32 {
     let Some(path) = opened_with else {
         eprintln!("--run needs a project file: protocol-simulator-tui project.toml --run \"Name\"");
         return 1;
@@ -61,16 +69,49 @@ pub fn run(opened_with: Option<PathBuf>, scenario_name: &str) -> i32 {
         engine.connect(id, config, retry);
     }
 
+    let last_received: LastReceived = Arc::new(Mutex::new(HashMap::new()));
+    let last_sent: LastSent = Arc::new(Mutex::new(HashMap::new()));
+    let status: RunStatus = Arc::new(Mutex::new(
+        serde_json::json!({"ok": true, "state": "running"}),
+    ));
+
+    // Queue the start before accepting control requests. The engine's command
+    // channel preserves that order, so a client that connects as soon as the
+    // listener is available can never have its first override discarded for
+    // referring to a scenario that has not been registered yet.
     scenarios::start(&mut session, &engine, &scenario);
     if let Some(error) = session.last_error.take() {
         eprintln!("{error}");
         return 1;
     }
 
-    watch(engine, scenario_name)
+    if let Some(port) = control_port {
+        let frames: Vec<_> = session.frames.frames().cloned().collect();
+        if let Err(error) = control::spawn(
+            port,
+            engine.command_sender(),
+            scenario_name.to_owned(),
+            control::editable_fields(&scenario, &frames),
+            Arc::clone(&last_received),
+            Arc::clone(&last_sent),
+            Arc::clone(&status),
+            frames,
+        ) {
+            eprintln!("cannot open the control socket on port {port}: {error}");
+            return 1;
+        }
+    }
+
+    watch(engine, scenario_name, &last_received, &last_sent, &status)
 }
 
-fn watch(mut engine: EngineHandle, scenario_name: &str) -> i32 {
+fn watch(
+    mut engine: EngineHandle,
+    scenario_name: &str,
+    last_received: &LastReceived,
+    last_sent: &LastSent,
+    status: &RunStatus,
+) -> i32 {
     loop {
         for event in engine.drain_events() {
             match event {
@@ -79,19 +120,25 @@ fn watch(mut engine: EngineHandle, scenario_name: &str) -> i32 {
                 }
                 Event::FrameSent { id, bytes, .. } => {
                     println!("TX {} {}", id.0, hex::spaced(&bytes));
+                    last_sent.lock().unwrap().insert(id, bytes);
                 }
                 Event::FrameReceived { id, bytes, .. } => {
                     println!("RX {} {}", id.0, hex::spaced(&bytes));
+                    last_received.lock().unwrap().insert(id, bytes);
                 }
                 Event::Error { id, error } => {
                     let who = id.map(|id| id.0).unwrap_or_default();
                     eprintln!("{who}: {error}");
+                    *status.lock().unwrap() = serde_json::json!({"ok": true, "state": "error", "reason": error.to_string(), "connection": who});
                 }
                 Event::ScenarioStep { name, step, pass } if name == scenario_name => {
                     println!("[{name}] pass {pass}, step {step}");
+                    *status.lock().unwrap() = serde_json::json!({"ok": true, "state": "running", "step": step, "pass": pass});
                 }
                 Event::ScenarioFinished { name, outcome } if name == scenario_name => {
                     println!("[{name}] {outcome:?}");
+                    *status.lock().unwrap() =
+                        serde_json::json!({"ok": true, "state": format!("{outcome:?}")});
                     return i32::from(outcome != Outcome::Completed);
                 }
                 Event::ScenarioStep { .. } | Event::ScenarioFinished { .. } => {}
@@ -104,6 +151,7 @@ fn watch(mut engine: EngineHandle, scenario_name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::run;
+    use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
 
     /// A project with one loopback connection and a scenario that sends once,
@@ -116,7 +164,8 @@ mod tests {
         std::fs::create_dir_all(root.join("scenarios")).expect("a scratch folder");
         std::fs::write(
             root.join("frames").join("ping.toml"),
-            "name = \"Ping\"\n[[field]]\nname = \"seq\"\ntype = \"u8\"\n",
+            "name = \"Ping\"\n[[field]]\nname = \"seq\"\ntype = \"u8\"\n\
+             [[field]]\nname = \"mode\"\ntype = \"u8\"\ndefault = 1\n",
         )
         .expect("a frame file");
         std::fs::write(root.join("scenarios").join("once.toml"), scenario_toml)
@@ -152,7 +201,7 @@ mod tests {
             "completes",
             "[[scenario]]\nname = \"Once\"\non = \"loop\"\n\n[[scenario.step]]\nsend = \"Ping\"\n",
         );
-        assert_eq!(run(Some(path), "Once"), 0);
+        assert_eq!(run(Some(path), "Once", None), 0);
     }
 
     #[test]
@@ -161,16 +210,83 @@ mod tests {
             "unknown",
             "[[scenario]]\nname = \"Once\"\non = \"loop\"\n\n[[scenario.step]]\nsend = \"Ping\"\n",
         );
-        assert_eq!(run(Some(path), "Never heard of it"), 1);
+        assert_eq!(run(Some(path), "Never heard of it", None), 1);
     }
 
     #[test]
     fn a_missing_project_path_exits_nonzero() {
-        assert_eq!(run(None, "Once"), 1);
+        assert_eq!(run(None, "Once", None), 1);
     }
 
     #[test]
     fn a_project_file_that_does_not_exist_exits_nonzero() {
-        assert_eq!(run(Some(PathBuf::from("/does/not/exist.toml")), "Once"), 1);
+        assert_eq!(
+            run(Some(PathBuf::from("/does/not/exist.toml")), "Once", None),
+            1
+        );
+    }
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a free port")
+            .local_addr()
+            .expect("a bound address")
+            .port()
+    }
+
+    #[test]
+    fn a_control_port_lets_an_external_client_steer_the_run() {
+        let path = a_project_on_disk(
+            "control",
+            "[[scenario]]\nname = \"Steerable\"\non = \"loop\"\n\n\
+             [[scenario.step]]\nwait_ms = 500\n\n\
+             [[scenario.step]]\nsend = \"Ping\"\nwith = { mode = 1 }\n\n\
+             [[scenario.step]]\nwait_ms = 50\n",
+        );
+        let control_port = free_tcp_port();
+
+        let path_for_thread = path.clone();
+        let runner =
+            std::thread::spawn(move || run(Some(path_for_thread), "Steerable", Some(control_port)));
+
+        // The listener opens after the scenario start was queued, so retrying
+        // the connection also ensures a subsequent control request follows it.
+        let mut client = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", control_port)) {
+                Ok(stream) => break stream,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        let mut reader = BufReader::new(client.try_clone().expect("clone should succeed"));
+
+        writeln!(
+            client,
+            r#"{{"cmd":"set","step":2,"field":"mode","value":9}}"#
+        )
+        .expect("write should succeed");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read should succeed");
+        assert!(line.contains("\"ok\":true"), "{line}");
+
+        assert_eq!(runner.join().expect("the run thread should not panic"), 0);
+
+        writeln!(
+            client,
+            r#"{{"cmd":"last_received","on":"loop","as":"Ping"}}"#
+        )
+        .expect("write should succeed");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read should succeed");
+        let response: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(response["ok"], true, "{line}");
+        assert_eq!(response["fields"]["mode"], 9, "{line}");
+
+        writeln!(client, r#"{{"cmd":"last_sent","on":"loop","as":"Ping"}}"#)
+            .expect("write should succeed");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read should succeed");
+        let response: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(response["ok"], true, "{line}");
+        assert_eq!(response["fields"]["mode"], 9, "{line}");
     }
 }
