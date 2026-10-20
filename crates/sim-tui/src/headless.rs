@@ -233,8 +233,10 @@ mod tests {
     fn a_control_port_lets_an_external_client_steer_the_run() {
         let path = a_project_on_disk(
             "control",
-            "[[scenario]]\nname = \"Steerable\"\non = \"loop\"\nrepeat = { every_ms = 30, times = 3 }\n\n\
-             [[scenario.step]]\nsend = \"Ping\"\nwith = { mode = 1 }\n",
+            "[[scenario]]\nname = \"Steerable\"\non = \"loop\"\n\n\
+             [[scenario.step]]\nwait_ms = 500\n\n\
+             [[scenario.step]]\nsend = \"Ping\"\nwith = { mode = 1 }\n\n\
+             [[scenario.step]]\nwait_ms = 50\n",
         );
         let control_port = free_tcp_port();
 
@@ -242,21 +244,41 @@ mod tests {
         let runner =
             std::thread::spawn(move || run(Some(path_for_thread), "Steerable", Some(control_port)));
 
-        // Give the run a moment to open its connection and the control
-        // socket before dialling in.
+        // The listener is opened before the scenario starts, so retrying the
+        // connection also serves as its readiness signal.
         let mut client = loop {
             match std::net::TcpStream::connect(("127.0.0.1", control_port)) {
                 Ok(stream) => break stream,
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         };
+        let mut reader = BufReader::new(client.try_clone().expect("clone should succeed"));
+
+        // Wait until the scenario is paused in its first step. A control
+        // request enqueued before the scenario exists is deliberately ignored
+        // by the engine, and a fast Windows worker could otherwise reach the
+        // first send before the socket thread gets a turn.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            writeln!(client, r#"{{"cmd":"status"}}"#).expect("write should succeed");
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read should succeed");
+            let status: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+            if status["step"] == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scenario never reached its initial wait: {status}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         writeln!(
             client,
-            r#"{{"cmd":"set","step":1,"field":"mode","value":9}}"#
+            r#"{{"cmd":"set","step":2,"field":"mode","value":9}}"#
         )
         .expect("write should succeed");
-        let mut reader = BufReader::new(client.try_clone().expect("clone should succeed"));
         let mut line = String::new();
         reader.read_line(&mut line).expect("read should succeed");
         assert!(line.contains("\"ok\":true"), "{line}");
