@@ -74,6 +74,17 @@ pub fn run(opened_with: Option<PathBuf>, scenario_name: &str, control_port: Opti
     let status: RunStatus = Arc::new(Mutex::new(
         serde_json::json!({"ok": true, "state": "running"}),
     ));
+
+    // Queue the start before accepting control requests. The engine's command
+    // channel preserves that order, so a client that connects as soon as the
+    // listener is available can never have its first override discarded for
+    // referring to a scenario that has not been registered yet.
+    scenarios::start(&mut session, &engine, &scenario);
+    if let Some(error) = session.last_error.take() {
+        eprintln!("{error}");
+        return 1;
+    }
+
     if let Some(port) = control_port {
         let frames: Vec<_> = session.frames.frames().cloned().collect();
         if let Err(error) = control::spawn(
@@ -89,12 +100,6 @@ pub fn run(opened_with: Option<PathBuf>, scenario_name: &str, control_port: Opti
             eprintln!("cannot open the control socket on port {port}: {error}");
             return 1;
         }
-    }
-
-    scenarios::start(&mut session, &engine, &scenario);
-    if let Some(error) = session.last_error.take() {
-        eprintln!("{error}");
-        return 1;
     }
 
     watch(engine, scenario_name, &last_received, &last_sent, &status)
@@ -244,8 +249,8 @@ mod tests {
         let runner =
             std::thread::spawn(move || run(Some(path_for_thread), "Steerable", Some(control_port)));
 
-        // The listener is opened before the scenario starts, so retrying the
-        // connection also serves as its readiness signal.
+        // The listener opens after the scenario start was queued, so retrying
+        // the connection also ensures a subsequent control request follows it.
         let mut client = loop {
             match std::net::TcpStream::connect(("127.0.0.1", control_port)) {
                 Ok(stream) => break stream,
@@ -253,26 +258,6 @@ mod tests {
             }
         };
         let mut reader = BufReader::new(client.try_clone().expect("clone should succeed"));
-
-        // Wait until the scenario is paused in its first step. A control
-        // request enqueued before the scenario exists is deliberately ignored
-        // by the engine, and a fast Windows worker could otherwise reach the
-        // first send before the socket thread gets a turn.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            writeln!(client, r#"{{"cmd":"status"}}"#).expect("write should succeed");
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read should succeed");
-            let status: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
-            if status["step"] == 1 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "scenario never reached its initial wait: {status}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
 
         writeln!(
             client,
