@@ -13,14 +13,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use sim_core::{Event, Outcome};
 use sim_session::engine_handle::EngineHandle;
 use sim_session::project::Project;
 use sim_session::scenarios;
 use sim_session::state::Session;
-use sim_session::{hex, links};
+use sim_session::{hex, links, traffic};
 
 use crate::control::{self, LastReceived, LastSent, RunStatus};
 
@@ -65,7 +65,7 @@ pub fn run(opened_with: Option<PathBuf>, scenario_name: &str, control_port: Opti
 
     let engine = EngineHandle::new();
     for (id, config, retry) in restored.connect {
-        println!("connecting {}...", id.0);
+        println!("{} connecting {}...", stamp(SystemTime::now(), None), id.0);
         engine.connect(id, config, retry);
     }
 
@@ -112,31 +112,61 @@ fn watch(
     last_sent: &LastSent,
     status: &RunStatus,
 ) -> i32 {
+    let mut previous_frame: Option<SystemTime> = None;
     loop {
         for event in engine.drain_events() {
             match event {
                 Event::ConnectionStatus { id, status } => {
-                    println!("{}: {}", id.0, links::status(status));
+                    println!(
+                        "{} {}: {}",
+                        stamp(SystemTime::now(), None),
+                        id.0,
+                        links::status(status)
+                    );
                 }
-                Event::FrameSent { id, bytes, .. } => {
-                    println!("TX {} {}", id.0, hex::spaced(&bytes));
+                Event::FrameSent {
+                    id,
+                    bytes,
+                    timestamp,
+                } => {
+                    let gap = frame_gap(&mut previous_frame, timestamp);
+                    println!(
+                        "{} TX {} {}",
+                        stamp(timestamp, gap),
+                        id.0,
+                        hex::spaced(&bytes)
+                    );
                     last_sent.lock().unwrap().insert(id, bytes);
                 }
-                Event::FrameReceived { id, bytes, .. } => {
-                    println!("RX {} {}", id.0, hex::spaced(&bytes));
+                Event::FrameReceived {
+                    id,
+                    bytes,
+                    timestamp,
+                    ..
+                } => {
+                    let gap = frame_gap(&mut previous_frame, timestamp);
+                    println!(
+                        "{} RX {} {}",
+                        stamp(timestamp, gap),
+                        id.0,
+                        hex::spaced(&bytes)
+                    );
                     last_received.lock().unwrap().insert(id, bytes);
                 }
                 Event::Error { id, error } => {
                     let who = id.map(|id| id.0).unwrap_or_default();
-                    eprintln!("{who}: {error}");
+                    eprintln!("{} {who}: {error}", stamp(SystemTime::now(), None));
                     *status.lock().unwrap() = serde_json::json!({"ok": true, "state": "error", "reason": error.to_string(), "connection": who});
                 }
                 Event::ScenarioStep { name, step, pass } if name == scenario_name => {
-                    println!("[{name}] pass {pass}, step {step}");
+                    println!(
+                        "{} [{name}] pass {pass}, step {step}",
+                        stamp(SystemTime::now(), None)
+                    );
                     *status.lock().unwrap() = serde_json::json!({"ok": true, "state": "running", "step": step, "pass": pass});
                 }
                 Event::ScenarioFinished { name, outcome } if name == scenario_name => {
-                    println!("[{name}] {outcome:?}");
+                    println!("{} [{name}] {outcome:?}", stamp(SystemTime::now(), None));
                     *status.lock().unwrap() =
                         serde_json::json!({"ok": true, "state": format!("{outcome:?}")});
                     return i32::from(outcome != Outcome::Completed);
@@ -146,6 +176,20 @@ fn watch(
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// Time since the previous frame in either direction, the same gap the
+/// monitor shows. Remembers `timestamp` for the next call.
+fn frame_gap(previous: &mut Option<SystemTime>, timestamp: SystemTime) -> Option<Duration> {
+    let gap = previous.and_then(|before| timestamp.duration_since(before).ok());
+    *previous = Some(timestamp);
+    gap
+}
+
+/// The clock and gap columns every log line starts with, so lines of every
+/// kind stay aligned with the frame rows.
+fn stamp(at: SystemTime, gap: Option<Duration>) -> String {
+    format!("{} {}", traffic::timestamp(at), traffic::delta(gap))
 }
 
 #[cfg(test)]
