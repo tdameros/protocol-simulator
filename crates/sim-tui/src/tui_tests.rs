@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use sim_core::{ConnectionId, ConnectionStatus, TransportConfig};
 use sim_session::state::{ConnectionEntry, Direction, LogEntry};
 
-use crate::app::App;
+use crate::app::{App, Overlay};
 use crate::ui;
 
 /// The screen as one string, one line per row.
@@ -1811,6 +1811,44 @@ fn an_overridden_field_can_be_given_a_value() {
         screen(&mut app).contains("send Status with sync"),
         "{}",
         screen(&mut app)
+    );
+}
+
+#[test]
+fn an_overridden_enum_field_is_chosen_from_its_variants() {
+    let mut app = App::default();
+    linked(&mut app, "bus", ConnectionStatus::Connected);
+    with_scenario_frames(
+        &mut app,
+        "an_overridden_enum_field_is_chosen_from_its_variants",
+    );
+    press(&mut app, KeyCode::Char('5'));
+    press(&mut app, KeyCode::Char('n'));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Left); // Wait -> Raw -> Send
+    press(&mut app, KeyCode::Down); // bus
+    press(&mut app, KeyCode::Down); // Frame
+    press(&mut app, KeyCode::Right); // Status
+    press(&mut app, KeyCode::Down); // sync
+    press(&mut app, KeyCode::Down); // state, an enum
+    press(&mut app, KeyCode::Char(' ')); // override it, which lists the variants
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("IDLE = 0"), "{shown}");
+    assert!(shown.contains("RUNNING = 2"), "{shown}");
+
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    let shown = screen(&mut app);
+    assert!(shown.contains("RUNNING (2)"), "{shown}");
+    assert!(
+        matches!(app.overlay(), Some(Overlay::Step(_))),
+        "back in the step editor"
     );
 }
 
