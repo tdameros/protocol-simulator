@@ -123,6 +123,13 @@ pub enum PickPurpose {
     FrameTarget,
     /// Settles which connection hand-typed hex bytes are sent on.
     HexTarget,
+    /// Settles the value an enum field is held at in a scenario step, and
+    /// returns to that step's editor either way.
+    StepEnum {
+        step: usize,
+        focus: usize,
+        field: String,
+    },
 }
 
 /// One value typed as text, and what it belongs to.
@@ -1797,7 +1804,7 @@ impl App {
             return Some(&[
                 ("Tab", "next field"),
                 ("left/right", "change, capture"),
-                ("space", "toggle"),
+                ("space", "toggle, pick enum"),
                 ("F2", "save sent field"),
                 ("F3", "match from capture"),
                 ("type", "edit"),
@@ -2060,19 +2067,12 @@ impl App {
                 KeyCode::Char(letter) => browser.picker.typing(letter),
                 _ => {}
             },
-            Overlay::Pick(picker, purpose) => match code {
+            Overlay::Pick(picker, _) => match code {
                 KeyCode::Down => picker.step(1),
                 KeyCode::Up => picker.step(-1),
                 KeyCode::Backspace => picker.rubbed_out(),
-                KeyCode::Esc => self.overlay = None,
-                KeyCode::Enter => {
-                    let taken = picker.taken();
-                    let purpose = std::mem::replace(purpose, PickPurpose::DecodeAs);
-                    self.overlay = None;
-                    if let Some(name) = taken {
-                        self.take_picked(purpose, name);
-                    }
-                }
+                KeyCode::Esc => self.close_pick(false),
+                KeyCode::Enter => self.close_pick(true),
                 KeyCode::Char(letter) => picker.typing(letter),
                 _ => {}
             },
@@ -2931,12 +2931,25 @@ impl App {
         }
     }
 
+    /// Closes the picker, applying the line under its cursor when `take`.
+    /// Whatever opened it over a step editor gets that editor back either way.
+    fn close_pick(&mut self, take: bool) {
+        let Some(Overlay::Pick(picker, purpose)) = self.overlay.take() else {
+            return;
+        };
+        if take {
+            if let Some(name) = picker.taken() {
+                self.take_picked(purpose, name);
+                return;
+            }
+        }
+        if let PickPurpose::StepEnum { step, focus, .. } = purpose {
+            self.back_to_step(step, focus);
+        }
+    }
+
     /// Applies what a picker settled: which frame a row reads as, or which
     /// enum variant a field now holds.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "consumed by one arm and not the other, moving it in either way"
-    )]
     fn take_picked(&mut self, purpose: PickPurpose, taken: String) {
         match purpose {
             PickPurpose::DecodeAs => {
@@ -2967,7 +2980,145 @@ impl App {
             PickPurpose::HexTarget => {
                 self.session.hex_target = Some(sim_core::ConnectionId(taken));
             }
+            PickPurpose::StepEnum { step, focus, field } => {
+                if let Some(value) = taken.rsplit(" = ").next().and_then(|v| v.parse().ok()) {
+                    self.hold_step_field(step, &field, sim_core::frame::value::Value::Uint(value));
+                }
+                self.back_to_step(step, focus);
+            }
         }
+    }
+
+    /// Reopens a step's editor on `focus`, its scratch text read back from
+    /// the model so it agrees with what a picker may just have changed.
+    fn back_to_step(&mut self, step: usize, focus: usize) {
+        let names: Vec<String> = self
+            .session
+            .connections
+            .iter()
+            .map(|(id, _)| id.0.clone())
+            .collect();
+        let frames: Vec<FrameDef> = self.session.frames.frames().cloned().collect();
+        let mut edit = StepEdit {
+            step,
+            focus,
+            text: String::new(),
+        };
+        if let Some(held) = self
+            .session
+            .scenarios
+            .draft
+            .as_ref()
+            .and_then(|draft| draft.scenario.steps.get(step))
+        {
+            edit.reseed(held, &names, &frames);
+        }
+        self.overlay = Some(Overlay::Step(edit));
+    }
+
+    /// Replaces the value a step holds one of its frame's fields at, whether
+    /// it sends it or waits for it.
+    fn hold_step_field(&mut self, step: usize, field: &str, value: sim_core::frame::value::Value) {
+        let Some(held) = self
+            .session
+            .scenarios
+            .draft
+            .as_mut()
+            .and_then(|draft| draft.scenario.steps.get_mut(step))
+        else {
+            return;
+        };
+        match &mut held.action {
+            Action::Send { with, .. } => {
+                with.insert(field.to_owned(), value);
+            }
+            Action::WaitFor {
+                expect: Expect::Frame { values, .. },
+                ..
+            } => {
+                values.insert(field.to_owned(), value);
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the list of variants for the enum field under the cursor of a
+    /// step editor, when it is held at a value. Returns whether it did, so a
+    /// key that has no list to open keeps its usual meaning.
+    fn open_step_enum_picker(&mut self, index: usize, focus: usize) -> bool {
+        let Some(step) = self
+            .session
+            .scenarios
+            .draft
+            .as_ref()
+            .and_then(|draft| draft.scenario.steps.get(index).cloned())
+        else {
+            return false;
+        };
+        let names: Vec<String> = self
+            .session
+            .connections
+            .iter()
+            .map(|(id, _)| id.0.clone())
+            .collect();
+        let frames: Vec<FrameDef> = self.session.frames.frames().cloned().collect();
+        let fields = StepEdit::fields_with_frame(&step, &names, &frames);
+        let Some(field) = fields.get(focus.min(fields.len().saturating_sub(1))) else {
+            return false;
+        };
+        let (frame, position, held) = match (field, &step.action) {
+            (StepField::SendField(i), Action::Send { frame, with, .. }) => (frame, *i, with),
+            (
+                StepField::WaitField(i),
+                Action::WaitFor {
+                    expect:
+                        Expect::Frame {
+                            frame,
+                            values,
+                            capture,
+                            ..
+                        },
+                    ..
+                },
+            ) => {
+                let name = frames
+                    .iter()
+                    .find(|f| &f.name == frame)
+                    .and_then(|f| f.fields.get(*i))
+                    .map(|f| &f.name);
+                if name.is_some_and(|name| capture.contains_key(name)) {
+                    return false;
+                }
+                (frame, *i, values)
+            }
+            _ => return false,
+        };
+        let Some(field_def) = frames
+            .iter()
+            .find(|f| &f.name == frame)
+            .and_then(|f| f.fields.get(position))
+        else {
+            return false;
+        };
+        let FieldKind::Enum { variants, .. } = &field_def.kind else {
+            return false;
+        };
+        if !held.contains_key(&field_def.name) {
+            return false;
+        }
+        let options = variants
+            .iter()
+            .map(|variant| format!("{} = {}", variant.name, variant.value))
+            .collect();
+        self.overlay = Some(Overlay::Pick(
+            Picker::new(field_def.name.clone(), options),
+            PickPurpose::StepEnum {
+                step: index,
+                focus,
+                field: field_def.name.clone(),
+            },
+        ));
+        true
     }
 
     /// Applies an edit that belongs to the scenario header rather than to a
@@ -3537,23 +3688,21 @@ impl App {
         let mut close = false;
         match code {
             KeyCode::Esc | KeyCode::Enter => close = true,
-            KeyCode::Tab | KeyCode::Down => {
+            KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
                 let held = StepEdit::fields_with_frame(&step, &names, &frames)
                     .len()
                     .max(1);
-                focus = (focus + 1) % held;
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                let held = StepEdit::fields_with_frame(&step, &names, &frames)
-                    .len()
-                    .max(1);
-                focus = (focus + held - 1) % held;
+                let forwards = matches!(code, KeyCode::Tab | KeyCode::Down);
+                focus = (focus + if forwards { 1 } else { held - 1 }) % held;
             }
             _ => {
                 let fields = StepEdit::fields_with_frame(&step, &names, &frames);
                 let at = focus.min(fields.len().saturating_sub(1));
                 if let Some(field) = fields.into_iter().nth(at) {
                     self.act_on_step(index, &field, code, &names, &frames, &links, &mut text);
+                }
+                if code == KeyCode::Char(' ') && self.open_step_enum_picker(index, focus) {
+                    return;
                 }
             }
         }
