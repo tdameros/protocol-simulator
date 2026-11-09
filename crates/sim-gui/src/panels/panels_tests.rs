@@ -762,3 +762,200 @@ fn a_dangling_capture_can_still_be_cleared_from_its_own_row() {
         "unticking it clears the stale reference: {from_capture:?}"
     );
 }
+
+/// A draft with a reply to read and a frame to send, over frames that exist in
+/// a folder, so that a rule has something on each side.
+fn a_draft_with_a_reply_and_a_send(tag: &str) -> World {
+    let (dir, mut world) = folder(
+        tag,
+        &[("response.toml", RESPONSE), ("forward.toml", FORWARD)],
+    );
+    world.state.scenarios.load_from(dir);
+    world
+        .state
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    let draft = world.state.scenarios.draft.as_mut().unwrap();
+    draft.scenario.steps[0].action = sim_core::scenario::Action::WaitFor {
+        expect: sim_core::scenario::Expect::Frame {
+            frame: "Response".to_owned(),
+            values: std::collections::BTreeMap::from([(
+                "code".to_owned(),
+                sim_core::frame::value::Value::Uint(1),
+            )]),
+            match_from_capture: std::collections::BTreeMap::default(),
+            capture: std::collections::BTreeMap::default(),
+        },
+        timeout: None,
+        on_timeout: sim_core::scenario::TimeoutPolicy::Fail,
+    };
+    draft.scenario.steps[0].targets = vec![sim_core::ConnectionId::from("server1")];
+    draft.scenario.steps.push(sim_core::scenario::Step {
+        targets: vec![sim_core::ConnectionId::from("server2")],
+        action: sim_core::scenario::Action::Send {
+            frame: "Forward".to_owned(),
+            with: std::collections::BTreeMap::default(),
+            counters: std::collections::BTreeMap::default(),
+            from_capture: std::collections::BTreeMap::default(),
+            capture: std::collections::BTreeMap::default(),
+        },
+    });
+    world
+}
+
+fn draft_rules<'a>(harness: &'a Harness<'static, World>) -> &'a [sim_core::rule::Rule] {
+    &harness
+        .state()
+        .state
+        .scenarios
+        .draft
+        .as_ref()
+        .unwrap()
+        .scenario
+        .rules
+}
+
+#[test]
+fn a_rule_can_be_added_and_starts_valid() {
+    let mut harness = scenarios_panel(a_draft_with_a_reply_and_a_send("rule-add"));
+    harness.run();
+
+    harness.get_by_label_contains("Add a rule").click();
+    harness.run();
+
+    let rules = draft_rules(&harness);
+    assert_eq!(rules.len(), 1, "{rules:?}");
+    assert_eq!(rules[0].set.step, 2);
+    assert_eq!(rules[0].set.field, "payload");
+    assert!(
+        harness.query_by_label_contains("Rule 1").is_some(),
+        "and it is on screen"
+    );
+    assert!(
+        harness
+            .state()
+            .state
+            .scenarios
+            .draft
+            .as_ref()
+            .unwrap()
+            .problem()
+            .is_none(),
+        "a rule that starts out valid does not block the save"
+    );
+}
+
+#[test]
+fn there_is_no_rule_to_add_with_nothing_to_read() {
+    let (dir, mut world) = folder("rule-none", &[("forward.toml", FORWARD)]);
+    world.state.scenarios.load_from(dir);
+    world
+        .state
+        .scenarios
+        .begin_new(sim_session::scenarios::blank());
+    let mut harness = scenarios_panel(world);
+    harness.run();
+
+    harness.get_by_label_contains("Add a rule").click();
+    harness.run();
+
+    assert!(draft_rules(&harness).is_empty());
+}
+
+#[test]
+fn a_test_can_be_added_to_a_condition() {
+    let mut harness = scenarios_panel(a_draft_with_a_reply_and_a_send("rule-when"));
+    // Tall enough that the button is on screen, not scrolled out of reach.
+    harness.set_size(egui::vec2(800.0, 2000.0));
+    harness.run();
+    harness.get_by_label_contains("Add a rule").click();
+    harness.run();
+    assert!(draft_rules(&harness)[0].when.is_none(), "always, to start");
+
+    // The mode list is a popup, which this harness cannot reach, so the
+    // condition is switched on through the model and the buttons are driven.
+    {
+        let draft = harness.state_mut().state.scenarios.draft.as_mut().unwrap();
+        draft.scenario.rules[0].when = Some(sim_core::rule::Condition {
+            combine: sim_core::rule::Combine::All,
+            tests: vec![sim_core::rule::Test {
+                source: sim_core::rule::Source {
+                    step: 1,
+                    field: "code".to_owned(),
+                    bit: None,
+                },
+                equals: sim_core::frame::value::Value::Uint(1),
+            }],
+        });
+    }
+    harness.run();
+
+    harness.get_by_label_contains("Add a test").click();
+    harness.run();
+    assert_eq!(
+        draft_rules(&harness)[0].when.as_ref().unwrap().tests.len(),
+        2
+    );
+}
+
+#[test]
+fn a_rule_naming_a_field_the_frame_lacks_says_so_on_the_rule() {
+    let mut world = a_draft_with_a_reply_and_a_send("rule-bad");
+    {
+        let draft = world.state.scenarios.draft.as_mut().unwrap();
+        assert!(sim_session::scenarios::add_rule(
+            &mut draft.scenario,
+            &world.state.frames.frames().cloned().collect::<Vec<_>>()
+        ));
+        draft.scenario.rules[0].set.field = "nope".to_owned();
+    }
+    let mut harness = scenarios_panel(world);
+    harness.run();
+
+    assert_eq!(
+        harness
+            .query_all_by_label_contains("no field named nope")
+            .count(),
+        2,
+        "on the rule itself, and in the save bar saying why Save is not offered"
+    );
+}
+
+#[test]
+fn a_saved_scenario_shows_its_rules_in_a_line_each() {
+    let (dir, mut world) = folder(
+        "rule-view",
+        &[("response.toml", RESPONSE), ("forward.toml", FORWARD)],
+    );
+    std::fs::write(
+        dir.join("scenario.toml"),
+        r#"
+[[scenario]]
+name = "Relay"
+on = "bus"
+
+[[scenario.step]]
+wait_for = { frame = "Response", match = { code = 1 }, timeout_ms = 500 }
+
+[[scenario.step]]
+send = "Forward"
+
+[[scenario.rule]]
+name = "relay"
+set = { step = 2, field = "payload", from = { step = 1, field = "code" } }
+"#,
+    )
+    .unwrap();
+    world.state.scenarios.load_from(dir);
+    world.state.scenarios.selected = Some(0);
+
+    let mut harness = scenarios_panel(world);
+    harness.run();
+
+    assert!(
+        harness
+            .query_by_label_contains("relay: set step 2 payload from step 1 code")
+            .is_some(),
+        "the rule reads in a line under the steps"
+    );
+}

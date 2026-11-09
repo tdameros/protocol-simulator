@@ -4,6 +4,7 @@ pub mod frame_edit;
 mod frame_editor;
 pub mod hex_inject;
 pub mod live_monitor;
+pub mod rule_edit;
 pub mod scenario_edit;
 pub mod scenario_list;
 pub mod type_edit;
