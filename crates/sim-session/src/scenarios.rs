@@ -16,6 +16,7 @@ use crate::engine_handle::EngineHandle;
 use crate::state::Session;
 use sim_core::frame::value::seed_values;
 use sim_core::frame::{schema, FrameDef};
+use sim_core::rule::{self as rules, Rule};
 use sim_core::scenario::{self, Action, Counter, Expect, Scenario, Step};
 use sim_core::{ConnectionId, HexPattern};
 
@@ -398,6 +399,17 @@ impl Draft {
         if index < self.scenario.steps.len() {
             self.scenario.steps.remove(index);
             prune_dangling_captures(&mut self.scenario);
+            // Rules name steps by number, so the ones after this one shift
+            // down. A rule that read the step or wrote into it has nothing
+            // left to refer to and goes with it, as a dangling capture does.
+            let gone = index + 1;
+            self.scenario.rules.retain_mut(|rule| {
+                rule.remap_steps(|step| match step.cmp(&gone) {
+                    std::cmp::Ordering::Less => Some(step),
+                    std::cmp::Ordering::Equal => None,
+                    std::cmp::Ordering::Greater => Some(step - 1),
+                })
+            });
         }
     }
 
@@ -414,6 +426,22 @@ impl Draft {
         if index < steps.len() && other < steps.len() {
             steps.swap(index, other);
             prune_dangling_captures(&mut self.scenario);
+            // A rule follows the steps it named, not their positions. One
+            // that now reads a step after the one it fills is left for
+            // `problem` to report rather than dropped: the move is undone by
+            // moving back, a dropped rule is not.
+            let (first, second) = (index + 1, other + 1);
+            for rule in &mut self.scenario.rules {
+                rule.remap_steps(|step| {
+                    Some(if step == first {
+                        second
+                    } else if step == second {
+                        first
+                    } else {
+                        step
+                    })
+                });
+            }
         }
     }
 
@@ -729,6 +757,165 @@ fn prune_dangling_captures(scenario: &mut Scenario) {
             known.extend(capture.values().cloned());
         }
     }
+}
+
+/// The steps before `target` a rule could read from, numbered from one: the
+/// ones that send or wait for a frame, and wait on a single link.
+#[must_use]
+pub fn readable_before(scenario: &Scenario, target: usize) -> Vec<usize> {
+    scenario
+        .steps
+        .iter()
+        .enumerate()
+        .take(target.saturating_sub(1))
+        .filter(|(_, step)| match &step.action {
+            Action::Send { .. } => true,
+            Action::WaitFor {
+                expect: Expect::Frame { .. },
+                ..
+            } => step.targets.len() == 1,
+            _ => false,
+        })
+        .map(|(index, _)| index + 1)
+        .collect()
+}
+
+/// A rule in one line, so a list of them reads without opening any.
+#[must_use]
+pub fn describe_rule(rule: &Rule, number: usize) -> String {
+    let mut text = rule
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("rule {number}"));
+    text.push(':');
+    if let Some(condition) = &rule.when {
+        let joiner = match condition.combine {
+            rules::Combine::All => " and ",
+            rules::Combine::Any => " or ",
+        };
+        let tests: Vec<String> = condition
+            .tests
+            .iter()
+            .map(|test| format!("{} = {}", place(&test.source), value_text(&test.equals)))
+            .collect();
+        let _ = write!(text, " when {},", tests.join(joiner));
+    }
+    let target = place(&rules::Source {
+        step: rule.set.step,
+        field: rule.set.field.clone(),
+        bit: rule.set.bit.clone(),
+    });
+    let _ = write!(text, " set {target}");
+    match &rule.set.operand {
+        rules::Operand::Constant(value) => {
+            let _ = write!(text, " = {}", value_text(value));
+        }
+        rules::Operand::Copy { from, and, or } => {
+            let _ = write!(text, " from {}", place(from));
+            if let Some(mask) = and {
+                let _ = write!(text, ", and {mask:#04X}");
+            }
+            if let Some(mask) = or {
+                let _ = write!(text, ", or {mask:#04X}");
+            }
+        }
+    }
+    text
+}
+
+fn place(source: &rules::Source) -> String {
+    match &source.bit {
+        Some(bit) => format!("step {} {}.{bit}", source.step, source.field),
+        None => format!("step {} {}", source.step, source.field),
+    }
+}
+
+fn value_text(value: &sim_core::frame::value::Value) -> String {
+    use sim_core::frame::value::Value;
+    match value {
+        Value::Uint(number) => number.to_string(),
+        Value::Int(number) => number.to_string(),
+        Value::Float(number) => number.to_string(),
+        Value::Text(text) => format!("{text:?}"),
+        Value::Bytes(bytes) => crate::hex::spaced(bytes),
+        Value::Bits(_) => "bits".to_owned(),
+    }
+}
+
+/// Appends a rule that is valid as it stands, for the editor to refine.
+///
+/// Returns whether there was somewhere to put one: it needs a `send` step with
+/// a readable step before it, and a field of that send no step sets itself.
+pub fn add_rule(scenario: &mut Scenario, frames: &[FrameDef]) -> bool {
+    let fields_of = |step: &Step| -> Vec<String> {
+        rules::frame_of(step)
+            .and_then(|name| frames.iter().find(|frame| frame.name == name))
+            .map(|frame| {
+                frame
+                    .fields
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    for target in (1..=scenario.steps.len()).rev() {
+        let step = &scenario.steps[target - 1];
+        let Action::Send {
+            with,
+            counters,
+            from_capture,
+            ..
+        } = &step.action
+        else {
+            continue;
+        };
+        let Some(field) = fields_of(step).into_iter().find(|field| {
+            !with.contains_key(field)
+                && !counters.contains_key(field)
+                && !from_capture.contains_key(field)
+        }) else {
+            continue;
+        };
+        let Some((from, read)) = readable_before(scenario, target)
+            .into_iter()
+            .rev()
+            .find_map(|number| {
+                let first = fields_of(&scenario.steps[number - 1]).into_iter().next()?;
+                Some((number, first))
+            })
+        else {
+            continue;
+        };
+
+        scenario.rules.push(Rule {
+            name: None,
+            when: None,
+            set: rules::Assignment {
+                step: target,
+                field,
+                bit: None,
+                operand: rules::Operand::Copy {
+                    from: rules::Source {
+                        step: from,
+                        field: read,
+                        bit: None,
+                    },
+                    and: None,
+                    or: None,
+                },
+            },
+        });
+        return true;
+    }
+    false
+}
+
+/// Why a rule cannot run against these frames, if it cannot.
+#[must_use]
+pub fn rule_problem(scenario: &Scenario, rule: &Rule, frames: &[FrameDef]) -> Option<String> {
+    rules::check_against(rule, &scenario.steps, frames).err()
 }
 
 /// Swaps a wait between naming a frame and spelling out bytes, keeping nothing
@@ -1811,5 +1998,197 @@ wait_for = { frame = "Telemetry", match = { sync = 1, mode = 2 } }
             "wait for C0 FE at offset 2, giving up after 500 ms"
         );
         assert_eq!(lines[4], "wait for Telemetry matching mode, sync");
+    }
+
+    const RULED: &str = r#"
+[[scenario]]
+name = "R"
+on = "bus"
+
+[[scenario.step]]
+send = "Request"
+
+[[scenario.step]]
+wait_for = { frame = "Status", match = { sync = 1 }, timeout_ms = 500 }
+
+[[scenario.step]]
+wait_ms = 10
+
+[[scenario.step]]
+send = "Out"
+
+[[scenario.step]]
+send = "Out"
+
+[[scenario.rule]]
+name = "mirror"
+when = { all = [{ step = 2, field = "state", bit = "fault", equals = 1 }] }
+set = { step = 4, field = "flags", bit = "alarm", from = { step = 2, field = "state", bit = "fault" } }
+
+[[scenario.rule]]
+set = { step = 5, field = "speed", value = 3 }
+
+[[scenario.rule]]
+set = { step = 5, field = "mode", from = { step = 1, field = "id" }, and = 15, or = 128 }
+"#;
+
+    fn draft(text: &str) -> Draft {
+        Draft {
+            scenario: parse(text),
+            origin: None,
+        }
+    }
+
+    fn targets(draft: &Draft) -> Vec<usize> {
+        draft
+            .scenario
+            .rules
+            .iter()
+            .map(|rule| rule.set.step)
+            .collect()
+    }
+
+    #[test]
+    fn removing_a_step_renumbers_the_rules_after_it() {
+        let mut draft = draft(RULED);
+        draft.remove_step(2); // the delay, step 3
+
+        assert_eq!(targets(&draft), [3, 4, 4]);
+        assert_eq!(draft.problem(), None, "still a scenario that loads");
+    }
+
+    #[test]
+    fn removing_a_step_drops_the_rules_that_read_it() {
+        let mut draft = draft(RULED);
+        draft.remove_step(1); // the wait, step 2, which the first rule reads
+
+        assert_eq!(draft.scenario.rules.len(), 2);
+        assert_eq!(targets(&draft), [4, 4]);
+        assert_eq!(draft.problem(), None);
+    }
+
+    #[test]
+    fn removing_a_step_drops_the_rules_that_write_into_it() {
+        let mut draft = draft(RULED);
+        draft.remove_step(4); // the last send, step 5
+
+        assert_eq!(draft.scenario.rules.len(), 1);
+        assert_eq!(draft.scenario.rules[0].name.as_deref(), Some("mirror"));
+    }
+
+    #[test]
+    fn moving_a_step_keeps_each_rule_on_the_step_it_named() {
+        let mut draft = draft(RULED);
+        draft.move_step(2, true); // the delay swaps with the send after it
+
+        // The send that was step 4 is step 3 now, and the delay is step 4.
+        assert_eq!(targets(&draft), [3, 5, 5]);
+    }
+
+    #[test]
+    fn a_move_that_puts_a_source_after_its_target_is_reported_not_hidden() {
+        let mut draft = draft(RULED);
+        draft.move_step(1, true); // the wait is step 3 now, still before step 4
+        assert_eq!(draft.problem(), None);
+        draft.move_step(2, true); // and step 4 now, after the send it feeds
+
+        let problem = draft.problem().expect("the rule now reads a later step");
+        assert!(
+            problem.contains("rule 1") && problem.contains("step 4"),
+            "{problem}"
+        );
+    }
+
+    #[test]
+    fn only_steps_that_name_a_frame_before_the_target_can_be_read() {
+        let scenario = parse(RULED);
+        assert_eq!(readable_before(&scenario, 4), [1, 2]);
+        assert_eq!(readable_before(&scenario, 5), [1, 2, 4]);
+        assert_eq!(readable_before(&scenario, 1), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_rule_reads_in_one_line() {
+        let scenario = parse(RULED);
+        assert_eq!(
+            describe_rule(&scenario.rules[0], 1),
+            "mirror: when step 2 state.fault = 1, set step 4 flags.alarm from step 2 state.fault"
+        );
+        assert_eq!(
+            describe_rule(&scenario.rules[1], 2),
+            "rule 2: set step 5 speed = 3"
+        );
+        assert_eq!(
+            describe_rule(&scenario.rules[2], 3),
+            "rule 3: set step 5 mode from step 1 id, and 0x0F, or 0x80"
+        );
+    }
+
+    fn frames_for_rules() -> Vec<FrameDef> {
+        let parse = |text: &str| schema::from_toml(text).expect("a frame");
+        vec![
+            parse("name = \"Request\"\n[[field]]\nname = \"id\"\ntype = \"u8\"\n"),
+            parse(
+                "name = \"Status\"\n[[field]]\nname = \"sync\"\ntype = \"u8\"\n\
+                 [[field]]\nname = \"state\"\ntype = \"u8\"\n",
+            ),
+            parse("name = \"Out\"\n[[field]]\nname = \"speed\"\ntype = \"u8\"\n"),
+        ]
+    }
+
+    #[test]
+    fn a_new_rule_starts_valid_and_on_a_free_field() {
+        let mut scenario = parse(
+            r#"
+[[scenario]]
+name = "R"
+on = "bus"
+
+[[scenario.step]]
+wait_for = { frame = "Status", match = { sync = 1 }, timeout_ms = 500 }
+
+[[scenario.step]]
+send = "Out"
+with = { speed = 1 }
+"#,
+        );
+        let mut frames = frames_for_rules();
+        frames[2] = schema::from_toml(
+            "name = \"Out\"\n[[field]]\nname = \"speed\"\ntype = \"u8\"\n\
+             [[field]]\nname = \"limit\"\ntype = \"u8\"\n",
+        )
+        .expect("a frame");
+
+        assert!(add_rule(&mut scenario, &frames));
+
+        let rule = &scenario.rules[0];
+        assert_eq!(rule.set.step, 2);
+        assert_eq!(rule.set.field, "limit", "speed is the step's own");
+        let draft = Draft {
+            scenario: scenario.clone(),
+            origin: None,
+        };
+        assert_eq!(draft.problem(), None);
+        assert_eq!(rule_problem(&scenario, rule, &frames), None);
+    }
+
+    #[test]
+    fn there_is_no_rule_to_add_without_something_to_read_and_something_to_fill() {
+        let mut only_sends = parse(
+            "[[scenario]]\nname = \"R\"\non = \"bus\"\n\n[[scenario.step]]\nsend = \"Out\"\n",
+        );
+        assert!(!add_rule(&mut only_sends, &frames_for_rules()));
+        assert!(only_sends.rules.is_empty());
+    }
+
+    #[test]
+    fn a_rule_left_pointing_at_a_missing_field_is_reported() {
+        let scenario = parse(RULED);
+        let problem = rule_problem(&scenario, &scenario.rules[1], &frames_for_rules());
+        assert_eq!(problem, None, "speed exists in Out");
+
+        let problem = rule_problem(&scenario, &scenario.rules[0], &frames_for_rules())
+            .expect("Out has no flags");
+        assert!(problem.contains("flags"), "{problem}");
     }
 }
