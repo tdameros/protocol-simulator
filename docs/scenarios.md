@@ -136,6 +136,82 @@ wait_for = { frame = "Response", match_from_capture = { id = "request_id" }, tim
 but never the same field. The variable must have been captured by an earlier
 `send` or `wait_for` step. As with other captures, it exists for one pass only.
 
+## Rules
+
+A rule reads what an earlier step sent or received in the current pass and
+decides what a later `send` carries. It covers what a capture cannot say: send
+a field only if a bit came back set, fill one bit from another, keep part of a
+received value.
+
+```toml
+[[scenario.rule]]
+name = "mirror fault"
+when = { all = [
+  { step = 2, field = "status", bit = "fault", equals = 1 },
+  { step = 2, field = "status", bit = "busy", equals = 0 },
+] }
+set = { step = 4, field = "flags", bit = "alarm", from = { step = 2, field = "status", bit = "fault" } }
+
+[[scenario.rule]]
+set = { step = 4, field = "speed", from = { step = 2, field = "raw" }, and = 0x0F, or = 0x80 }
+```
+
+Steps are numbered from one, as in error messages.
+
+| Key | Meaning |
+| --- | --- |
+| `name` | Optional. Used in error messages in place of the rule's number |
+| `when` | Optional. Without it the rule always applies |
+| `when.all` | Every test must hold |
+| `when.any` | At least one test must hold |
+| test | `{ step, field, bit, equals }`. `bit` is optional and reads one bit of a bitfield |
+| `set.step`, `set.field` | The `send` step and the field to write |
+| `set.bit` | Optional. Writes one bit of a bitfield and leaves the others as they were |
+| `set.from` | `{ step, field, bit }`, the value to copy. `bit` is optional |
+| `set.value` | A fixed value, instead of `from` |
+| `set.and`, `set.or` | Optional masks on what `from` read. The result is `(read AND and) OR or` |
+
+`when` takes either `all` or `any`, never both. `set` takes either `from` or
+`value`, never both, and the masks go with `from` only.
+
+Rules apply in the order the file lists them. Two rules on the same field are
+how two conditions pick between two values, the last one that holds wins. Two
+rules on different bits of one field both land.
+
+A bit that no rule sets keeps the step's own value, or the frame's default when
+the step sets nothing. A rule whose condition does not hold changes nothing.
+
+Numbers compare as numbers, so `equals = 2` matches a signed or an unsigned 2.
+An enum is compared by its number, not its variant name.
+
+Checked when the scenario loads:
+
+| Refused | Because |
+| --- | --- |
+| A step that does not exist | Nothing to read or write |
+| A target step that is not a `send` | Only a sent frame has fields to fill |
+| A source step that does not come before the target | It has not run yet |
+| A source step that is a delay, a raw send or a hex pattern wait | It has no named fields |
+| A source `wait_for` aimed at several links | Several answers, only one would be kept |
+| A target field that the step sets in `with`, `counters` or `from_capture` | Two sources would fight over it |
+| Both or neither of `all` and `any`, or an empty list | The condition says nothing |
+| Both or neither of `from` and `value`, or a mask next to `value` | The rule sets nothing, or two things |
+
+Checked when the step runs, because it needs the frame definitions:
+
+| Failure | Because |
+| --- | --- |
+| A field or a bit the frame does not have | Named in the message |
+| A `bit` on a field that is not a bitfield | Named in the message |
+| A mask on a value that is not an unsigned number | There are no bits to mask |
+| A value no earlier step produced | A source frame that did not decode, or a field it lacks |
+
+A failing rule fails the step and the scenario, with the rule and what it could
+not read. A rule's values are remembered for one pass, as captures are.
+
+A live override of a field a rule writes is replaced by the rule on the next
+send.
+
 ## Targets
 
 `on` at the scenario level applies to every step. A step may carry its own `on`

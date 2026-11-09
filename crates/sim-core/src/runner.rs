@@ -18,9 +18,10 @@ use tokio::time::MissedTickBehavior;
 
 use crate::connection::ConnectionId;
 use crate::engine::{Command, Event};
-use crate::frame::value::{seed_values, Value};
+use crate::frame::value::{seed_values, FieldValues, Value};
 use crate::frame::{codec, FrameDef};
 use crate::pattern::{Anchor, HexPattern};
+use crate::rule;
 use crate::scenario::{Action, Counter, Expect, Scenario, Step, TimeoutPolicy};
 
 /// A frame as it arrived, republished for whoever is waiting for one.
@@ -92,6 +93,9 @@ pub(crate) async fn run(context: Context) -> Outcome {
         // Fresh every pass: a value a repeat's earlier pass captured has
         // nothing to do with the reply this one is about to wait for.
         let mut variables: BTreeMap<String, Value> = BTreeMap::new();
+        // The same goes for what the steps of this pass saw, which the rules
+        // read from.
+        let mut seen: BTreeMap<usize, FieldValues> = BTreeMap::new();
 
         // Subscribed here, before this pass's first send, rather than inside
         // each wait: a reply can be broadcast the instant the engine writes
@@ -120,6 +124,7 @@ pub(crate) async fn run(context: Context) -> Outcome {
                 &context,
                 &mut received,
                 &mut variables,
+                &mut seen,
             )
             .await
             {
@@ -169,9 +174,11 @@ async fn execute(
     context: &Context,
     received: &mut broadcast::Receiver<Heard>,
     variables: &mut BTreeMap<String, Value>,
+    seen: &mut BTreeMap<usize, FieldValues>,
 ) -> StepResult {
     let commands = &context.commands;
     let frames = &context.frames;
+    let rules = &context.scenario.rules;
     match &step.action {
         Action::Wait { delay } => {
             tokio::time::sleep(*delay).await;
@@ -185,13 +192,19 @@ async fn execute(
             from_capture,
             capture,
         } => {
-            let with = frames
-                .iter()
-                .find(|definition| definition.name == *frame)
-                .map_or_else(
-                    || with.clone(),
-                    |definition| merged(with, definition, number, &context.overrides),
-                );
+            let definition = frames.iter().find(|definition| definition.name == *frame);
+            let mut with = definition.map_or_else(
+                || with.clone(),
+                |definition| merged(with, definition, number, &context.overrides),
+            );
+            // After the live overrides, so a rule decides the field it names:
+            // the file says the field is the rule's, and a person nudging it
+            // from the editor would otherwise undo the rule for one pass.
+            if let Some(definition) = definition {
+                if let Err(reason) = rule::apply(rules, number, definition, seen, &mut with) {
+                    return StepResult::Failed(reason);
+                }
+            }
             match encode(
                 frame,
                 &with,
@@ -209,6 +222,9 @@ async fn execute(
                         if let Some(value) = values.get(field) {
                             variables.insert(variable.clone(), value.clone());
                         }
+                    }
+                    if rule::reads(rules, number) {
+                        seen.insert(number, values);
                     }
                     send_to_all(commands, &step.targets, &bytes).await
                 }
@@ -239,6 +255,15 @@ async fn execute(
                 _ => None,
             };
 
+            // Kept apart from `capturing`: a rule reads the whole decoded
+            // frame, and names no variable to put it in.
+            let observed = match expect {
+                Expect::Frame { frame, .. } if rule::reads(rules, number) => {
+                    frames.iter().find(|held| &held.name == frame)
+                }
+                _ => None,
+            };
+
             // Every target has to answer, so each one is struck off as it does
             // and the wait ends when none is left.
             let mut pending: HashSet<&ConnectionId> = step.targets.iter().collect();
@@ -250,6 +275,11 @@ async fn execute(
                                 pending.remove(&id);
                                 if let Some((frame, capture)) = capturing {
                                     store_capture(frame, capture, &bytes, variables);
+                                }
+                                if let Some(frame) = observed {
+                                    if let Ok(decoded) = codec::decode(frame, &bytes) {
+                                        seen.insert(number, decoded.values);
+                                    }
                                 }
                             }
                         }
@@ -574,6 +604,7 @@ default = 0
                 every: Duration::from_micros(200),
                 times: Some(PASSES),
             }),
+            rules: Vec::new(),
             steps: vec![
                 Step {
                     targets: vec![id.clone()],

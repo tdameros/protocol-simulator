@@ -824,6 +824,7 @@ pub fn blank() -> Scenario {
                 delay: Duration::from_millis(100),
             },
         }],
+        rules: Vec::new(),
         repeat: None,
     }
 }
