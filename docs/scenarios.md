@@ -156,7 +156,9 @@ set = { step = 4, field = "flags", bit = "alarm", from = { step = 2, field = "st
 set = { step = 4, field = "speed", from = { step = 2, field = "raw" }, and = 0x0F, or = 0x80 }
 ```
 
-Steps are numbered from one, as in error messages.
+Steps are numbered from one, as in error messages. The GUI scenario editor
+has a Rules section under the steps, built from lists of the steps, fields and
+bits the scenario already has.
 
 | Key | Meaning |
 | --- | --- |
