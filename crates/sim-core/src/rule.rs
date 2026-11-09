@@ -185,6 +185,34 @@ impl Rule {
         tests.chain(copied)
     }
 
+    /// Renumbers every step this rule names, for a step that was moved or
+    /// removed. Returns `false`, leaving the rule as it was, when `map` has no
+    /// number for one of them: the rule then names a step that is gone.
+    pub fn remap_steps(&mut self, map: impl Fn(usize) -> Option<usize>) -> bool {
+        let Some(target) = map(self.set.step) else {
+            return false;
+        };
+        let mut places: Vec<&mut usize> = Vec::new();
+        if let Some(condition) = &mut self.when {
+            places.extend(condition.tests.iter_mut().map(|test| &mut test.source.step));
+        }
+        if let Operand::Copy { from, .. } = &mut self.set.operand {
+            places.push(&mut from.step);
+        }
+        let Some(mapped) = places
+            .iter()
+            .map(|place| map(**place))
+            .collect::<Option<Vec<usize>>>()
+        else {
+            return false;
+        };
+        for (place, number) in places.into_iter().zip(mapped) {
+            *place = number;
+        }
+        self.set.step = target;
+        true
+    }
+
     fn label(&self, number: usize) -> String {
         self.name.as_ref().map_or_else(
             || format!("rule {number}"),
@@ -557,6 +585,81 @@ fn write(
     held.insert(bit.clone(), number);
     with.insert(field.clone(), Value::Bits(held));
     Ok(())
+}
+
+/// Checks one rule against the frame definitions, which the file alone cannot
+/// say: that each field it names exists and that each bit sits in a bitfield.
+///
+/// # Errors
+///
+/// Names the field or bit that is missing.
+pub fn check_against(rule: &Rule, steps: &[Step], frames: &[FrameDef]) -> Result<(), String> {
+    check_place(
+        steps,
+        frames,
+        rule.set.step,
+        &rule.set.field,
+        rule.set.bit.as_deref(),
+    )?;
+    for source in rule.sources() {
+        check_place(
+            steps,
+            frames,
+            source.step,
+            &source.field,
+            source.bit.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+/// The frame a step sends or waits for, which is what its fields belong to.
+#[must_use]
+pub fn frame_of(step: &Step) -> Option<&str> {
+    match &step.action {
+        Action::Send { frame, .. }
+        | Action::WaitFor {
+            expect: Expect::Frame { frame, .. },
+            ..
+        } => Some(frame),
+        _ => None,
+    }
+}
+
+fn check_place(
+    steps: &[Step],
+    frames: &[FrameDef],
+    step: usize,
+    field: &str,
+    bit: Option<&str>,
+) -> Result<(), String> {
+    let name = step
+        .checked_sub(1)
+        .and_then(|at| steps.get(at))
+        .and_then(frame_of)
+        .ok_or_else(|| format!("step {step} has no frame to read fields from"))?;
+    let frame = frames
+        .iter()
+        .find(|declared| declared.name == name)
+        .ok_or_else(|| format!("step {step} uses {name}, which is not defined"))?;
+    let declared = frame
+        .fields
+        .iter()
+        .find(|declared| declared.name == field)
+        .ok_or_else(|| format!("{name} has no field named {field}"))?;
+    let Some(bit) = bit else {
+        return Ok(());
+    };
+    let FieldKind::Bits { bits, .. } = &declared.kind else {
+        return Err(format!(
+            "{name}.{field} is not a bitfield, it has no bit {bit}"
+        ));
+    };
+    if bits.iter().any(|candidate| candidate.name == bit) {
+        Ok(())
+    } else {
+        Err(format!("{name}.{field} has no bit named {bit}"))
+    }
 }
 
 #[cfg(test)]
@@ -1008,5 +1111,115 @@ bits = [
             toml::from_str("set = { step = 2, field = \"a\", value = 1 }\nwhen = { all = [] }")
                 .expect("raw");
         assert!(matches!(build(raw), Err(RuleError::BadCondition)));
+    }
+
+    fn ruled(rule: &str) -> (Vec<Rule>, Vec<Step>) {
+        let text = format!(
+            r#"
+[[scenario]]
+name = "R"
+on = "bus"
+
+[[scenario.step]]
+wait_for = {{ frame = "Status", match = {{ sync = 1 }}, timeout_ms = 500 }}
+
+[[scenario.step]]
+send = "Out"
+
+{rule}
+"#
+        );
+        let scenario = crate::scenario::from_toml(&text)
+            .expect("a scenario")
+            .remove(0);
+        (scenario.rules, scenario.steps)
+    }
+
+    fn definitions() -> Vec<FrameDef> {
+        vec![
+            flags_frame(),
+            frame(
+                r#"
+name = "Status"
+[[field]]
+name = "sync"
+type = "u8"
+[[field]]
+name = "state"
+type = "bits"
+repr = "u8"
+bits = [{ name = "fault", width = 1 }, { name = "spare", width = 7 }]
+"#,
+            ),
+        ]
+    }
+
+    fn judged(rule: &str) -> Result<(), String> {
+        let (rules, steps) = ruled(rule);
+        check_against(&rules[0], &steps, &definitions())
+    }
+
+    #[test]
+    fn a_rule_naming_real_fields_and_bits_is_accepted() {
+        judged(
+            "[[scenario.rule]]\nwhen = { all = [{ step = 1, field = \"state\", bit = \"fault\", equals = 1 }] }\n\
+             set = { step = 2, field = \"flags\", bit = \"alarm\", from = { step = 1, field = \"state\", bit = \"fault\" } }",
+        )
+        .expect("fine");
+    }
+
+    #[test]
+    fn a_target_field_the_frame_lacks_is_named() {
+        let error = judged("[[scenario.rule]]\nset = { step = 2, field = \"nope\", value = 1 }")
+            .expect_err("no such field");
+        assert!(error.contains("nope") && error.contains("Out"), "{error}");
+    }
+
+    #[test]
+    fn a_target_bit_the_frame_lacks_is_named() {
+        let error = judged(
+            "[[scenario.rule]]\nset = { step = 2, field = \"flags\", bit = \"nope\", value = 1 }",
+        )
+        .expect_err("no such bit");
+        assert!(error.contains("nope"), "{error}");
+    }
+
+    #[test]
+    fn a_bit_on_a_field_that_holds_no_bits_is_named() {
+        let error = judged(
+            "[[scenario.rule]]\nset = { step = 2, field = \"speed\", bit = \"alarm\", value = 1 }",
+        )
+        .expect_err("not a bitfield");
+        assert!(error.contains("speed"), "{error}");
+    }
+
+    #[test]
+    fn a_source_field_the_frame_lacks_is_named() {
+        let error = judged(
+            "[[scenario.rule]]\nset = { step = 2, field = \"speed\", from = { step = 1, field = \"nope\" } }",
+        )
+        .expect_err("no such field");
+        assert!(
+            error.contains("nope") && error.contains("Status"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_source_bit_the_frame_lacks_is_named() {
+        let error = judged(
+            "[[scenario.rule]]\nwhen = { all = [{ step = 1, field = \"state\", bit = \"nope\", equals = 1 }] }\n\
+             set = { step = 2, field = \"speed\", value = 1 }",
+        )
+        .expect_err("no such bit");
+        assert!(error.contains("nope"), "{error}");
+    }
+
+    #[test]
+    fn a_frame_nobody_defined_is_named() {
+        let (rules, steps) =
+            ruled("[[scenario.rule]]\nset = { step = 2, field = \"speed\", value = 1 }");
+        let error = check_against(&rules[0], &steps, &[]).expect_err("no frames at all");
+        assert!(error.contains("Out"), "{error}");
     }
 }
