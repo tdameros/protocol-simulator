@@ -51,7 +51,9 @@ pub enum RuleError {
     #[error("`when` needs exactly one of `all` or `any`, with at least one test")]
     BadCondition,
 
-    #[error("writes {field} of step {step}, which that step already sets itself")]
+    #[error(
+        "writes {field} of step {step}, which that step counts or fills from a capture itself"
+    )]
     TargetAlreadySet { step: usize, field: String },
 }
 
@@ -355,7 +357,6 @@ pub(crate) fn check(rules: &[Rule], steps: &[Step]) -> Result<(), (usize, RuleEr
 fn check_one(rule: &Rule, steps: &[Step]) -> Result<(), RuleError> {
     let target = rule.set.step;
     let Some(Action::Send {
-        with,
         counters,
         from_capture,
         ..
@@ -371,8 +372,10 @@ fn check_one(rule: &Rule, steps: &[Step]) -> Result<(), RuleError> {
         });
     };
     let field = &rule.set.field;
-    if with.contains_key(field) || counters.contains_key(field) || from_capture.contains_key(field)
-    {
+    // A fixed value in `with` is only what the step sends when no rule says
+    // otherwise. A counter or a capture is a source of its own, and two of
+    // those on one field would leave it unsaid which one wins.
+    if counters.contains_key(field) || from_capture.contains_key(field) {
         return Err(RuleError::TargetAlreadySet {
             step: target,
             field: field.clone(),
@@ -1056,6 +1059,44 @@ bits = [
         )
         .expect_err("text has no bits");
         assert!(error.contains("name"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_replaces_a_value_the_step_already_fixes() {
+        let rules = [rule(
+            None,
+            4,
+            "speed",
+            None,
+            Operand::Constant(Value::Uint(9)),
+        )];
+        let mut with = BTreeMap::from([("speed".to_owned(), Value::Uint(1))]);
+
+        apply(&rules, 4, &flags_frame(), &BTreeMap::new(), &mut with).expect("applies");
+
+        assert_eq!(with["speed"], Value::Uint(9));
+    }
+
+    #[test]
+    fn a_rule_changes_one_bit_of_a_fixed_bitfield_and_keeps_the_rest() {
+        let rules = [rule(
+            None,
+            4,
+            "flags",
+            Some("alarm"),
+            Operand::Constant(Value::Uint(1)),
+        )];
+        let mut with = BTreeMap::from([(
+            "flags".to_owned(),
+            bits(&[("alarm", 0), ("link", 1), ("spare", 5)]),
+        )]);
+
+        apply(&rules, 4, &flags_frame(), &BTreeMap::new(), &mut with).expect("applies");
+
+        assert_eq!(
+            with["flags"],
+            bits(&[("alarm", 1), ("link", 1), ("spare", 5)])
+        );
     }
 
     #[test]

@@ -1418,6 +1418,7 @@ on = "to_server1"
 [[scenario.step]]
 send = "Forward"
 on = "to_server2"
+with = { tag = 9 }
 
 [[scenario.rule]]
 set = { step = 3, field = "payload", from = { step = 2, field = "code" }, and = 15, or = 128 }
@@ -1465,7 +1466,7 @@ set = { step = 3, field = "tag", value = 2 }
     assert_eq!(
         beacons(&seen, "server2"),
         vec![vec![0x8A, 2]],
-        "(42 AND 0x0F) OR 0x80, and the tag of the rule whose condition held"
+        "(42 AND 0x0F) OR 0x80, and the rule that held replaced the step's fixed tag"
     );
 }
 

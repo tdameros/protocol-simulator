@@ -40,7 +40,8 @@ struct StepInfo {
     sends: bool,
     /// A rule may read from it, being before the rule's own step.
     readable: bool,
-    /// Fields the step already sets by itself, which a rule cannot also set.
+    /// Fields the step counts or fills from a capture, which a rule cannot also
+    /// set. A fixed value is not one: the rule replaces it.
     taken: HashSet<String>,
 }
 
@@ -55,14 +56,13 @@ fn catalogue(scenario: &Scenario) -> Vec<StepInfo> {
             let (label, taken) = match &step.action {
                 Action::Send {
                     frame,
-                    with,
                     counters,
                     from_capture,
                     ..
                 } => (
                     format!("{number}. send {frame}"),
-                    with.keys()
-                        .chain(counters.keys())
+                    counters
+                        .keys()
                         .chain(from_capture.keys())
                         .cloned()
                         .collect(),
@@ -523,7 +523,7 @@ fn field_and_bit(
                 ui.add_enabled_ui(free, |ui| {
                     if ui
                         .selectable_label(*field == candidate.name, &candidate.name)
-                        .on_disabled_hover_text("The step sets this field itself")
+                        .on_disabled_hover_text("The step counts or captures this field itself")
                         .clicked()
                         && *field != candidate.name
                     {

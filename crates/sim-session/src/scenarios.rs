@@ -845,7 +845,8 @@ fn value_text(value: &sim_core::frame::value::Value) -> String {
 /// Appends a rule that is valid as it stands, for the editor to refine.
 ///
 /// Returns whether there was somewhere to put one: it needs a `send` step with
-/// a readable step before it, and a field of that send no step sets itself.
+/// a readable step before it, and a field of that send that is not counted or
+/// filled from a capture.
 pub fn add_rule(scenario: &mut Scenario, frames: &[FrameDef]) -> bool {
     let fields_of = |step: &Step| -> Vec<String> {
         rules::frame_of(step)
@@ -871,11 +872,24 @@ pub fn add_rule(scenario: &mut Scenario, frames: &[FrameDef]) -> bool {
         else {
             continue;
         };
-        let Some(field) = fields_of(step).into_iter().find(|field| {
-            !with.contains_key(field)
-                && !counters.contains_key(field)
-                && !from_capture.contains_key(field)
-        }) else {
+        // A field the step sets from nowhere comes first, then one it only
+        // fixes: a rule may replace a fixed value, but starting on a free
+        // field leaves the step's own settings alone.
+        let fields = fields_of(step);
+        let Some(field) = fields
+            .iter()
+            .find(|field| {
+                !with.contains_key(*field)
+                    && !counters.contains_key(*field)
+                    && !from_capture.contains_key(*field)
+            })
+            .or_else(|| {
+                fields.iter().find(|field| {
+                    !counters.contains_key(*field) && !from_capture.contains_key(*field)
+                })
+            })
+            .cloned()
+        else {
             continue;
         };
         let Some((from, read)) = readable_before(scenario, target)
@@ -2170,6 +2184,27 @@ with = { speed = 1 }
         };
         assert_eq!(draft.problem(), None);
         assert_eq!(rule_problem(&scenario, rule, &frames), None);
+    }
+
+    #[test]
+    fn a_new_rule_may_land_on_a_field_the_step_fixes_when_none_is_free() {
+        let mut scenario = parse(
+            r#"
+[[scenario]]
+name = "R"
+on = "bus"
+
+[[scenario.step]]
+wait_for = { frame = "Status", match = { sync = 1 }, timeout_ms = 500 }
+
+[[scenario.step]]
+send = "Out"
+with = { speed = 1 }
+"#,
+        );
+
+        assert!(add_rule(&mut scenario, &frames_for_rules()));
+        assert_eq!(scenario.rules[0].set.field, "speed");
     }
 
     #[test]

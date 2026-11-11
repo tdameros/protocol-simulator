@@ -195,7 +195,7 @@ Checked when the scenario loads:
 | A source step that does not come before the target | It has not run yet |
 | A source step that is a delay, a raw send or a hex pattern wait | It has no named fields |
 | A source `wait_for` aimed at several links | Several answers, only one would be kept |
-| A target field that the step sets in `with`, `counters` or `from_capture` | Two sources would fight over it |
+| A target field that the step sets in `counters` or `from_capture` | Two sources would fight over it |
 | Both or neither of `all` and `any`, or an empty list | The condition says nothing |
 | Both or neither of `from` and `value`, or a mask next to `value` | The rule sets nothing, or two things |
 
@@ -211,8 +211,10 @@ Checked when the step runs, because it needs the frame definitions:
 A failing rule fails the step and the scenario, with the rule and what it could
 not read. A rule's values are remembered for one pass, as captures are.
 
-A live override of a field a rule writes is replaced by the rule on the next
-send.
+A rule replaces a fixed value the step gives the same field in `with`, and a
+live override of it, on the next send. The fixed value is what goes out when no
+rule applies. Writing one bit of a fixed bitfield keeps the other bits of that
+value.
 
 ## Targets
 

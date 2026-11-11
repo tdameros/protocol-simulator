@@ -2062,6 +2062,12 @@ set = { step = 4, field = "mode", value = 5 }
     }
 
     fn refused(rule: &str) -> String {
+        refused_or_loaded(rule)
+            .expect_err("the rule should have been refused")
+            .to_string()
+    }
+
+    fn refused_or_loaded(rule: &str) -> Result<Vec<Scenario>, ScenarioError> {
         let text = format!(
             r#"
 [[scenario]]
@@ -2091,8 +2097,6 @@ send = "Out"
 "#
         );
         from_toml(&text)
-            .expect_err("the rule should have been refused")
-            .to_string()
     }
 
     #[test]
@@ -2142,13 +2146,21 @@ send = "Out"
     }
 
     #[test]
+    fn a_rule_may_override_a_value_the_step_fixes() {
+        let text = refused_or_loaded(
+            "[[scenario.rule]]\nset = { step = 4, field = \"speed\", value = 2 }",
+        );
+        text.expect("a fixed value is only a default for the rule to replace");
+    }
+
+    #[test]
     fn a_rule_fighting_a_step_over_a_field_is_refused() {
-        for field in ["speed", "count", "other"] {
+        for field in ["count", "other"] {
             let error = refused(&format!(
                 "[[scenario.rule]]\nset = {{ step = 4, field = \"{field}\", value = 1 }}"
             ));
             assert!(
-                error.contains(field) && error.contains("already"),
+                error.contains(field) && error.contains("counts or fills"),
                 "{field}: {error}"
             );
         }
