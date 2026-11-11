@@ -255,6 +255,8 @@ async fn execute(
                 _ => None,
             };
 
+            let exact = exact_size(expect, frames);
+
             // Kept apart from `capturing`: a rule reads the whole decoded
             // frame, and names no variable to put it in.
             let observed = match expect {
@@ -271,7 +273,9 @@ async fn execute(
                 while !pending.is_empty() {
                     match received.recv().await {
                         Ok((id, bytes)) => {
-                            if pattern.found_in(&bytes, *anchor) {
+                            if pattern.found_in(&bytes, *anchor)
+                                && exact.is_none_or(|size| bytes.len() == size)
+                            {
                                 pending.remove(&id);
                                 if let Some((frame, capture)) = capturing {
                                     store_capture(frame, capture, &bytes, variables);
@@ -524,6 +528,32 @@ fn overlaid(
     Ok(values)
 }
 
+/// The exact length a frame wait demands of what it takes, when it compares no
+/// field at all.
+///
+/// With nothing compared, the pattern is all wildcards and would take any
+/// datagram at least as long as the frame, which is how a capture on its own
+/// mistook a longer frame for its reply. A wait that does compare something
+/// keeps taking longer frames: on a stream a read can hold more than one.
+fn exact_size(expect: &Expect, frames: &[FrameDef]) -> Option<usize> {
+    let Expect::Frame {
+        frame,
+        values,
+        match_from_capture,
+        ..
+    } = expect
+    else {
+        return None;
+    };
+    if !values.is_empty() || !match_from_capture.is_empty() {
+        return None;
+    }
+    frames
+        .iter()
+        .find(|known| &known.name == frame)
+        .map(FrameDef::size)
+}
+
 fn field_kind<'a>(frame: &'a FrameDef, field: &str) -> Result<&'a crate::frame::FieldKind, String> {
     frame
         .fields
@@ -539,6 +569,53 @@ mod tests {
 
     use super::*;
     use crate::scenario::Repeat;
+
+    fn frame_wait(values: &[(&str, u64)], capture: &[(&str, &str)]) -> Expect {
+        Expect::Frame {
+            frame: "Packet".to_owned(),
+            values: values
+                .iter()
+                .map(|(field, value)| ((*field).to_owned(), Value::Uint(*value)))
+                .collect(),
+            match_from_capture: BTreeMap::new(),
+            capture: capture
+                .iter()
+                .map(|(field, variable)| ((*field).to_owned(), (*variable).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn packet() -> FrameDef {
+        crate::frame::schema::from_toml(
+            "name = \"Packet\"\n[[field]]\nname = \"id\"\ntype = \"u8\"\n\
+             [[field]]\nname = \"value\"\ntype = \"u16\"\n",
+        )
+        .expect("a frame")
+    }
+
+    #[test]
+    fn a_wait_comparing_nothing_demands_the_exact_size_of_the_frame() {
+        let frames = [packet()];
+        assert_eq!(
+            exact_size(&frame_wait(&[], &[("value", "seen")]), &frames),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_wait_comparing_a_field_keeps_taking_longer_frames() {
+        let frames = [packet()];
+        assert_eq!(exact_size(&frame_wait(&[("id", 1)], &[]), &frames), None);
+    }
+
+    #[test]
+    fn a_wait_on_hex_bytes_has_no_frame_size() {
+        let expect = Expect::Pattern {
+            pattern: HexPattern::parse("AA").expect("a pattern"),
+            anchor: Anchor::At(0),
+        };
+        assert_eq!(exact_size(&expect, &[packet()]), None);
+    }
 
     #[test]
     fn a_saved_counter_value_matches_the_reply_that_echoes_it() {

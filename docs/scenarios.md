@@ -110,6 +110,10 @@ on the left, one of that frame's own fields, filled with whatever the variable
 on the right last held.
 
 A capture needs a frame to decode by, so it is refused on a hex pattern wait.
+A frame wait that compares no field, a capture on its own, takes only a frame of
+exactly the size its definition gives. Any other frame wait keeps taking a longer
+frame too, since a stream read can hold more than one. Compare a field that tells
+the frame apart, such as an id or a type, to be sure it is the right one.
 It also needs one target, an answer from a second one having nothing to do
 with the first. `from_capture` is refused where it names a variable no earlier
 step captures, caught when the scenario loads rather than partway through a

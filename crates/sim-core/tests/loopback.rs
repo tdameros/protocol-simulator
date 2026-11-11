@@ -1579,3 +1579,95 @@ set = { step = 3, field = "flags", bit = "link", value = 1 }
         "fault came back set and busy clear: alarm is raised, link is not"
     );
 }
+
+/// A wait that compares no field takes only a frame of exactly the size the
+/// definition says, so a longer datagram is not mistaken for its reply.
+#[tokio::test]
+async fn a_wait_comparing_nothing_ignores_a_frame_of_the_wrong_size() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let to_server1 = "127.0.0.1:19903".parse().unwrap();
+    let server1 = "127.0.0.1:19904".parse().unwrap();
+    let to_server2 = "127.0.0.1:19905".parse().unwrap();
+    let server2 = "127.0.0.1:19906".parse().unwrap();
+    for (name, bind, remote) in [
+        ("to_server1", to_server1, server1),
+        ("server1", server1, to_server1),
+        ("to_server2", to_server2, server2),
+        ("server2", server2, to_server2),
+    ] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["to_server1", "server1", "to_server2", "server2"]).await;
+
+    let frame = |text: &str| sim_core::frame::schema::from_toml(text).expect("a frame");
+    let request = frame("name = \"Request\"\n[[field]]\nname = \"id\"\ntype = \"u8\"\n");
+    let response = frame("name = \"Response\"\n[[field]]\nname = \"code\"\ntype = \"u8\"\n");
+    let forward = frame("name = \"Forward\"\n[[field]]\nname = \"payload\"\ntype = \"u8\"\n");
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Sized"
+
+[[scenario.step]]
+send = "Request"
+on = "to_server1"
+
+[[scenario.step]]
+wait_for = { frame = "Response", timeout_ms = 4000, capture = { code = "seen" } }
+on = "to_server1"
+
+[[scenario.step]]
+send = "Forward"
+on = "to_server2"
+from_capture = { payload = "seen" }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![request, response, forward],
+    })
+    .await
+    .unwrap();
+
+    wait_for(
+        &mut rx,
+        |event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server1"),
+    )
+    .await;
+
+    // Three bytes first, which is longer than a Response and must be ignored,
+    // then the one byte a Response is.
+    for bytes in [vec![9, 9, 9], vec![42]] {
+        tx.send(Command::SendRaw {
+            id: ConnectionId::from("server1"),
+            bytes,
+        })
+        .await
+        .unwrap();
+    }
+
+    let seen = gather_until(&mut rx, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server2"))
+            && finished_with(events, "Sized", &sim_core::Outcome::Completed)
+    })
+    .await;
+
+    assert_eq!(
+        beacons(&seen, "server2"),
+        vec![vec![42]],
+        "the three byte datagram was not taken for the reply"
+    );
+}
