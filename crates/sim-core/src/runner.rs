@@ -18,9 +18,10 @@ use tokio::time::MissedTickBehavior;
 
 use crate::connection::ConnectionId;
 use crate::engine::{Command, Event};
-use crate::frame::value::{seed_values, Value};
+use crate::frame::value::{seed_values, FieldValues, Value};
 use crate::frame::{codec, FrameDef};
 use crate::pattern::{Anchor, HexPattern};
+use crate::rule;
 use crate::scenario::{Action, Counter, Expect, Scenario, Step, TimeoutPolicy};
 
 /// A frame as it arrived, republished for whoever is waiting for one.
@@ -92,6 +93,9 @@ pub(crate) async fn run(context: Context) -> Outcome {
         // Fresh every pass: a value a repeat's earlier pass captured has
         // nothing to do with the reply this one is about to wait for.
         let mut variables: BTreeMap<String, Value> = BTreeMap::new();
+        // The same goes for what the steps of this pass saw, which the rules
+        // read from.
+        let mut seen: BTreeMap<usize, FieldValues> = BTreeMap::new();
 
         // Subscribed here, before this pass's first send, rather than inside
         // each wait: a reply can be broadcast the instant the engine writes
@@ -120,6 +124,7 @@ pub(crate) async fn run(context: Context) -> Outcome {
                 &context,
                 &mut received,
                 &mut variables,
+                &mut seen,
             )
             .await
             {
@@ -169,9 +174,11 @@ async fn execute(
     context: &Context,
     received: &mut broadcast::Receiver<Heard>,
     variables: &mut BTreeMap<String, Value>,
+    seen: &mut BTreeMap<usize, FieldValues>,
 ) -> StepResult {
     let commands = &context.commands;
     let frames = &context.frames;
+    let rules = &context.scenario.rules;
     match &step.action {
         Action::Wait { delay } => {
             tokio::time::sleep(*delay).await;
@@ -185,13 +192,19 @@ async fn execute(
             from_capture,
             capture,
         } => {
-            let with = frames
-                .iter()
-                .find(|definition| definition.name == *frame)
-                .map_or_else(
-                    || with.clone(),
-                    |definition| merged(with, definition, number, &context.overrides),
-                );
+            let definition = frames.iter().find(|definition| definition.name == *frame);
+            let mut with = definition.map_or_else(
+                || with.clone(),
+                |definition| merged(with, definition, number, &context.overrides),
+            );
+            // After the live overrides, so a rule decides the field it names:
+            // the file says the field is the rule's, and a person nudging it
+            // from the editor would otherwise undo the rule for one pass.
+            if let Some(definition) = definition {
+                if let Err(reason) = rule::apply(rules, number, definition, seen, &mut with) {
+                    return StepResult::Failed(reason);
+                }
+            }
             match encode(
                 frame,
                 &with,
@@ -209,6 +222,9 @@ async fn execute(
                         if let Some(value) = values.get(field) {
                             variables.insert(variable.clone(), value.clone());
                         }
+                    }
+                    if rule::reads(rules, number) {
+                        seen.insert(number, values);
                     }
                     send_to_all(commands, &step.targets, &bytes).await
                 }
@@ -239,6 +255,17 @@ async fn execute(
                 _ => None,
             };
 
+            let exact = exact_size(expect, frames);
+
+            // Kept apart from `capturing`: a rule reads the whole decoded
+            // frame, and names no variable to put it in.
+            let observed = match expect {
+                Expect::Frame { frame, .. } if rule::reads(rules, number) => {
+                    frames.iter().find(|held| &held.name == frame)
+                }
+                _ => None,
+            };
+
             // Every target has to answer, so each one is struck off as it does
             // and the wait ends when none is left.
             let mut pending: HashSet<&ConnectionId> = step.targets.iter().collect();
@@ -246,10 +273,17 @@ async fn execute(
                 while !pending.is_empty() {
                     match received.recv().await {
                         Ok((id, bytes)) => {
-                            if pattern.found_in(&bytes, *anchor) {
+                            if pattern.found_in(&bytes, *anchor)
+                                && exact.is_none_or(|size| bytes.len() == size)
+                            {
                                 pending.remove(&id);
                                 if let Some((frame, capture)) = capturing {
                                     store_capture(frame, capture, &bytes, variables);
+                                }
+                                if let Some(frame) = observed {
+                                    if let Ok(decoded) = codec::decode(frame, &bytes) {
+                                        seen.insert(number, decoded.values);
+                                    }
                                 }
                             }
                         }
@@ -494,6 +528,32 @@ fn overlaid(
     Ok(values)
 }
 
+/// The exact length a frame wait demands of what it takes, when it compares no
+/// field at all.
+///
+/// With nothing compared, the pattern is all wildcards and would take any
+/// datagram at least as long as the frame, which is how a capture on its own
+/// mistook a longer frame for its reply. A wait that does compare something
+/// keeps taking longer frames: on a stream a read can hold more than one.
+fn exact_size(expect: &Expect, frames: &[FrameDef]) -> Option<usize> {
+    let Expect::Frame {
+        frame,
+        values,
+        match_from_capture,
+        ..
+    } = expect
+    else {
+        return None;
+    };
+    if !values.is_empty() || !match_from_capture.is_empty() {
+        return None;
+    }
+    frames
+        .iter()
+        .find(|known| &known.name == frame)
+        .map(FrameDef::size)
+}
+
 fn field_kind<'a>(frame: &'a FrameDef, field: &str) -> Result<&'a crate::frame::FieldKind, String> {
     frame
         .fields
@@ -509,6 +569,53 @@ mod tests {
 
     use super::*;
     use crate::scenario::Repeat;
+
+    fn frame_wait(values: &[(&str, u64)], capture: &[(&str, &str)]) -> Expect {
+        Expect::Frame {
+            frame: "Packet".to_owned(),
+            values: values
+                .iter()
+                .map(|(field, value)| ((*field).to_owned(), Value::Uint(*value)))
+                .collect(),
+            match_from_capture: BTreeMap::new(),
+            capture: capture
+                .iter()
+                .map(|(field, variable)| ((*field).to_owned(), (*variable).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn packet() -> FrameDef {
+        crate::frame::schema::from_toml(
+            "name = \"Packet\"\n[[field]]\nname = \"id\"\ntype = \"u8\"\n\
+             [[field]]\nname = \"value\"\ntype = \"u16\"\n",
+        )
+        .expect("a frame")
+    }
+
+    #[test]
+    fn a_wait_comparing_nothing_demands_the_exact_size_of_the_frame() {
+        let frames = [packet()];
+        assert_eq!(
+            exact_size(&frame_wait(&[], &[("value", "seen")]), &frames),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn a_wait_comparing_a_field_keeps_taking_longer_frames() {
+        let frames = [packet()];
+        assert_eq!(exact_size(&frame_wait(&[("id", 1)], &[]), &frames), None);
+    }
+
+    #[test]
+    fn a_wait_on_hex_bytes_has_no_frame_size() {
+        let expect = Expect::Pattern {
+            pattern: HexPattern::parse("AA").expect("a pattern"),
+            anchor: Anchor::At(0),
+        };
+        assert_eq!(exact_size(&expect, &[packet()]), None);
+    }
 
     #[test]
     fn a_saved_counter_value_matches_the_reply_that_echoes_it() {
@@ -574,6 +681,7 @@ default = 0
                 every: Duration::from_micros(200),
                 times: Some(PASSES),
             }),
+            rules: Vec::new(),
             steps: vec![
                 Step {
                     targets: vec![id.clone()],

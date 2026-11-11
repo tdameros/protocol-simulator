@@ -8,6 +8,7 @@ pub mod engine;
 pub mod error;
 pub mod frame;
 pub mod pattern;
+pub mod rule;
 pub mod runner;
 pub mod scenario;
 pub mod transport;

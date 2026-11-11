@@ -1359,3 +1359,315 @@ from_capture = { payload = "server1_code" }
         "the captured code, not a default"
     );
 }
+
+/// A rule reads what a reply carried and decides what a later frame sends:
+/// the received code is masked into one field, and a second field is only set
+/// by the rule whose condition held.
+#[tokio::test]
+async fn a_rule_turns_a_received_value_into_a_sent_one() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let to_server1 = "127.0.0.1:19880".parse().unwrap();
+    let server1 = "127.0.0.1:19881".parse().unwrap();
+    let to_server2 = "127.0.0.1:19882".parse().unwrap();
+    let server2 = "127.0.0.1:19883".parse().unwrap();
+    for (name, bind, remote) in [
+        ("to_server1", to_server1, server1),
+        ("server1", server1, to_server1),
+        ("to_server2", to_server2, server2),
+        ("server2", server2, to_server2),
+    ] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["to_server1", "server1", "to_server2", "server2"]).await;
+
+    let request = sim_core::frame::schema::from_toml(
+        "name = \"Request\"\n[[field]]\nname = \"id\"\ntype = \"u8\"\n",
+    )
+    .expect("the test frame should parse");
+    let response = sim_core::frame::schema::from_toml(
+        "name = \"Response\"\n[[field]]\nname = \"sync\"\ntype = \"u8\"\ndefault = 170\n\
+         [[field]]\nname = \"code\"\ntype = \"u8\"\n",
+    )
+    .expect("the test frame should parse");
+    let forward = sim_core::frame::schema::from_toml(
+        "name = \"Forward\"\n[[field]]\nname = \"payload\"\ntype = \"u8\"\n\
+         [[field]]\nname = \"tag\"\ntype = \"u8\"\n",
+    )
+    .expect("the test frame should parse");
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Ruled"
+
+[[scenario.step]]
+send = "Request"
+on = "to_server1"
+
+[[scenario.step]]
+wait_for = { frame = "Response", match = { sync = 170 }, timeout_ms = 4000 }
+on = "to_server1"
+
+[[scenario.step]]
+send = "Forward"
+on = "to_server2"
+with = { tag = 9 }
+
+[[scenario.rule]]
+set = { step = 3, field = "payload", from = { step = 2, field = "code" }, and = 15, or = 128 }
+
+[[scenario.rule]]
+when = { all = [{ step = 2, field = "code", equals = 7 }] }
+set = { step = 3, field = "tag", value = 1 }
+
+[[scenario.rule]]
+when = { any = [{ step = 2, field = "code", equals = 42 }] }
+set = { step = 3, field = "tag", value = 2 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![request, response, forward],
+    })
+    .await
+    .unwrap();
+
+    wait_for(
+        &mut rx,
+        |event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server1"),
+    )
+    .await;
+
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("server1"),
+        bytes: vec![170, 42],
+    })
+    .await
+    .unwrap();
+
+    let seen = gather_until(&mut rx, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server2"))
+            && finished_with(events, "Ruled", &sim_core::Outcome::Completed)
+    })
+    .await;
+
+    assert_eq!(
+        beacons(&seen, "server2"),
+        vec![vec![0x8A, 2]],
+        "(42 AND 0x0F) OR 0x80, and the rule that held replaced the step's fixed tag"
+    );
+}
+
+/// Bits are read out of a received bitfield and written into one bit of a sent
+/// one, the other bits staying as the frame declares them.
+#[tokio::test]
+async fn a_rule_copies_one_received_bit_into_one_sent_bit() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let to_server1 = "127.0.0.1:19884".parse().unwrap();
+    let server1 = "127.0.0.1:19885".parse().unwrap();
+    let to_server2 = "127.0.0.1:19886".parse().unwrap();
+    let server2 = "127.0.0.1:19887".parse().unwrap();
+    for (name, bind, remote) in [
+        ("to_server1", to_server1, server1),
+        ("server1", server1, to_server1),
+        ("to_server2", to_server2, server2),
+        ("server2", server2, to_server2),
+    ] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["to_server1", "server1", "to_server2", "server2"]).await;
+
+    let request = sim_core::frame::schema::from_toml(
+        "name = \"Request\"\n[[field]]\nname = \"id\"\ntype = \"u8\"\n",
+    )
+    .expect("the test frame should parse");
+    // The first bit declared is the most significant one.
+    let status = sim_core::frame::schema::from_toml(
+        "name = \"Status\"\n[[field]]\nname = \"sync\"\ntype = \"u8\"\ndefault = 170\n\
+         [[field]]\nname = \"state\"\ntype = \"bits\"\nrepr = \"u8\"\n\
+         bits = [{ name = \"fault\", width = 1 }, { name = \"busy\", width = 1 }, { name = \"spare\", width = 6 }]\n",
+    )
+    .expect("the test frame should parse");
+    let out = sim_core::frame::schema::from_toml(
+        "name = \"Out\"\n[[field]]\nname = \"flags\"\ntype = \"bits\"\nrepr = \"u8\"\n\
+         bits = [{ name = \"alarm\", width = 1 }, { name = \"link\", width = 1 }, { name = \"spare\", width = 6 }]\n",
+    )
+    .expect("the test frame should parse");
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Bits"
+
+[[scenario.step]]
+send = "Request"
+on = "to_server1"
+
+[[scenario.step]]
+wait_for = { frame = "Status", match = { sync = 170 }, timeout_ms = 4000 }
+on = "to_server1"
+
+[[scenario.step]]
+send = "Out"
+on = "to_server2"
+
+[[scenario.rule]]
+when = { all = [
+  { step = 2, field = "state", bit = "fault", equals = 1 },
+  { step = 2, field = "state", bit = "busy", equals = 0 },
+] }
+set = { step = 3, field = "flags", bit = "alarm", from = { step = 2, field = "state", bit = "fault" } }
+
+[[scenario.rule]]
+when = { any = [{ step = 2, field = "state", bit = "busy", equals = 1 }] }
+set = { step = 3, field = "flags", bit = "link", value = 1 }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![request, status, out],
+    })
+    .await
+    .unwrap();
+
+    wait_for(
+        &mut rx,
+        |event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server1"),
+    )
+    .await;
+
+    tx.send(Command::SendRaw {
+        id: ConnectionId::from("server1"),
+        bytes: vec![170, 0b1000_0000],
+    })
+    .await
+    .unwrap();
+
+    let seen = gather_until(&mut rx, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server2"))
+            && finished_with(events, "Bits", &sim_core::Outcome::Completed)
+    })
+    .await;
+
+    assert_eq!(
+        beacons(&seen, "server2"),
+        vec![vec![0b1000_0000]],
+        "fault came back set and busy clear: alarm is raised, link is not"
+    );
+}
+
+/// A wait that compares no field takes only a frame of exactly the size the
+/// definition says, so a longer datagram is not mistaken for its reply.
+#[tokio::test]
+async fn a_wait_comparing_nothing_ignores_a_frame_of_the_wrong_size() {
+    let (tx, mut rx) = Engine::spawn();
+
+    let to_server1 = "127.0.0.1:19903".parse().unwrap();
+    let server1 = "127.0.0.1:19904".parse().unwrap();
+    let to_server2 = "127.0.0.1:19905".parse().unwrap();
+    let server2 = "127.0.0.1:19906".parse().unwrap();
+    for (name, bind, remote) in [
+        ("to_server1", to_server1, server1),
+        ("server1", server1, to_server1),
+        ("to_server2", to_server2, server2),
+        ("server2", server2, to_server2),
+    ] {
+        tx.send(Command::Connect {
+            id: ConnectionId::from(name),
+            config: TransportConfig::Udp { bind, remote },
+            retry: None,
+        })
+        .await
+        .unwrap();
+    }
+    wait_all_connected(&mut rx, &["to_server1", "server1", "to_server2", "server2"]).await;
+
+    let frame = |text: &str| sim_core::frame::schema::from_toml(text).expect("a frame");
+    let request = frame("name = \"Request\"\n[[field]]\nname = \"id\"\ntype = \"u8\"\n");
+    let response = frame("name = \"Response\"\n[[field]]\nname = \"code\"\ntype = \"u8\"\n");
+    let forward = frame("name = \"Forward\"\n[[field]]\nname = \"payload\"\ntype = \"u8\"\n");
+
+    let scenario = sim_core::scenario::from_toml(
+        r#"
+[[scenario]]
+name = "Sized"
+
+[[scenario.step]]
+send = "Request"
+on = "to_server1"
+
+[[scenario.step]]
+wait_for = { frame = "Response", timeout_ms = 4000, capture = { code = "seen" } }
+on = "to_server1"
+
+[[scenario.step]]
+send = "Forward"
+on = "to_server2"
+from_capture = { payload = "seen" }
+"#,
+    )
+    .expect("scenario should parse")
+    .remove(0);
+
+    tx.send(Command::StartScenario {
+        scenario: Box::new(scenario),
+        frames: vec![request, response, forward],
+    })
+    .await
+    .unwrap();
+
+    wait_for(
+        &mut rx,
+        |event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server1"),
+    )
+    .await;
+
+    // Three bytes first, which is longer than a Response and must be ignored,
+    // then the one byte a Response is.
+    for bytes in [vec![9, 9, 9], vec![42]] {
+        tx.send(Command::SendRaw {
+            id: ConnectionId::from("server1"),
+            bytes,
+        })
+        .await
+        .unwrap();
+    }
+
+    let seen = gather_until(&mut rx, |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, Event::FrameReceived { id, .. } if id.0 == "server2"))
+            && finished_with(events, "Sized", &sim_core::Outcome::Completed)
+    })
+    .await;
+
+    assert_eq!(
+        beacons(&seen, "server2"),
+        vec![vec![42]],
+        "the three byte datagram was not taken for the reply"
+    );
+}

@@ -3,7 +3,7 @@ use sim_core::scenario::Scenario;
 use egui::{Color32, Grid, RichText, ScrollArea, Ui};
 use egui_phosphor::regular as icons;
 
-use crate::panels::{scenario_edit, widest};
+use crate::panels::{rule_edit, scenario_edit, widest};
 use sim_session::engine_handle::EngineHandle;
 use sim_session::scenarios;
 use sim_session::state::Session;
@@ -41,16 +41,32 @@ pub fn show(ui: &mut Ui, state: &mut Session, engine: &EngineHandle) {
         ui.separator();
         ScrollArea::vertical()
             .id_salt("scenario_editor")
-            .show(ui, |ui| scenario_edit::steps(ui, state));
+            .show(ui, |ui| {
+                scenario_edit::steps(ui, state);
+                ui.add_space(ui.spacing().item_spacing.y);
+                rule_edit::rules(ui, state);
+            });
         ui.separator();
         // Both are read after the widgets above have applied this frame's
         // edits, so Save reacts to every setting rather than one frame late.
         let dirty = state.scenarios.draft_is_dirty();
-        let problem = state
-            .scenarios
-            .draft
-            .as_ref()
-            .and_then(sim_session::scenarios::Draft::problem);
+        let frames: Vec<_> = state.frames.frames().cloned().collect();
+        // The loader cannot say whether a rule's fields exist, not having the
+        // frames, so that is added here: saving it would only move the failure
+        // to the first run.
+        let problem = state.scenarios.draft.as_ref().and_then(|draft| {
+            draft.problem().or_else(|| {
+                draft
+                    .scenario
+                    .rules
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, rule)| {
+                        scenarios::rule_problem(&draft.scenario, rule, &frames)
+                            .map(|reason| format!("rule {}: {reason}", index + 1))
+                    })
+            })
+        });
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -275,5 +291,13 @@ fn steps(ui: &mut Ui, state: &Session, scenario: &Scenario) {
                         ui.end_row();
                     }
                 });
+
+            if !scenario.rules.is_empty() {
+                ui.add_space(ui.spacing().item_spacing.y);
+                ui.label(RichText::new("Rules").strong());
+                for (index, rule) in scenario.rules.iter().enumerate() {
+                    ui.label(scenarios::describe_rule(rule, index + 1));
+                }
+            }
         });
 }

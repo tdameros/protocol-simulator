@@ -21,6 +21,7 @@ use crate::document::{self, compact, fold, last_position, merge, place_after};
 use crate::connection::ConnectionId;
 use crate::frame::value::Value;
 use crate::pattern::PatternSpec;
+use crate::rule::{self, Rule, RuleError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScenarioError {
@@ -60,6 +61,13 @@ pub enum ScenarioError {
         name: String,
         step: usize,
         reason: StepError,
+    },
+
+    #[error("scenario {name}, rule {rule}: {reason}")]
+    Rule {
+        name: String,
+        rule: usize,
+        reason: RuleError,
     },
 }
 
@@ -117,6 +125,8 @@ pub struct Scenario {
     pub name: String,
     pub description: Option<String>,
     pub steps: Vec<Step>,
+    /// What an earlier step saw deciding what a later `send` carries.
+    pub rules: Vec<Rule>,
     /// How the whole sequence repeats. `None` runs it once.
     pub repeat: Option<Repeat>,
 }
@@ -310,6 +320,8 @@ struct RawScenario {
     repeat: Option<RawRepeat>,
     #[serde(default, rename = "step")]
     steps: Vec<RawStep>,
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    rules: Vec<rule::RawRule>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -497,6 +509,16 @@ pub fn to_toml(scenarios: &[Scenario]) -> Result<String, ScenarioError> {
                 }
                 compact(step, "on");
             }
+            if let Some(rules) = scenario
+                .get_mut("rule")
+                .and_then(Item::as_array_of_tables_mut)
+            {
+                for rule in rules.iter_mut() {
+                    for key in ["when", "set"] {
+                        fold(rule, key);
+                    }
+                }
+            }
             compact(scenario, "on");
         }
     }
@@ -529,8 +551,9 @@ pub fn update_in(text: &str, name: &str, scenario: &Scenario) -> Result<String, 
             name: name.to_owned(),
         })?;
 
-    merge(existing, &fresh, &["step"]);
-    merge_steps(existing, &fresh);
+    merge(existing, &fresh, &["step", "rule"]);
+    merge_numbered(existing, &fresh, "step");
+    merge_numbered(existing, &fresh, "rule");
     Ok(document::render(&document, text))
 }
 
@@ -600,25 +623,22 @@ fn as_table(scenario: &Scenario) -> Result<toml_edit::Table, ScenarioError> {
         .ok_or(ScenarioError::NotScenarios)
 }
 
-/// Steps are matched by position, there being nothing else to match them by.
+/// Steps and rules are matched by position, there being nothing else to match
+/// them by.
 ///
-/// A step edited in place keeps whatever was written above it. A step inserted
+/// An entry edited in place keeps whatever was written above it. One inserted
 /// or removed in the middle shifts the comments below it by one, which is the
 /// price of keeping them at all rather than dropping the lot.
-fn merge_steps(into: &mut toml_edit::Table, from: &toml_edit::Table) {
-    let Some(wanted) = from.get("step").and_then(Item::as_array_of_tables) else {
-        into.remove("step");
+fn merge_numbered(into: &mut toml_edit::Table, from: &toml_edit::Table, key: &str) {
+    let Some(wanted) = from.get(key).and_then(Item::as_array_of_tables) else {
+        into.remove(key);
         return;
     };
 
-    if into
-        .get("step")
-        .and_then(Item::as_array_of_tables)
-        .is_none()
-    {
-        into.insert("step", Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+    if into.get(key).and_then(Item::as_array_of_tables).is_none() {
+        into.insert(key, Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
     }
-    let Some(existing) = into.get_mut("step").and_then(Item::as_array_of_tables_mut) else {
+    let Some(existing) = into.get_mut(key).and_then(Item::as_array_of_tables_mut) else {
         return;
     };
 
@@ -663,6 +683,7 @@ fn lower(scenario: &Scenario) -> RawScenario {
             .iter()
             .map(|step| lower_step(step, default.as_deref()))
             .collect(),
+        rules: scenario.rules.iter().map(rule::lower).collect(),
     }
 }
 
@@ -855,10 +876,29 @@ fn build(raw: RawScenario) -> Result<Scenario, ScenarioError> {
         None => None,
     };
 
+    let rules = raw
+        .rules
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw_rule)| {
+            rule::build(raw_rule).map_err(|reason| ScenarioError::Rule {
+                name: name.clone(),
+                rule: index + 1,
+                reason,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    rule::check(&rules, &steps).map_err(|(index, reason)| ScenarioError::Rule {
+        name: name.clone(),
+        rule: index,
+        reason,
+    })?;
+
     Ok(Scenario {
         name,
         description: raw.description,
         steps,
+        rules,
         repeat,
     })
 }
@@ -1907,5 +1947,249 @@ wait_for = { hex = "AA 5" }
                 .as_deref(),
             Some("edited")
         );
+    }
+
+    const RULED: &str = r#"
+[[scenario]]
+name = "Mirror"
+on = "bus"
+
+[[scenario.step]]
+send = "Request"
+
+[[scenario.step]]
+wait_for = { frame = "Status", match = { sync = 1 }, timeout_ms = 500 }
+
+[[scenario.step]]
+send = "Echo"
+with = { speed = 3 }
+
+[[scenario.step]]
+send = "Out"
+
+# Only worth sending the alarm when the device said it was in trouble.
+[[scenario.rule]]
+name = "mirror fault"
+when = { all = [
+  { step = 2, field = "status", bit = "fault", equals = 1 },
+  { step = 1, field = "mode", equals = 2 },
+] }
+set = { step = 4, field = "flags", bit = "alarm", from = { step = 2, field = "status", bit = "fault" } }
+
+[[scenario.rule]]
+when = { any = [{ step = 2, field = "level", equals = 9 }] }
+set = { step = 4, field = "speed", from = { step = 2, field = "raw" }, and = 15, or = 128 }
+
+[[scenario.rule]]
+set = { step = 4, field = "mode", value = 5 }
+"#;
+
+    #[test]
+    fn rules_read_as_conditions_and_assignments() {
+        let scenario = one(RULED);
+        assert_eq!(scenario.rules.len(), 3);
+
+        let first = &scenario.rules[0];
+        assert_eq!(first.name.as_deref(), Some("mirror fault"));
+        let when = first.when.as_ref().expect("a condition");
+        assert_eq!(when.combine, rule::Combine::All);
+        assert_eq!(when.tests.len(), 2);
+        assert_eq!(when.tests[0].source.bit.as_deref(), Some("fault"));
+        assert_eq!(first.set.step, 4);
+        assert_eq!(first.set.bit.as_deref(), Some("alarm"));
+
+        let second = &scenario.rules[1];
+        assert_eq!(second.when.as_ref().unwrap().combine, rule::Combine::Any);
+        assert!(matches!(
+            &second.set.operand,
+            rule::Operand::Copy {
+                and: Some(15),
+                or: Some(128),
+                ..
+            }
+        ));
+
+        let third = &scenario.rules[2];
+        assert!(third.when.is_none(), "no condition always applies");
+        assert!(matches!(
+            &third.set.operand,
+            rule::Operand::Constant(Value::Uint(5))
+        ));
+    }
+
+    #[test]
+    fn rules_survive_being_written_out() {
+        let written = to_toml(&from_toml(RULED).expect("should parse")).expect("should serialise");
+        assert!(written.contains("[[scenario.rule]]"), "{written}");
+        assert!(
+            written.contains("set = {"),
+            "a rule's parts fold onto one line, as a person writes them:\n{written}"
+        );
+        round_trips(RULED);
+    }
+
+    #[test]
+    fn a_scenario_without_rules_writes_none() {
+        let written = to_toml(&from_toml(BOOT).expect("should parse")).expect("should serialise");
+        assert!(!written.contains("rule"), "{written}");
+    }
+
+    #[test]
+    fn editing_a_scenario_keeps_its_rules_and_the_comments_above_them() {
+        let mut scenarios = from_toml(RULED).expect("should parse");
+        scenarios[0].description = Some("edited".to_owned());
+
+        let written = update_in(RULED, "Mirror", &scenarios[0]).expect("should update");
+
+        assert!(
+            written
+                .contains("# Only worth sending the alarm when the device said it was in trouble."),
+            "{written}"
+        );
+        let reread = from_toml(&written).expect("still valid");
+        assert_eq!(reread[0].rules, scenarios[0].rules);
+        assert_eq!(reread[0].description.as_deref(), Some("edited"));
+    }
+
+    #[test]
+    fn a_rule_removed_in_the_editor_is_removed_from_the_file() {
+        let mut scenarios = from_toml(RULED).expect("should parse");
+        scenarios[0].rules.pop();
+
+        let written = update_in(RULED, "Mirror", &scenarios[0]).expect("should update");
+
+        assert_eq!(from_toml(&written).expect("still valid")[0].rules.len(), 2);
+    }
+
+    fn refused(rule: &str) -> String {
+        refused_or_loaded(rule)
+            .expect_err("the rule should have been refused")
+            .to_string()
+    }
+
+    fn refused_or_loaded(rule: &str) -> Result<Vec<Scenario>, ScenarioError> {
+        let text = format!(
+            r#"
+[[scenario]]
+name = "Bad"
+on = "bus"
+
+[[scenario.step]]
+send = "Request"
+capture = {{ id = "seen" }}
+
+[[scenario.step]]
+wait_for = {{ frame = "Status", match = {{ sync = 1 }}, timeout_ms = 500 }}
+
+[[scenario.step]]
+wait_ms = 10
+
+[[scenario.step]]
+send = "Out"
+with = {{ speed = 1 }}
+counters = {{ count = {{ wrap = 255 }} }}
+from_capture = {{ other = "seen" }}
+
+[[scenario.step]]
+send = "Out"
+
+{rule}
+"#
+        );
+        from_toml(&text)
+    }
+
+    #[test]
+    fn a_rule_naming_a_step_that_does_not_exist_is_refused() {
+        let error = refused("[[scenario.rule]]\nset = { step = 9, field = \"x\", value = 1 }");
+        assert!(
+            error.contains("rule 1") && error.contains("step 9"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_rule_writing_into_something_that_is_not_a_send_is_refused() {
+        let error = refused("[[scenario.rule]]\nset = { step = 3, field = \"x\", value = 1 }");
+        assert!(
+            error.contains("step 3") && error.contains("send"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_rule_reading_a_step_that_comes_later_is_refused() {
+        let error = refused(
+            "[[scenario.rule]]\nset = { step = 4, field = \"x\", from = { step = 5, field = \"y\" } }",
+        );
+        assert!(
+            error.contains("step 5") && error.contains("before"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_rule_reading_a_delay_is_refused() {
+        let error = refused(
+            "[[scenario.rule]]\nset = { step = 4, field = \"x\", from = { step = 3, field = \"y\" } }",
+        );
+        assert!(error.contains("step 3"), "{error}");
+    }
+
+    #[test]
+    fn a_condition_on_a_later_step_is_refused() {
+        let error = refused(
+            "[[scenario.rule]]\nwhen = { all = [{ step = 5, field = \"y\", equals = 1 }] }\n\
+             set = { step = 4, field = \"x\", value = 1 }",
+        );
+        assert!(error.contains("step 5"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_may_override_a_value_the_step_fixes() {
+        let text = refused_or_loaded(
+            "[[scenario.rule]]\nset = { step = 4, field = \"speed\", value = 2 }",
+        );
+        text.expect("a fixed value is only a default for the rule to replace");
+    }
+
+    #[test]
+    fn a_rule_fighting_a_step_over_a_field_is_refused() {
+        for field in ["count", "other"] {
+            let error = refused(&format!(
+                "[[scenario.rule]]\nset = {{ step = 4, field = \"{field}\", value = 1 }}"
+            ));
+            assert!(
+                error.contains(field) && error.contains("counts or fills"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_reading_a_wait_on_two_links_is_refused() {
+        let text = r#"
+[[scenario]]
+name = "Two"
+
+[[scenario.step]]
+wait_for = { frame = "Status", match = { sync = 1 }, timeout_ms = 500 }
+on = ["a", "b"]
+
+[[scenario.step]]
+send = "Out"
+on = "a"
+
+[[scenario.rule]]
+set = { step = 2, field = "x", from = { step = 1, field = "y" } }
+"#;
+        let error = from_toml(text).expect_err("refused").to_string();
+        assert!(error.contains("2 links"), "{error}");
+    }
+
+    #[test]
+    fn a_misspelt_rule_key_is_refused_by_name() {
+        let error = refused("[[scenario.rule]]\nset = { step = 4, field = \"x\", valeu = 1 }");
+        assert!(error.contains("valeu"), "{error}");
     }
 }
